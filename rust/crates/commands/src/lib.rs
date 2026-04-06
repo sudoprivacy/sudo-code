@@ -243,7 +243,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "skills",
-        aliases: &[],
+        aliases: &["skill"],
         summary: "List, install, or invoke available skills",
         argument_hint: Some("[list|install <path>|help|<skill> [args]]"),
         resume_supported: true,
@@ -1312,7 +1312,7 @@ pub fn validate_slash_command_input(
         "agents" => SlashCommand::Agents {
             args: parse_list_or_help_args(command, remainder)?,
         },
-        "skills" => SlashCommand::Skills {
+        "skills" | "skill" => SlashCommand::Skills {
             args: parse_skills_args(remainder.as_deref())?,
         },
         "doctor" => {
@@ -1975,9 +1975,9 @@ enum DefinitionScope {
 impl DefinitionScope {
     fn label(self) -> &'static str {
         match self {
-            Self::Project => "Project (.claw)",
-            Self::UserConfigHome => "User ($CLAW_CONFIG_HOME)",
-            Self::UserHome => "User (~/.claw)",
+            Self::Project => "Project roots",
+            Self::UserConfigHome => "User config roots",
+            Self::UserHome => "User home roots",
         }
     }
 }
@@ -2548,6 +2548,14 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         );
     }
 
+    if let Ok(claude_config_dir) = env::var("CLAUDE_CONFIG_DIR") {
+        push_unique_root(
+            &mut roots,
+            DefinitionSource::UserClaude,
+            PathBuf::from(claude_config_dir).join(leaf),
+        );
+    }
+
     if let Some(home) = env::var_os("HOME") {
         let home = PathBuf::from(home);
         push_unique_root(
@@ -2579,6 +2587,18 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
             &mut roots,
             DefinitionSource::ProjectClaw,
             ancestor.join(".claw").join("skills"),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::ProjectClaw,
+            ancestor.join(".omc").join("skills"),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::ProjectClaw,
+            ancestor.join(".agents").join("skills"),
             SkillOrigin::SkillsDir,
         );
         push_unique_skill_root(
@@ -2656,6 +2676,12 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserClaw,
+            home.join(".omc").join("skills"),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClaw,
             home.join(".claw").join("commands"),
             SkillOrigin::LegacyCommandsDir,
         );
@@ -2680,7 +2706,36 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserClaude,
+            home.join(".claude").join("skills").join("omc-learned"),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClaude,
             home.join(".claude").join("commands"),
+            SkillOrigin::LegacyCommandsDir,
+        );
+    }
+
+    if let Ok(claude_config_dir) = env::var("CLAUDE_CONFIG_DIR") {
+        let claude_config_dir = PathBuf::from(claude_config_dir);
+        let skills_dir = claude_config_dir.join("skills");
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClaude,
+            skills_dir.clone(),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClaude,
+            skills_dir.join("omc-learned"),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClaude,
+            claude_config_dir.join("commands"),
             SkillOrigin::LegacyCommandsDir,
         );
     }
@@ -3467,10 +3522,11 @@ fn render_skills_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Skills".to_string(),
         "  Usage            /skills [list|install <path>|help|<skill> [args]]".to_string(),
+        "  Alias            /skill".to_string(),
         "  Direct CLI       claw skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Invoke           /skills help overview -> $help overview".to_string(),
         "  Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills".to_string(),
-        "  Sources          .claw/skills, ~/.claw/skills, legacy /commands".to_string(),
+        "  Sources          .claw/skills, .omc/skills, .agents/skills, .codex/skills, .claude/skills, ~/.claw/skills, ~/.omc/skills, ~/.claude/skills/omc-learned, ~/.codex/skills, ~/.claude/skills, legacy /commands".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3484,10 +3540,24 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
         "action": "help",
         "usage": {
             "slash_command": "/skills [list|install <path>|help|<skill> [args]]",
+            "aliases": ["/skill"],
             "direct_cli": "claw skills [list|install <path>|help|<skill> [args]]",
             "invoke": "/skills help overview -> $help overview",
             "install_root": "$CLAW_CONFIG_HOME/skills or ~/.claw/skills",
-            "sources": [".claw/skills", "legacy /commands", "legacy fallback dirs still load automatically"],
+            "sources": [
+                ".claw/skills",
+                ".omc/skills",
+                ".agents/skills",
+                ".codex/skills",
+                ".claude/skills",
+                "~/.claw/skills",
+                "~/.omc/skills",
+                "~/.claude/skills/omc-learned",
+                "~/.codex/skills",
+                "~/.claude/skills",
+                "legacy /commands",
+                "legacy fallback dirs still load automatically"
+            ],
         },
         "unexpected": unexpected,
     })
@@ -3849,8 +3919,10 @@ mod tests {
     use runtime::{
         CompactionConfig, ConfigLoader, ContentBlock, ConversationMessage, MessageRole, Session,
     };
+    use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -3859,6 +3931,18 @@ mod tests {
             .expect("time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("commands-plugin-{label}-{nanos}"))
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn restore_env_var(key: &str, original: Option<OsString>) {
+        match original {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
     }
 
     fn write_external_plugin(root: &Path, name: &str, version: &str) {
@@ -4275,6 +4359,7 @@ mod tests {
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
+        assert!(help.contains("aliases: /skill"));
         assert_eq!(slash_command_specs().len(), 141);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
@@ -4517,10 +4602,10 @@ mod tests {
 
         assert!(report.contains("Agents"));
         assert!(report.contains("2 active agents"));
-        assert!(report.contains("Project (.claw):"));
+        assert!(report.contains("Project roots:"));
         assert!(report.contains("planner · Project planner · gpt-5.4 · medium"));
-        assert!(report.contains("User (~/.claw):"));
-        assert!(report.contains("(shadowed by Project (.claw)) planner · User planner"));
+        assert!(report.contains("User home roots:"));
+        assert!(report.contains("(shadowed by Project roots) planner · User planner"));
         assert!(report.contains("verifier · Verification agent · gpt-5.4-mini · high"));
 
         let _ = fs::remove_dir_all(workspace);
@@ -4628,11 +4713,11 @@ mod tests {
 
         assert!(report.contains("Skills"));
         assert!(report.contains("3 available skills"));
-        assert!(report.contains("Project (.claw):"));
+        assert!(report.contains("Project roots:"));
         assert!(report.contains("plan · Project planning guidance"));
         assert!(report.contains("deploy · Legacy deployment guidance · legacy /commands"));
-        assert!(report.contains("User (~/.claw):"));
-        assert!(report.contains("(shadowed by Project (.claw)) plan · User planning guidance"));
+        assert!(report.contains("User home roots:"));
+        assert!(report.contains("(shadowed by Project roots) plan · User planning guidance"));
         assert!(report.contains("help · Help guidance"));
 
         let _ = fs::remove_dir_all(workspace);
@@ -4704,6 +4789,7 @@ mod tests {
         let help = handle_skills_slash_command_json(Some("help"), &workspace).expect("skills help");
         assert_eq!(help["kind"], "skills");
         assert_eq!(help["action"], "help");
+        assert_eq!(help["usage"]["aliases"][0], "/skill");
         assert_eq!(
             help["usage"]["direct_cli"],
             "claw skills [list|install <path>|help|<skill> [args]]"
@@ -4732,8 +4818,12 @@ mod tests {
             super::handle_skills_slash_command(Some("--help"), &cwd).expect("skills help");
         assert!(skills_help
             .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(skills_help.contains("Alias            /skill"));
         assert!(skills_help.contains("Invoke           /skills help overview -> $help overview"));
         assert!(skills_help.contains("Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills"));
+        assert!(skills_help.contains(".omc/skills"));
+        assert!(skills_help.contains(".agents/skills"));
+        assert!(skills_help.contains("~/.claude/skills/omc-learned"));
         assert!(skills_help.contains("legacy /commands"));
 
         let skills_unexpected =
@@ -4744,6 +4834,7 @@ mod tests {
             .expect("nested skills help");
         assert!(skills_install_help
             .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(skills_install_help.contains("Alias            /skill"));
         assert!(skills_install_help.contains("Unexpected       install"));
 
         let skills_unknown_help =
@@ -4752,7 +4843,85 @@ mod tests {
             .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
         assert!(skills_unknown_help.contains("Unexpected       show"));
 
+        let skills_help_json =
+            super::handle_skills_slash_command_json(Some("help"), &cwd).expect("skills help json");
+        let sources = skills_help_json["usage"]["sources"]
+            .as_array()
+            .expect("skills help sources");
+        assert_eq!(skills_help_json["usage"]["aliases"][0], "/skill");
+        assert!(sources.iter().any(|value| value == ".omc/skills"));
+        assert!(sources.iter().any(|value| value == ".agents/skills"));
+        assert!(sources.iter().any(|value| value == "~/.omc/skills"));
+        assert!(sources
+            .iter()
+            .any(|value| value == "~/.claude/skills/omc-learned"));
+
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn discovers_omc_skills_from_project_and_user_compatibility_roots() {
+        let _guard = env_lock().lock().expect("env lock");
+        let workspace = temp_dir("skills-omc-workspace");
+        let user_home = temp_dir("skills-omc-home");
+        let claude_config_dir = temp_dir("skills-omc-claude-config");
+        let project_omc_skills = workspace.join(".omc").join("skills");
+        let project_agents_skills = workspace.join(".agents").join("skills");
+        let user_omc_skills = user_home.join(".omc").join("skills");
+        let claude_config_skills = claude_config_dir.join("skills");
+        let claude_config_commands = claude_config_dir.join("commands");
+        let learned_skills = claude_config_dir.join("skills").join("omc-learned");
+        let original_home = std::env::var_os("HOME");
+        let original_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+
+        write_skill(&project_omc_skills, "hud", "OMC HUD guidance");
+        write_skill(
+            &project_agents_skills,
+            "trace",
+            "Compatibility skill guidance",
+        );
+        write_skill(&user_omc_skills, "cancel", "OMC cancel guidance");
+        write_skill(
+            &claude_config_skills,
+            "statusline",
+            "Claude config skill guidance",
+        );
+        write_legacy_command(
+            &claude_config_commands,
+            "doctor-check",
+            "Claude config command guidance",
+        );
+        write_skill(&learned_skills, "learned", "Learned skill guidance");
+        std::env::set_var("HOME", &user_home);
+        std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config_dir);
+
+        let report = super::handle_skills_slash_command(None, &workspace).expect("skills list");
+        assert!(report.contains("available skills"));
+        assert!(report.contains("hud · OMC HUD guidance"));
+        assert!(report.contains("trace · Compatibility skill guidance"));
+        assert!(report.contains("cancel · OMC cancel guidance"));
+        assert!(report.contains("statusline · Claude config skill guidance"));
+        assert!(report.contains("doctor-check · Claude config command guidance · legacy /commands"));
+        assert!(report.contains("learned · Learned skill guidance"));
+
+        let help =
+            super::handle_skills_slash_command_json(Some("help"), &workspace).expect("skills help");
+        let sources = help["usage"]["sources"]
+            .as_array()
+            .expect("skills help sources");
+        assert_eq!(help["usage"]["aliases"][0], "/skill");
+        assert!(sources.iter().any(|value| value == ".omc/skills"));
+        assert!(sources.iter().any(|value| value == ".agents/skills"));
+        assert!(sources.iter().any(|value| value == "~/.omc/skills"));
+        assert!(sources
+            .iter()
+            .any(|value| value == "~/.claude/skills/omc-learned"));
+
+        restore_env_var("HOME", original_home);
+        restore_env_var("CLAUDE_CONFIG_DIR", original_claude_config_dir);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(user_home);
+        let _ = fs::remove_dir_all(claude_config_dir);
     }
 
     #[test]
@@ -4991,7 +5160,7 @@ mod tests {
         let listed = render_skills_report(
             &load_skills_from_roots(&roots).expect("installed skills should load"),
         );
-        assert!(listed.contains("User ($CLAW_CONFIG_HOME):"));
+        assert!(listed.contains("User config roots:"));
         assert!(listed.contains("help · Helpful skill"));
 
         let _ = fs::remove_dir_all(workspace);

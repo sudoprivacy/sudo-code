@@ -128,6 +128,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             args,
             output_format,
         } => LiveCli::print_skills(args.as_deref(), output_format)?,
+        CliAction::Plugins {
+            action,
+            target,
+            output_format,
+        } => LiveCli::print_plugins(action.as_deref(), target.as_deref(), output_format)?,
         CliAction::PrintSystemPrompt {
             cwd,
             date,
@@ -186,6 +191,11 @@ enum CliAction {
     },
     Skills {
         args: Option<String>,
+        output_format: CliOutputFormat,
+    },
+    Plugins {
+        action: Option<String>,
+        target: Option<String>,
         output_format: CliOutputFormat,
     },
     PrintSystemPrompt {
@@ -619,6 +629,10 @@ fn format_unknown_direct_slash_command(name: &str) -> String {
         message.push('\n');
         message.push_str(&suggestions);
     }
+    if let Some(note) = omc_compatibility_note_for_unknown_slash_command(name) {
+        message.push('\n');
+        message.push_str(note);
+    }
     message.push_str("\nRun `claw --help` for CLI usage, or start `claw` and use /help.");
     message
 }
@@ -630,8 +644,19 @@ fn format_unknown_slash_command(name: &str) -> String {
         message.push('\n');
         message.push_str(&suggestions);
     }
+    if let Some(note) = omc_compatibility_note_for_unknown_slash_command(name) {
+        message.push('\n');
+        message.push_str(note);
+    }
     message.push_str("\n  Help             /help lists available slash commands");
     message
+}
+
+fn omc_compatibility_note_for_unknown_slash_command(name: &str) -> Option<&'static str> {
+    name.starts_with("oh-my-claudecode:")
+        .then_some(
+            "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `claw` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
+        )
 }
 
 fn render_suggestion_line(label: &str, suggestions: &[String]) -> Option<String> {
@@ -1885,14 +1910,18 @@ impl GitWorkspaceSummary {
 #[cfg(test)]
 fn format_unknown_slash_command_message(name: &str) -> String {
     let suggestions = suggest_slash_commands(name);
-    if suggestions.is_empty() {
-        format!("unknown slash command: /{name}. Use /help to list available commands.")
-    } else {
-        format!(
-            "unknown slash command: /{name}. Did you mean {}? Use /help to list available commands.",
-            suggestions.join(", ")
-        )
+    let mut message = format!("unknown slash command: /{name}.");
+    if !suggestions.is_empty() {
+        message.push_str(" Did you mean ");
+        message.push_str(&suggestions.join(", "));
+        message.push('?');
     }
+    if let Some(note) = omc_compatibility_note_for_unknown_slash_command(name) {
+        message.push(' ');
+        message.push_str(note);
+    }
+    message.push_str(" Use /help to list available commands.");
+    message
 }
 
 fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
@@ -3564,6 +3593,32 @@ impl LiveCli {
             CliOutputFormat::Json => println!(
                 "{}",
                 serde_json::to_string_pretty(&handle_skills_slash_command_json(args, &cwd)?)?
+            ),
+        }
+        Ok(())
+    }
+
+    fn print_plugins(
+        action: Option<&str>,
+        target: Option<&str>,
+        output_format: CliOutputFormat,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
+        let loader = ConfigLoader::default_for(&cwd);
+        let runtime_config = loader.load()?;
+        let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+        let result = handle_plugins_slash_command(action, target, &mut manager)?;
+        match output_format {
+            CliOutputFormat::Text => println!("{}", result.message),
+            CliOutputFormat::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "plugin",
+                    "action": action.unwrap_or("list"),
+                    "target": target,
+                    "message": result.message,
+                    "reload_runtime": result.reload_runtime,
+                }))?
             ),
         }
         Ok(())
@@ -7450,10 +7505,25 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&["/skill".to_string()]).expect("/skill should parse"),
+            CliAction::Skills {
+                args: None,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
             parse_args(&["/skills".to_string(), "help".to_string()])
                 .expect("/skills help should parse"),
             CliAction::Skills {
                 args: Some("help".to_string()),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["/skill".to_string(), "list".to_string()])
+                .expect("/skill list should parse"),
+            CliAction::Skills {
+                args: Some("list".to_string()),
                 output_format: CliOutputFormat::Text,
             }
         );
@@ -7513,6 +7583,16 @@ mod tests {
         assert!(report.contains("unknown slash command: /statsu"));
         assert!(report.contains("Did you mean"));
         assert!(report.contains("Use /help"));
+    }
+
+    #[test]
+    fn formats_namespaced_omc_slash_command_with_contract_guidance() {
+        let report = format_unknown_slash_command_message("oh-my-claudecode:hud");
+        assert!(report.contains("unknown slash command: /oh-my-claudecode:hud"));
+        assert!(report.contains("Claude Code/OMC plugin command"));
+        assert!(report.contains("plugin slash commands"));
+        assert!(report.contains("statusline"));
+        assert!(report.contains("session hooks"));
     }
 
     #[test]
@@ -8310,6 +8390,14 @@ UU conflicted.rs",
         assert!(message.contains("Unknown slash command: /stats"));
         assert!(message.contains("/status"));
         assert!(message.contains("/help"));
+    }
+
+    #[test]
+    fn unknown_omc_slash_command_guidance_explains_runtime_gap() {
+        let message = format_unknown_slash_command("oh-my-claudecode:hud");
+        assert!(message.contains("Unknown slash command: /oh-my-claudecode:hud"));
+        assert!(message.contains("Claude Code/OMC plugin command"));
+        assert!(message.contains("does not yet load plugin slash commands"));
     }
 
     #[test]

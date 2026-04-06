@@ -920,6 +920,9 @@ pub enum PluginManifestValidationError {
         tool_name: String,
         permission: String,
     },
+    UnsupportedManifestContract {
+        detail: String,
+    },
 }
 
 impl Display for PluginManifestValidationError {
@@ -965,6 +968,7 @@ impl Display for PluginManifestValidationError {
                 f,
                 "plugin tool `{tool_name}` requiredPermission `{permission}` must be read-only, workspace-write, or danger-full-access"
             ),
+            Self::UnsupportedManifestContract { detail } => f.write_str(detail),
         }
     }
 }
@@ -1594,8 +1598,71 @@ fn load_manifest_from_path(
             manifest_path.display()
         ))
     })?;
-    let raw_manifest: RawPluginManifest = serde_json::from_str(&contents)?;
+    let raw_json: Value = serde_json::from_str(&contents)?;
+    let compatibility_errors = detect_claude_code_manifest_contract_gaps(&raw_json);
+    if !compatibility_errors.is_empty() {
+        return Err(PluginError::ManifestValidation(compatibility_errors));
+    }
+    let raw_manifest: RawPluginManifest = serde_json::from_value(raw_json)?;
     build_plugin_manifest(root, raw_manifest)
+}
+
+fn detect_claude_code_manifest_contract_gaps(
+    raw_manifest: &Value,
+) -> Vec<PluginManifestValidationError> {
+    let Some(root) = raw_manifest.as_object() else {
+        return Vec::new();
+    };
+
+    let mut errors = Vec::new();
+
+    for (field, detail) in [
+        (
+            "skills",
+            "plugin manifest field `skills` uses the Claude Code plugin contract; `claw` does not load plugin-managed skills and instead discovers skills from local roots such as `.claw/skills`, `.omc/skills`, `.agents/skills`, `~/.omc/skills`, and `~/.claude/skills/omc-learned`.",
+        ),
+        (
+            "mcpServers",
+            "plugin manifest field `mcpServers` uses the Claude Code plugin contract; `claw` does not import MCP servers from plugin manifests.",
+        ),
+        (
+            "agents",
+            "plugin manifest field `agents` uses the Claude Code plugin contract; `claw` does not load plugin-managed agent markdown catalogs from plugin manifests.",
+        ),
+    ] {
+        if root.contains_key(field) {
+            errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                detail: detail.to_string(),
+            });
+        }
+    }
+
+    if root
+        .get("commands")
+        .and_then(Value::as_array)
+        .is_some_and(|commands| commands.iter().any(Value::is_string))
+    {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: "plugin manifest field `commands` uses Claude Code-style directory globs; `claw` slash dispatch is still built-in and does not load plugin slash command markdown files.".to_string(),
+        });
+    }
+
+    if let Some(hooks) = root.get("hooks").and_then(Value::as_object) {
+        for hook_name in hooks.keys() {
+            if !matches!(
+                hook_name.as_str(),
+                "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
+            ) {
+                errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+                    detail: format!(
+                        "plugin hook `{hook_name}` uses the Claude Code lifecycle contract; `claw` plugins currently support only PreToolUse, PostToolUse, and PostToolUseFailure."
+                    ),
+                });
+            }
+        }
+    }
+
+    errors
 }
 
 fn plugin_manifest_path(root: &Path) -> Result<PathBuf, PluginError> {
@@ -2513,6 +2580,37 @@ mod tests {
             }
             other => panic!("expected manifest validation errors, got {other}"),
         }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_plugin_from_directory_rejects_claude_code_manifest_contracts_with_guidance() {
+        let root = temp_dir("manifest-claude-code-contract");
+        write_file(
+            root.join(MANIFEST_FILE_NAME).as_path(),
+            r#"{
+  "name": "oh-my-claudecode",
+  "version": "4.10.2",
+  "description": "Claude Code plugin manifest",
+  "hooks": {
+    "SessionStart": ["scripts/session-start.mjs"]
+  },
+  "agents": ["agents/*.md"],
+  "commands": ["commands/**/*.md"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json"
+}"#,
+        );
+
+        let error = load_plugin_from_directory(&root)
+            .expect_err("Claude Code plugin manifest should fail with guidance");
+        let rendered = error.to_string();
+        assert!(rendered.contains("field `skills` uses the Claude Code plugin contract"));
+        assert!(rendered.contains("field `mcpServers` uses the Claude Code plugin contract"));
+        assert!(rendered.contains("field `agents` uses the Claude Code plugin contract"));
+        assert!(rendered.contains("field `commands` uses Claude Code-style directory globs"));
+        assert!(rendered.contains("hook `SessionStart` uses the Claude Code lifecycle contract"));
 
         let _ = fs::remove_dir_all(root);
     }
