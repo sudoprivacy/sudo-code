@@ -690,6 +690,19 @@ struct ErrorBody {
     message: Option<String>,
 }
 
+/// Returns true for models known to reject tuning parameters like temperature,
+/// top_p, frequency_penalty, and presence_penalty. These are typically
+/// reasoning/chain-of-thought models with fixed sampling.
+fn is_reasoning_model(model: &str) -> bool {
+    let lowered = model.to_ascii_lowercase();
+    // OpenAI reasoning models
+    lowered.starts_with("o1")
+        || lowered.starts_with("o3")
+        || lowered.starts_with("o4")
+        // xAI reasoning: grok-3-mini always uses reasoning mode
+        || lowered == "grok-3-mini"
+}
+
 fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
@@ -722,18 +735,23 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     }
 
     // OpenAI-compatible tuning parameters — only included when explicitly set.
-    if let Some(temperature) = request.temperature {
-        payload["temperature"] = json!(temperature);
+    // Reasoning models (o1/o3/o4/grok-3-mini) reject these params with 400;
+    // silently strip them to avoid cryptic provider errors.
+    if !is_reasoning_model(&request.model) {
+        if let Some(temperature) = request.temperature {
+            payload["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = request.top_p {
+            payload["top_p"] = json!(top_p);
+        }
+        if let Some(frequency_penalty) = request.frequency_penalty {
+            payload["frequency_penalty"] = json!(frequency_penalty);
+        }
+        if let Some(presence_penalty) = request.presence_penalty {
+            payload["presence_penalty"] = json!(presence_penalty);
+        }
     }
-    if let Some(top_p) = request.top_p {
-        payload["top_p"] = json!(top_p);
-    }
-    if let Some(frequency_penalty) = request.frequency_penalty {
-        payload["frequency_penalty"] = json!(frequency_penalty);
-    }
-    if let Some(presence_penalty) = request.presence_penalty {
-        payload["presence_penalty"] = json!(presence_penalty);
-    }
+    // stop is generally safe for all providers
     if let Some(stop) = &request.stop {
         if !stop.is_empty() {
             payload["stop"] = json!(stop);
@@ -1028,8 +1046,9 @@ impl StringExt for String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_request, chat_completions_endpoint, normalize_finish_reason,
-        openai_tool_choice, parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
+        build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
+        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
+        OpenAiCompatConfig,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1204,6 +1223,40 @@ mod tests {
         assert_eq!(payload["frequency_penalty"], 0.5);
         assert_eq!(payload["presence_penalty"], 0.3);
         assert_eq!(payload["stop"], json!(["\n"]));
+    }
+
+    #[test]
+    fn reasoning_model_strips_tuning_params() {
+        let request = MessageRequest {
+            model: "o1-mini".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(0.3),
+            stop: Some(vec!["\n".to_string()]),
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert!(payload.get("temperature").is_none(), "reasoning model should strip temperature");
+        assert!(payload.get("top_p").is_none(), "reasoning model should strip top_p");
+        assert!(payload.get("frequency_penalty").is_none());
+        assert!(payload.get("presence_penalty").is_none());
+        // stop is safe for all providers
+        assert_eq!(payload["stop"], json!(["\n"]));
+    }
+
+    #[test]
+    fn grok_3_mini_is_reasoning_model() {
+        assert!(is_reasoning_model("grok-3-mini"));
+        assert!(is_reasoning_model("o1"));
+        assert!(is_reasoning_model("o1-mini"));
+        assert!(is_reasoning_model("o3-mini"));
+        assert!(!is_reasoning_model("gpt-4o"));
+        assert!(!is_reasoning_model("grok-3"));
+        assert!(!is_reasoning_model("claude-sonnet-4-6"));
     }
 
     #[test]
