@@ -43,6 +43,15 @@ cd rust
 /doctor
 ```
 
+Or run doctor directly with JSON output for scripting:
+
+```bash
+cd rust
+./target/debug/claw doctor --output-format json
+```
+
+**Note:** Diagnostic verbs (`doctor`, `status`, `sandbox`, `version`) support `--output-format json` for machine-readable output. Invalid suffix arguments (e.g., `--json`) are now rejected at parse time rather than falling through to prompt dispatch.
+
 ### Interactive REPL
 
 ```bash
