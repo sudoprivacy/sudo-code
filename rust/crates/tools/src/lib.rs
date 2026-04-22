@@ -3588,7 +3588,7 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
     let summary = runtime
-        .run_turn(job.prompt.clone(), None)
+        .run_turn(job.prompt.clone(), None, None)
         .map_err(|error| error.to_string())?;
     let final_text = final_assistant_text(&summary);
     persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
@@ -8440,7 +8440,7 @@ mod tests {
         );
 
         let summary = runtime
-            .run_turn("Inspect the delegated file", None)
+            .run_turn("Inspect the delegated file", None, None)
             .expect("subagent loop should succeed");
 
         assert_eq!(

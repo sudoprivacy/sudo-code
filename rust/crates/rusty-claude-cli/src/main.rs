@@ -4263,7 +4263,7 @@ impl LiveCli {
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
@@ -4312,7 +4312,7 @@ impl LiveCli {
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -4326,7 +4326,7 @@ impl LiveCli {
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -4351,7 +4351,7 @@ impl LiveCli {
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -5137,7 +5137,7 @@ impl LiveCli {
             progress,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
+        let summary = runtime.run_turn(prompt, Some(&mut permission_prompter), None)?;
         let text = final_assistant_text(&summary).trim().to_string();
         runtime.shutdown_plugins()?;
         Ok(text)
