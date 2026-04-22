@@ -54,6 +54,22 @@ pub trait ApiClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
 }
 
+/// Optional observer for runtime events emitted while processing a turn.
+pub trait RuntimeObserver {
+    fn on_text_delta(&mut self, _delta: &str) {}
+
+    fn on_tool_use(&mut self, _id: &str, _name: &str, _input: &str) {}
+
+    fn on_tool_result(
+        &mut self,
+        _tool_use_id: &str,
+        _tool_name: &str,
+        _output: &str,
+        _is_error: bool,
+    ) {
+    }
+}
+
 /// Trait implemented by tool dispatchers that execute model-requested tools.
 pub trait ToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
@@ -315,6 +331,7 @@ where
         &mut self,
         user_input: impl Into<String>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
+        mut observer: Option<&mut dyn RuntimeObserver>,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
 
@@ -361,7 +378,7 @@ where
                 }
             };
             let (assistant_message, usage, turn_prompt_cache_events) =
-                match build_assistant_message(events) {
+                match build_assistant_message(events, runtime_observer_mut(&mut observer)) {
                     Ok(result) => result,
                     Err(error) => {
                         self.record_turn_failed(iterations, &error);
@@ -491,6 +508,7 @@ where
                         true,
                     ),
                 };
+                notify_tool_result(runtime_observer_mut(&mut observer), &result_message);
                 self.session
                     .push_message(result_message.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -705,6 +723,7 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
 
 fn build_assistant_message(
     events: Vec<AssistantEvent>,
+    mut observer: Option<&mut dyn RuntimeObserver>,
 ) -> Result<
     (
         ConversationMessage,
@@ -721,8 +740,16 @@ fn build_assistant_message(
 
     for event in events {
         match event {
-            AssistantEvent::TextDelta(delta) => text.push_str(&delta),
+            AssistantEvent::TextDelta(delta) => {
+                if let Some(observer) = observer.as_mut() {
+                    observer.on_text_delta(&delta);
+                }
+                text.push_str(&delta);
+            }
             AssistantEvent::ToolUse { id, name, input } => {
+                if let Some(observer) = observer.as_mut() {
+                    observer.on_tool_use(&id, &name, &input);
+                }
                 flush_text_block(&mut text, &mut blocks);
                 blocks.push(ContentBlock::ToolUse { id, name, input });
             }
@@ -750,6 +777,34 @@ fn build_assistant_message(
         usage,
         prompt_cache_events,
     ))
+}
+
+fn notify_tool_result(
+    observer: Option<&mut dyn RuntimeObserver>,
+    result_message: &ConversationMessage,
+) {
+    let Some(observer) = observer else {
+        return;
+    };
+    let Some(ContentBlock::ToolResult {
+        tool_use_id,
+        tool_name,
+        output,
+        is_error,
+    }) = result_message.blocks.first()
+    else {
+        return;
+    };
+
+    observer.on_tool_result(tool_use_id, tool_name, output, *is_error);
+}
+
+fn runtime_observer_mut<'a>(
+    observer: &'a mut Option<&mut dyn RuntimeObserver>,
+) -> Option<&'a mut dyn RuntimeObserver> {
+    observer
+        .as_mut()
+        .map(|observer| &mut **observer as &mut dyn RuntimeObserver)
 }
 
 fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
@@ -824,7 +879,8 @@ mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        RuntimeObserver, StaticToolExecutor, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -911,6 +967,57 @@ mod tests {
         }
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum ObservedRuntimeEvent {
+        TextDelta(String),
+        ToolUse {
+            id: String,
+            name: String,
+            input: String,
+        },
+        ToolResult {
+            tool_use_id: String,
+            tool_name: String,
+            output: String,
+            is_error: bool,
+        },
+    }
+
+    #[derive(Default)]
+    struct RecordingRuntimeObserver {
+        events: Vec<ObservedRuntimeEvent>,
+    }
+
+    impl RuntimeObserver for RecordingRuntimeObserver {
+        fn on_text_delta(&mut self, delta: &str) {
+            self.events
+                .push(ObservedRuntimeEvent::TextDelta(delta.to_string()));
+        }
+
+        fn on_tool_use(&mut self, id: &str, name: &str, input: &str) {
+            self.events.push(ObservedRuntimeEvent::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input: input.to_string(),
+            });
+        }
+
+        fn on_tool_result(
+            &mut self,
+            tool_use_id: &str,
+            tool_name: &str,
+            output: &str,
+            is_error: bool,
+        ) {
+            self.events.push(ObservedRuntimeEvent::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                tool_name: tool_name.to_string(),
+                output: output.to_string(),
+                is_error,
+            });
+        }
+    }
+
     #[test]
     fn runs_user_to_tool_to_result_loop_end_to_end_and_tracks_usage() {
         let api_client = ScriptedApiClient { call_count: 0 };
@@ -942,7 +1049,7 @@ mod tests {
         );
 
         let summary = runtime
-            .run_turn("what is 2 + 2?", Some(&mut PromptAllowOnce))
+            .run_turn("what is 2 + 2?", Some(&mut PromptAllowOnce), None)
             .expect("conversation loop should succeed");
 
         assert_eq!(summary.iterations, 2);
@@ -979,7 +1086,7 @@ mod tests {
         .with_session_tracer(tracer);
 
         runtime
-            .run_turn("what is 2 + 2?", Some(&mut PromptAllowOnce))
+            .run_turn("what is 2 + 2?", Some(&mut PromptAllowOnce), None)
             .expect("conversation loop should succeed");
 
         let events = sink.events();
@@ -1042,7 +1149,7 @@ mod tests {
         );
 
         let summary = runtime
-            .run_turn("use the tool", Some(&mut RejectPrompter))
+            .run_turn("use the tool", Some(&mut RejectPrompter), None)
             .expect("conversation should continue after denied tool");
 
         assert_eq!(summary.tool_results.len(), 1);
@@ -1094,7 +1201,7 @@ mod tests {
         );
 
         let summary = runtime
-            .run_turn("use the tool", None)
+            .run_turn("use the tool", None, None)
             .expect("conversation should continue after hook denial");
 
         assert_eq!(summary.tool_results.len(), 1);
@@ -1158,7 +1265,7 @@ mod tests {
 
         // when
         let summary = runtime
-            .run_turn("use the tool", None)
+            .run_turn("use the tool", None, None)
             .expect("conversation should continue after hook failure");
 
         // then
@@ -1226,7 +1333,7 @@ mod tests {
         );
 
         let summary = runtime
-            .run_turn("use add", None)
+            .run_turn("use add", None, None)
             .expect("tool loop succeeds");
 
         assert_eq!(summary.tool_results.len(), 1);
@@ -1304,7 +1411,7 @@ mod tests {
 
         // when
         let summary = runtime
-            .run_turn("use fail", None)
+            .run_turn("use fail", None, None)
             .expect("tool loop succeeds");
 
         // then
@@ -1331,6 +1438,149 @@ mod tests {
             !output.contains("post hook should not run"),
             "normal post hook should not run on tool failure: {output:?}"
         );
+    }
+
+    #[test]
+    fn runtime_observer_receives_text_delta_tool_use_and_tool_result_in_order() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ScriptedApiClient { call_count: 0 },
+            StaticToolExecutor::new().register("add", |_input| Ok("4".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        let mut observer = RecordingRuntimeObserver::default();
+
+        runtime
+            .run_turn("what is 2 + 2?", None, Some(&mut observer))
+            .expect("conversation loop should succeed");
+
+        assert_eq!(
+            observer.events,
+            vec![
+                ObservedRuntimeEvent::TextDelta("Let me calculate that.".to_string()),
+                ObservedRuntimeEvent::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "add".to_string(),
+                    input: "2,2".to_string(),
+                },
+                ObservedRuntimeEvent::ToolResult {
+                    tool_use_id: "tool-1".to_string(),
+                    tool_name: "add".to_string(),
+                    output: "4".to_string(),
+                    is_error: false,
+                },
+                ObservedRuntimeEvent::TextDelta("The answer is 4.".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_observer_receives_denied_tool_result() {
+        struct RejectPrompter;
+        impl PermissionPrompter for RejectPrompter {
+            fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
+                PermissionPromptDecision::Deny {
+                    reason: "not now".to_string(),
+                }
+            }
+        }
+
+        struct ToolUseApiClient;
+        impl ApiClient for ToolUseApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if request
+                    .messages
+                    .iter()
+                    .any(|message| message.role == MessageRole::Tool)
+                {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("blocked".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "blocked".to_string(),
+                        input: "secret".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ToolUseApiClient,
+            StaticToolExecutor::new()
+                .register("blocked", |_input| panic!("denied tool should not execute")),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+        let mut observer = RecordingRuntimeObserver::default();
+
+        runtime
+            .run_turn(
+                "use the tool",
+                Some(&mut RejectPrompter),
+                Some(&mut observer),
+            )
+            .expect("conversation should continue after denied tool");
+
+        assert!(observer.events.contains(&ObservedRuntimeEvent::ToolResult {
+            tool_use_id: "tool-1".to_string(),
+            tool_name: "blocked".to_string(),
+            output: "not now".to_string(),
+            is_error: true,
+        }));
+    }
+
+    #[test]
+    fn runtime_observer_receives_error_tool_result() {
+        struct ToolUseApiClient;
+        impl ApiClient for ToolUseApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if request
+                    .messages
+                    .iter()
+                    .any(|message| message.role == MessageRole::Tool)
+                {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("failed".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "fail".to_string(),
+                        input: "{}".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ToolUseApiClient,
+            StaticToolExecutor::new().register("fail", |_input| Err(ToolError::new("boom"))),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        let mut observer = RecordingRuntimeObserver::default();
+
+        runtime
+            .run_turn("use the tool", None, Some(&mut observer))
+            .expect("conversation should continue after tool error");
+
+        assert!(observer.events.contains(&ObservedRuntimeEvent::ToolResult {
+            tool_use_id: "tool-1".to_string(),
+            tool_name: "fail".to_string(),
+            output: "boom".to_string(),
+            is_error: true,
+        }));
     }
 
     #[test]
@@ -1397,9 +1647,9 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         );
-        runtime.run_turn("a", None).expect("turn a");
-        runtime.run_turn("b", None).expect("turn b");
-        runtime.run_turn("c", None).expect("turn c");
+        runtime.run_turn("a", None, None).expect("turn a");
+        runtime.run_turn("b", None, None).expect("turn b");
+        runtime.run_turn("c", None, None).expect("turn c");
 
         let result = runtime.compact(CompactionConfig {
             preserve_recent_messages: 2,
@@ -1443,7 +1693,7 @@ mod tests {
         );
 
         runtime
-            .run_turn("persist this turn", None)
+            .run_turn("persist this turn", None, None)
             .expect("turn should succeed");
 
         let restored = Session::load_from_path(&path).expect("persisted session should reload");
@@ -1545,7 +1795,7 @@ mod tests {
         .with_auto_compaction_input_tokens_threshold(100_000);
 
         let summary = runtime
-            .run_turn("trigger", None)
+            .run_turn("trigger", None, None)
             .expect("turn should succeed");
 
         assert_eq!(
@@ -1588,7 +1838,7 @@ mod tests {
         .with_auto_compaction_input_tokens_threshold(100_000);
 
         let summary = runtime
-            .run_turn("trigger", None)
+            .run_turn("trigger", None, None)
             .expect("turn should succeed");
         assert_eq!(summary.auto_compaction, None);
         assert_eq!(runtime.session().messages.len(), 2);
@@ -1641,7 +1891,7 @@ mod tests {
         );
 
         let error = runtime
-            .run_turn("trigger", None)
+            .run_turn("trigger", None, None)
             .expect_err("health probe failure should abort the turn");
         assert!(
             error
@@ -1687,7 +1937,7 @@ mod tests {
         );
 
         let summary = runtime
-            .run_turn("trigger", None)
+            .run_turn("trigger", None, None)
             .expect("empty compacted session should not fail health probe");
         assert_eq!(summary.auto_compaction, None);
         assert_eq!(runtime.session().messages.len(), 2);
@@ -1699,7 +1949,7 @@ mod tests {
         let events = vec![AssistantEvent::TextDelta("hello".to_string())];
 
         // when
-        let error = build_assistant_message(events)
+        let error = build_assistant_message(events, None)
             .expect_err("assistant messages should require a stop event");
 
         // then
@@ -1714,8 +1964,8 @@ mod tests {
         let events = vec![AssistantEvent::MessageStop];
 
         // when
-        let error =
-            build_assistant_message(events).expect_err("assistant messages should require content");
+        let error = build_assistant_message(events, None)
+            .expect_err("assistant messages should require content");
 
         // then
         assert!(error
@@ -1769,7 +2019,7 @@ mod tests {
 
         // when
         let error = runtime
-            .run_turn("loop", None)
+            .run_turn("loop", None, None)
             .expect_err("conversation loop should stop after the configured limit");
 
         // then
@@ -1802,7 +2052,7 @@ mod tests {
 
         // when
         let error = runtime
-            .run_turn("hello", None)
+            .run_turn("hello", None, None)
             .expect_err("API failures should propagate");
 
         // then
