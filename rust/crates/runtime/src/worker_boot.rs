@@ -762,8 +762,8 @@ fn push_event(
     emit_state_file(worker);
 }
 
-/// Write current worker state to `.claw/worker-state.json` under the worker's cwd.
-/// This is the file-based observability surface: external observers (clawhip, orchestrators)
+/// Write current worker state to `.nexus/sudocode/worker-state.json` under the worker's cwd.
+/// This is the file-based observability surface: external observers (sudocodehip, orchestrators)
 /// poll this file instead of requiring an HTTP route on the opencode binary.
 #[derive(serde::Serialize)]
 struct StateSnapshot<'a> {
@@ -780,7 +780,9 @@ struct StateSnapshot<'a> {
 }
 
 fn emit_state_file(worker: &Worker) {
-    let state_dir = std::path::Path::new(&worker.cwd).join(".claw");
+    let state_dir = std::path::Path::new(&worker.cwd)
+        .join(".nexus")
+        .join("sudocode");
     if std::fs::create_dir_all(&state_dir).is_err() {
         return;
     }
@@ -1309,7 +1311,7 @@ mod tests {
                 &worker.worker_id,
                 Some("Implement worker handshake"),
                 Some(WorkerTaskReceipt {
-                    repo: "claw-code".to_string(),
+                    repo: "sudo-code".to_string(),
                     task_kind: "repo_code".to_string(),
                     source_surface: "omx_team".to_string(),
                     expected_artifacts: vec!["patch".to_string(), "tests".to_string()],
@@ -1349,7 +1351,7 @@ mod tests {
                     "Explain this KakaoTalk screenshot for a friend".to_string()
                 ),
                 task_receipt: Some(WorkerTaskReceipt {
-                    repo: "claw-code".to_string(),
+                    repo: "sudo-code".to_string(),
                     task_kind: "repo_code".to_string(),
                     source_surface: "omx_team".to_string(),
                     expected_artifacts: vec!["patch".to_string(), "tests".to_string()],
@@ -1423,7 +1425,7 @@ mod tests {
     #[test]
     fn emit_state_file_writes_worker_status_on_transition() {
         let cwd_path = std::env::temp_dir().join(format!(
-            "claw-state-test-{}",
+            "scode-state-test-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1435,7 +1437,10 @@ mod tests {
         let worker = registry.create(cwd, &[], true);
 
         // After create the worker is Spawning — state file should exist
-        let state_path = cwd_path.join(".claw").join("worker-state.json");
+        let state_path = cwd_path
+            .join(".nexus")
+            .join("sudocode")
+            .join("worker-state.json");
         assert!(
             state_path.exists(),
             "state file should exist after worker creation"
@@ -1560,7 +1565,7 @@ mod tests {
 
         // Now simulate startup timeout
         let timed_out = registry
-            .observe_startup_timeout(&worker.worker_id, "claw prompt", true, true)
+            .observe_startup_timeout(&worker.worker_id, "scode prompt", true, true)
             .expect("startup timeout observe should succeed");
 
         let event = timed_out
@@ -1598,7 +1603,7 @@ mod tests {
 
         // Simulate startup timeout while prompt is still in flight
         let timed_out = registry
-            .observe_startup_timeout(&worker.worker_id, "claw prompt", true, true)
+            .observe_startup_timeout(&worker.worker_id, "scode prompt", true, true)
             .expect("startup timeout observe should succeed");
 
         let event = timed_out

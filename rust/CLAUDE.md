@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claw Code (clawcode.dev) when working with code in this repository.
+This file provides guidance to Sudo Code (sudocode.dev) when working with code in this repository.
 
 ## Detected stack
 - Languages: Rust.
@@ -11,5 +11,5 @@ This file provides guidance to Claw Code (clawcode.dev) when working with code i
 
 ## Working agreement
 - Prefer small, reviewable changes and keep generated bootstrap files aligned with actual repo workflows.
-- Keep shared defaults in `.claw.json`; reserve `.claw/settings.local.json` for machine-local overrides.
+- Keep shared defaults in `.scode.json`; reserve `.nexus/sudocode/settings.local.json` for machine-local overrides.
 - Do not overwrite existing `CLAUDE.md` content automatically; update it intentionally when repo workflows change.

@@ -1,4 +1,4 @@
-//! Core runtime primitives for the `claw` CLI and supporting crates.
+//! Core runtime primitives for the `scode` CLI and supporting crates.
 //!
 //! This crate owns session persistence, permission evaluation, prompt assembly,
 //! MCP plumbing, tool-facing file operations, and the core conversation loop
@@ -62,7 +62,7 @@ pub use config::{
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
     RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
-    CLAW_SETTINGS_SCHEMA_NAME,
+    SUDOCODE_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -155,7 +155,7 @@ pub use session::{
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{
-    check_base_commit, format_stale_base_warning, read_claw_base_file, resolve_expected_base,
+    check_base_commit, format_stale_base_warning, read_sudocode_base_file, resolve_expected_base,
     BaseCommitSource, BaseCommitState,
 };
 pub use stale_branch::{

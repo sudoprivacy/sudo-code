@@ -151,7 +151,7 @@ mod tests {
             objective: "Implement typed task packet format".to_string(),
             scope: TaskScope::Module,
             scope_path: Some("runtime/task system".to_string()),
-            repo: "claw-code-parity".to_string(),
+            repo: "sudo-code-parity".to_string(),
             worktree: Some("/tmp/wt-1".to_string()),
             branch_policy: "origin/main only".to_string(),
             acceptance_tests: vec![

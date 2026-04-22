@@ -150,7 +150,7 @@ impl SessionIdentity {
 pub struct LaneOwnership {
     /// Owner/assignee identity
     pub owner: String,
-    /// Workflow scope (e.g., claw-code-dogfood, external-git-maintenance)
+    /// Workflow scope (e.g., sudo-code-dogfood, external-git-maintenance)
     pub workflow_scope: String,
     /// Whether the watcher is expected to act, observe, or ignore
     pub watcher_action: WatcherAction,
@@ -405,7 +405,10 @@ pub enum BlockedSubphase {
     #[serde(rename = "blocked.branch_freshness")]
     BranchFreshness { behind_main: u32 },
     #[serde(rename = "blocked.test_hang")]
-    TestHang { elapsed_secs: u32, test_name: Option<String> },
+    TestHang {
+        elapsed_secs: u32,
+        test_name: Option<String>,
+    },
     #[serde(rename = "blocked.report_pending")]
     ReportPending { since_secs: u32 },
 }
@@ -543,7 +546,8 @@ impl LaneEvent {
             .with_failure_class(blocker.failure_class)
             .with_detail(blocker.detail.clone());
         if let Some(ref subphase) = blocker.subphase {
-            event = event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
+            event =
+                event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
         }
         event
     }
@@ -554,7 +558,8 @@ impl LaneEvent {
             .with_failure_class(blocker.failure_class)
             .with_detail(blocker.detail.clone());
         if let Some(ref subphase) = blocker.subphase {
-            event = event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
+            event =
+                event.with_data(serde_json::to_value(subphase).expect("subphase should serialize"));
         }
         event
     }
@@ -562,8 +567,12 @@ impl LaneEvent {
     /// Ship prepared — §4.44.5
     #[must_use]
     pub fn ship_prepared(emitted_at: impl Into<String>, provenance: &ShipProvenance) -> Self {
-        Self::new(LaneEventName::ShipPrepared, LaneEventStatus::Ready, emitted_at)
-            .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
+        Self::new(
+            LaneEventName::ShipPrepared,
+            LaneEventStatus::Ready,
+            emitted_at,
+        )
+        .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
     }
 
     /// Ship commits selected — §4.44.5
@@ -573,22 +582,34 @@ impl LaneEvent {
         commit_count: u32,
         commit_range: impl Into<String>,
     ) -> Self {
-        Self::new(LaneEventName::ShipCommitsSelected, LaneEventStatus::Ready, emitted_at)
-            .with_detail(format!("{} commits: {}", commit_count, commit_range.into()))
+        Self::new(
+            LaneEventName::ShipCommitsSelected,
+            LaneEventStatus::Ready,
+            emitted_at,
+        )
+        .with_detail(format!("{} commits: {}", commit_count, commit_range.into()))
     }
 
     /// Ship merged — §4.44.5
     #[must_use]
     pub fn ship_merged(emitted_at: impl Into<String>, provenance: &ShipProvenance) -> Self {
-        Self::new(LaneEventName::ShipMerged, LaneEventStatus::Completed, emitted_at)
-            .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
+        Self::new(
+            LaneEventName::ShipMerged,
+            LaneEventStatus::Completed,
+            emitted_at,
+        )
+        .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
     }
 
     /// Ship pushed to main — §4.44.5
     #[must_use]
     pub fn ship_pushed_main(emitted_at: impl Into<String>, provenance: &ShipProvenance) -> Self {
-        Self::new(LaneEventName::ShipPushedMain, LaneEventStatus::Completed, emitted_at)
-            .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
+        Self::new(
+            LaneEventName::ShipPushedMain,
+            LaneEventStatus::Completed,
+            emitted_at,
+        )
+        .with_data(serde_json::to_value(provenance).expect("ship provenance should serialize"))
     }
 
     #[must_use]
@@ -924,13 +945,13 @@ mod tests {
     #[test]
     fn lane_ownership_binding_includes_workflow_scope() {
         let ownership = LaneOwnership {
-            owner: "claw-1".to_string(),
-            workflow_scope: "claw-code-dogfood".to_string(),
+            owner: "scode-1".to_string(),
+            workflow_scope: "sudo-code-dogfood".to_string(),
             watcher_action: WatcherAction::Act,
         };
 
-        assert_eq!(ownership.owner, "claw-1");
-        assert_eq!(ownership.workflow_scope, "claw-code-dogfood");
+        assert_eq!(ownership.owner, "scode-1");
+        assert_eq!(ownership.workflow_scope, "sudo-code-dogfood");
         assert_eq!(ownership.watcher_action, WatcherAction::Act);
     }
 

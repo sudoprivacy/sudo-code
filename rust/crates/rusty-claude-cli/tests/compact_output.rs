@@ -27,9 +27,9 @@ fn compact_flag_prints_only_final_assistant_text_without_tool_call_details() {
     fs::create_dir_all(&home).expect("home should exist");
     fs::write(workspace.join("fixture.txt"), "alpha parity line\n").expect("fixture should write");
 
-    // when we run claw in compact text mode against a tool-using scenario
+    // when we run scode in compact text mode against a tool-using scenario
     let prompt = format!("{SCENARIO_PREFIX}read_file_roundtrip");
-    let output = run_claw(
+    let output = run_scode(
         &workspace,
         &config_home,
         &home,
@@ -93,9 +93,9 @@ fn compact_flag_streaming_text_only_emits_final_message_text() {
     fs::create_dir_all(&config_home).expect("config home should exist");
     fs::create_dir_all(&home).expect("home should exist");
 
-    // when we invoke claw with --compact for the streaming text scenario
+    // when we invoke scode with --compact for the streaming text scenario
     let prompt = format!("{SCENARIO_PREFIX}streaming_text");
-    let output = run_claw(
+    let output = run_scode(
         &workspace,
         &config_home,
         &home,
@@ -142,7 +142,7 @@ fn compact_flag_with_json_output_emits_structured_json() {
     fs::create_dir_all(&home).expect("home should exist");
 
     let prompt = format!("{SCENARIO_PREFIX}streaming_text");
-    let output = run_claw(
+    let output = run_scode(
         &workspace,
         &config_home,
         &home,
@@ -172,7 +172,10 @@ stderr:
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     let parsed: Value = serde_json::from_str(&stdout).expect("compact json stdout should parse");
-    assert_eq!(parsed["message"], "Mock streaming says hello from the parity harness.");
+    assert_eq!(
+        parsed["message"],
+        "Mock streaming says hello from the parity harness."
+    );
     assert_eq!(parsed["compact"], true);
     assert_eq!(parsed["model"], "claude-sonnet-4-6");
     assert!(parsed["usage"].is_object());
@@ -180,25 +183,25 @@ stderr:
     fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
 }
 
-fn run_claw(
+fn run_scode(
     cwd: &std::path::Path,
     config_home: &std::path::Path,
     home: &std::path::Path,
     base_url: &str,
     args: &[&str],
 ) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_scode"));
     command
         .current_dir(cwd)
         .env_clear()
         .env("ANTHROPIC_API_KEY", "test-compact-key")
         .env("ANTHROPIC_BASE_URL", base_url)
-        .env("CLAW_CONFIG_HOME", config_home)
+        .env("SUDO_CODE_CONFIG_HOME", config_home)
         .env("HOME", home)
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
         .args(args);
-    command.output().expect("claw should launch")
+    command.output().expect("scode should launch")
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -208,7 +211,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         .as_millis();
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "claw-compact-{label}-{}-{millis}-{counter}",
+        "scode-compact-{label}-{}-{millis}-{counter}",
         std::process::id()
     ))
 }
