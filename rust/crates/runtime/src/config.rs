@@ -240,14 +240,10 @@ impl ConfigLoader {
 
     #[must_use]
     pub fn discover(&self) -> Vec<ConfigEntry> {
-        let user_legacy_path = self.config_home.parent().map_or_else(
-            || PathBuf::from("sudocode.json"),
-            |parent| parent.join("sudocode.json"),
-        );
         vec![
             ConfigEntry {
                 source: ConfigSource::User,
-                path: user_legacy_path,
+                path: self.config_home.join("scode.json"),
             },
             ConfigEntry {
                 source: ConfigSource::User,
@@ -682,7 +678,6 @@ struct ParsedConfigFile {
 }
 
 fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, ConfigError> {
-    let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some("sudocode.json");
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -698,13 +693,9 @@ fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, Co
 
     let parsed = match JsonValue::parse(&contents) {
         Ok(parsed) => parsed,
-        Err(_error) if is_legacy_config => return Ok(None),
         Err(error) => return Err(ConfigError::Parse(format!("{}: {error}", path.display()))),
     };
     let Some(object) = parsed.as_object() else {
-        if is_legacy_config {
-            return Ok(None);
-        }
         return Err(ConfigError::Parse(format!(
             "{}: top-level settings value must be a JSON object",
             path.display()
@@ -1311,10 +1302,10 @@ mod tests {
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
-            home.parent().expect("home parent").join("sudocode.json"),
+            home.join("scode.json"),
             r#"{"model":"haiku","env":{"A":"1"},"mcpServers":{"home":{"command":"uvx","args":["home"]}}}"#,
         )
-        .expect("write user compat config");
+        .expect("write user scode config");
         fs::write(
             home.join("settings.json"),
             r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"defaultMode":"plan","allow":["Read"],"deny":["Bash(rm -rf)"]}}"#,
