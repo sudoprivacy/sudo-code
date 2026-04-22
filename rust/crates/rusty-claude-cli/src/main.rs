@@ -44,11 +44,11 @@ use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
     load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
-    ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
-    ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
-    McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
-    ToolError, ToolExecutor, UsageTracker,
+    AcpServer, AcpServerSpec, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
+    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
+    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
+    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -404,6 +404,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
+        CliAction::AcpServe { output_format: _ } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let mut server = AcpServer::new(AcpServerSpec {
+                    server_name: "claw-acp".to_string(),
+                    server_version: env!("CARGO_PKG_VERSION").to_string(),
+                });
+                server.run().await
+            })?;
+        }
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         // #146: dispatch pure-local introspection. Text mode uses existing
@@ -529,6 +539,9 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Acp {
+        output_format: CliOutputFormat,
+    },
+    AcpServe {
         output_format: CliOutputFormat,
     },
     State {
@@ -1147,7 +1160,7 @@ fn removed_auth_surface_error(command_name: &str) -> String {
 fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     match args {
         [] => Ok(CliAction::Acp { output_format }),
-        [subcommand] if subcommand == "serve" => Ok(CliAction::Acp { output_format }),
+        [subcommand] if subcommand == "serve" => Ok(CliAction::AcpServe { output_format }),
         _ => Err(String::from(
             "unsupported ACP invocation. Use `claw acp`, `claw acp serve`, `claw --acp`, or `claw -acp`.",
         )),
@@ -10115,7 +10128,7 @@ mod tests {
         );
         assert_eq!(
             parse_args(&["acp".to_string(), "serve".to_string()]).expect("acp serve should parse"),
-            CliAction::Acp {
+            CliAction::AcpServe {
                 output_format: CliOutputFormat::Text,
             }
         );
