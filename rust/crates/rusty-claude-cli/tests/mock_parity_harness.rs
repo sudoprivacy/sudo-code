@@ -427,7 +427,7 @@ fn prepare_plugin_fixture(workspace: &HarnessWorkspace) {
     let script_path = tool_dir.join("echo-json.sh");
     fs::write(
         &script_path,
-        "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"plugin\":\"%s\",\"tool\":\"%s\",\"input\":%s}\\n' \"$CLAWD_PLUGIN_ID\" \"$CLAWD_TOOL_NAME\" \"$INPUT\"\n",
+        "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"plugin\":\"%s\",\"tool\":\"%s\",\"input\":%s}\\n' \"$SUDOCODE_PLUGIN_ID\" \"$SUDOCODE_TOOL_NAME\" \"$INPUT\"\n",
     )
     .expect("plugin script should write");
     let mut permissions = fs::metadata(&script_path)
