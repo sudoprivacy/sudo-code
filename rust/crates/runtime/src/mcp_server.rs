@@ -17,7 +17,7 @@ use std::io;
 
 use serde_json::{json, Value as JsonValue};
 use tokio::io::{
-    stdin, stdout, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Stdin, Stdout,
+    stdin, stdout, BufReader, Stdin, Stdout,
 };
 
 use crate::mcp_stdio::{
@@ -85,7 +85,7 @@ impl McpServer {
     /// callers can log and exit non-zero.
     pub async fn run(&mut self) -> io::Result<()> {
         loop {
-            let Some(payload) = read_frame(&mut self.stdin).await? else {
+            let Some(payload) = crate::jsonrpc_transport::read_msg(&mut self.stdin).await? else {
                 return Ok(());
             };
 
@@ -106,7 +106,7 @@ impl McpServer {
                             data: None,
                         }),
                     };
-                    write_response(&mut self.stdout, &response).await?;
+                    self.write_response(&response).await?;
                     continue;
                 }
             };
@@ -130,14 +130,23 @@ impl McpServer {
                             data: None,
                         }),
                     };
-                    write_response(&mut self.stdout, &response).await?;
+                    self.write_response(&response).await?;
                     continue;
                 }
             };
 
             let response = self.dispatch(request);
-            write_response(&mut self.stdout, &response).await?;
+            self.write_response(&response).await?;
         }
+    }
+
+    async fn write_response(
+        &mut self,
+        response: &JsonRpcResponse<JsonValue>,
+    ) -> io::Result<()> {
+        let body = serde_json::to_vec(response)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        crate::jsonrpc_transport::write_msg(&mut self.stdout, &body).await
     }
 
     fn dispatch(&self, request: JsonRpcRequest<JsonValue>) -> JsonRpcResponse<JsonValue> {
@@ -240,61 +249,6 @@ fn invalid_params_response(id: JsonRpcId, message: &str) -> JsonRpcResponse<Json
             data: None,
         }),
     }
-}
-
-/// Reads a single LSP-framed JSON-RPC payload from `reader`.
-///
-/// Returns `Ok(None)` on clean EOF before any header bytes have been read,
-/// matching how [`crate::mcp_stdio::McpStdioProcess`] treats stream closure.
-async fn read_frame(reader: &mut BufReader<Stdin>) -> io::Result<Option<Vec<u8>>> {
-    let mut content_length: Option<usize> = None;
-    let mut first_header = true;
-    loop {
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line).await?;
-        if bytes_read == 0 {
-            if first_header {
-                return Ok(None);
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "MCP stdio stream closed while reading headers",
-            ));
-        }
-        first_header = false;
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        let header = line.trim_end_matches(['\r', '\n']);
-        if let Some((name, value)) = header.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("Content-Length") {
-                let parsed = value
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                content_length = Some(parsed);
-            }
-        }
-    }
-
-    let content_length = content_length.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
-    })?;
-    let mut payload = vec![0_u8; content_length];
-    reader.read_exact(&mut payload).await?;
-    Ok(Some(payload))
-}
-
-async fn write_response(
-    stdout: &mut Stdout,
-    response: &JsonRpcResponse<JsonValue>,
-) -> io::Result<()> {
-    let body = serde_json::to_vec(response)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let header = format!("Content-Length: {}\r\n\r\n", body.len());
-    stdout.write_all(header.as_bytes()).await?;
-    stdout.write_all(&body).await?;
-    stdout.flush().await
 }
 
 #[cfg(test)]
