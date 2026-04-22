@@ -140,11 +140,8 @@ fn config_command_loads_defaults_from_standard_config_locations() {
 
     fs::write(config_home.join("settings.json"), r#"{"model":"haiku"}"#)
         .expect("write user settings");
-    fs::write(
-        temp_dir.join(".nexus/sudocode.json"),
-        r#"{"model":"sonnet"}"#,
-    )
-    .expect("write project settings");
+    fs::write(temp_dir.join(".scode.json"), r#"{"model":"sonnet"}"#)
+        .expect("write project settings");
     fs::write(
         temp_dir
             .join(".nexus")
@@ -180,12 +177,7 @@ fn config_command_loads_defaults_from_standard_config_locations() {
             .to_str()
             .expect("utf8 path")
     ));
-    assert!(stdout.contains(
-        temp_dir
-            .join(".nexus/sudocode.json")
-            .to_str()
-            .expect("utf8 path")
-    ));
+    assert!(stdout.contains(temp_dir.join(".scode.json").to_str().expect("utf8 path")));
     assert!(stdout.contains(
         temp_dir
             .join(".nexus")

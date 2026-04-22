@@ -255,7 +255,7 @@ impl ConfigLoader {
             },
             ConfigEntry {
                 source: ConfigSource::Project,
-                path: self.cwd.join(".nexus/sudocode.json"),
+                path: self.cwd.join(".scode.json"),
             },
             ConfigEntry {
                 source: ConfigSource::Project,
@@ -682,8 +682,7 @@ struct ParsedConfigFile {
 }
 
 fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, ConfigError> {
-    let is_legacy_config =
-        path.file_name().and_then(|name| name.to_str()) == Some(".nexus/sudocode.json");
+    let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some("sudocode.json");
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1322,7 +1321,7 @@ mod tests {
         )
         .expect("write user settings");
         fs::write(
-            cwd.join(".nexus/sudocode.json"),
+            cwd.join(".scode.json"),
             r#"{"model":"project-compat","env":{"B":"2"}}"#,
         )
         .expect("write project compat config");

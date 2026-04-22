@@ -2,6 +2,12 @@
     dead_code,
     unused_imports,
     unused_variables,
+    clippy::doc_markdown,
+    clippy::manual_string_new,
+    clippy::match_same_arms,
+    clippy::result_large_err,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
     clippy::unneeded_struct_pattern,
     clippy::unnecessary_wraps,
     clippy::unused_self
@@ -68,7 +74,7 @@ enum ModelSource {
     Flag,
     /// ANTHROPIC_MODEL environment variable (when no flag was passed).
     Env,
-    /// `model` key in `.nexus/sudocode.json` / `.nexus/sudocode/settings.json` (when neither
+    /// `model` key in `.scode.json` / `.nexus/sudocode/settings.json` (when neither
     /// flag nor env set it).
     Config,
     /// Compiled-in DEFAULT_MODEL fallback.
@@ -891,7 +897,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             })
         }
         // #146: `config` is pure-local read-only introspection (merges
-        // `.nexus/sudocode.json` + `.nexus/sudocode/settings.json` from disk, no network, no
+        // `.scode.json` + `.nexus/sudocode/settings.json` from disk, no network, no
         // state mutation). Previously callers had to spin up a session with
         // `scode --resume SESSION.jsonl /config` to see their own config,
         // which is synthetic friction. Accepts an optional section name
@@ -1548,7 +1554,7 @@ fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> PermissionMode
 }
 
 fn default_permission_mode() -> PermissionMode {
-    env::var("RUSTY_CLAUDE_PERMISSION_MODE")
+    env::var("SUDO_CODE_PERMISSION_MODE")
         .ok()
         .as_deref()
         .and_then(normalize_permission_mode)
@@ -1892,16 +1898,21 @@ impl DoctorReport {
             ),
         ];
         lines.extend(self.checks.iter().map(render_diagnostic_check));
+        if fail_count == 0 && warn_count == 0 {
+            lines.push("Sudo Code is healthy.".to_string());
+        }
         lines.join("\n\n")
     }
 
     fn json_value(&self) -> Value {
         let report = self.render();
         let (ok_count, warn_count, fail_count) = self.counts();
+        let healthy = fail_count == 0 && warn_count == 0;
         json!({
             "kind": "doctor",
             "message": report,
             "report": report,
+            "healthy": healthy,
             "has_failures": self.has_failures(),
             "summary": {
                 "total": self.checks.len(),
@@ -1976,13 +1987,21 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     let report = render_doctor_report()?;
     let message = report.render();
     match output_format {
-        CliOutputFormat::Text => println!("{message}"),
-        CliOutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&report.json_value())?);
+        CliOutputFormat::Text => {
+            println!("{message}");
+            if report.has_failures() {
+                return Err("doctor found failing checks".into());
+            }
         }
-    }
-    if report.has_failures() {
-        return Err("doctor found failing checks".into());
+        CliOutputFormat::Json => {
+            // Emit a single valid JSON object that includes both the report
+            // and the failure status so downstream tools never see a split
+            // stdout-report + stderr-error pair (#121).
+            println!("{}", serde_json::to_string_pretty(&report.json_value())?);
+            if report.has_failures() {
+                std::process::exit(1);
+            }
+        }
     }
     Ok(())
 }
@@ -2803,7 +2822,7 @@ struct StatusContext {
     git_branch: Option<String>,
     git_summary: GitWorkspaceSummary,
     sandbox_status: runtime::SandboxStatus,
-    /// #143: when `.nexus/sudocode.json` (or another loaded config file) fails to parse,
+    /// #143: when `.scode.json` (or another loaded config file) fails to parse,
     /// we capture the parse error here and still populate every field that
     /// doesn't depend on runtime config (workspace, git, sandbox defaults,
     /// discovery counts). Top-level JSON output then reports
@@ -4190,13 +4209,13 @@ impl LiveCli {
             |path| path.display().to_string(),
         );
         format!(
-            "\x1b[38;5;196m\
- ██████╗██╗      █████╗ ██╗    ██╗\n\
-██╔════╝██║     ██╔══██╗██║    ██║\n\
-██║     ██║     ███████║██║ █╗ ██║\n\
-██║     ██║     ██╔══██║██║███╗██║\n\
-╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
- ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
+            "\x1b[38;5;117m\
+███████╗██╗   ██╗██████╗  ██████╗ \n\
+██╔════╝██║   ██║██╔══██╗██╔═══██╗\n\
+███████╗██║   ██║██║  ██║██║   ██║\n\
+╚════██║██║   ██║██║  ██║██║   ██║\n\
+███████║╚██████╔╝██████╔╝╚██████╔╝\n\
+╚══════╝ ╚═════╝ ╚═════╝  ╚═════╝\x1b[0m \x1b[38;5;208mCode\x1b[0m\n\n\
   \x1b[2mModel\x1b[0m            {}\n\
   \x1b[2mPermissions\x1b[0m      {}\n\
   \x1b[2mBranch\x1b[0m           {}\n\
@@ -5814,7 +5833,7 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
             .to_string(),
         LocalHelpTopic::Init => "Init
   Usage            scode init [--output-format <format>]
-  Purpose          create .nexus/sudocode/, .nexus/sudocode.json, .gitignore, and CLAUDE.md in the current project
+  Purpose          create .nexus/sudocode/, .scode.json, .gitignore, and CLAUDE.md in the current project
   Output           list of created vs. skipped files (idempotent: safe to re-run)
   Formats          text (default), json
   Related          scode status · scode doctor"
@@ -9337,7 +9356,7 @@ mod tests {
     #[test]
     fn defaults_to_repl_when_no_args() {
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("SUDO_CODE_PERMISSION_MODE");
         assert_eq!(
             parse_args(&[]).expect("args should parse"),
             CliAction::Repl {
@@ -9367,9 +9386,9 @@ mod tests {
         .expect("project config should write");
 
         let original_config_home = std::env::var("SUDO_CODE_CONFIG_HOME").ok();
-        let original_permission_mode = std::env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok();
+        let original_permission_mode = std::env::var("SUDO_CODE_PERMISSION_MODE").ok();
         std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("SUDO_CODE_PERMISSION_MODE");
 
         let resolved = with_current_dir(&cwd, super::default_permission_mode);
 
@@ -9378,8 +9397,8 @@ mod tests {
             None => std::env::remove_var("SUDO_CODE_CONFIG_HOME"),
         }
         match original_permission_mode {
-            Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
-            None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
+            Some(value) => std::env::set_var("SUDO_CODE_PERMISSION_MODE", value),
+            None => std::env::remove_var("SUDO_CODE_PERMISSION_MODE"),
         }
         std::fs::remove_dir_all(root).expect("temp config root should clean up");
 
@@ -9402,9 +9421,9 @@ mod tests {
         .expect("project config should write");
 
         let original_config_home = std::env::var("SUDO_CODE_CONFIG_HOME").ok();
-        let original_permission_mode = std::env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok();
+        let original_permission_mode = std::env::var("SUDO_CODE_PERMISSION_MODE").ok();
         std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
-        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
+        std::env::set_var("SUDO_CODE_PERMISSION_MODE", "read-only");
 
         let resolved = with_current_dir(&cwd, super::default_permission_mode);
 
@@ -9413,8 +9432,8 @@ mod tests {
             None => std::env::remove_var("SUDO_CODE_CONFIG_HOME"),
         }
         match original_permission_mode {
-            Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
-            None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
+            Some(value) => std::env::set_var("SUDO_CODE_PERMISSION_MODE", value),
+            None => std::env::remove_var("SUDO_CODE_PERMISSION_MODE"),
         }
         std::fs::remove_dir_all(root).expect("temp config root should clean up");
 
@@ -9465,7 +9484,7 @@ mod tests {
     #[test]
     fn parses_prompt_subcommand() {
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("SUDO_CODE_PERMISSION_MODE");
         let args = vec![
             "prompt".to_string(),
             "hello".to_string(),
@@ -9554,7 +9573,7 @@ mod tests {
     #[test]
     fn parses_bare_prompt_and_json_output_flag() {
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("SUDO_CODE_PERMISSION_MODE");
         let args = vec![
             "--output-format=json".to_string(),
             "--model".to_string(),
@@ -9582,7 +9601,7 @@ mod tests {
     fn parses_compact_flag_for_prompt_mode() {
         // given a bare prompt invocation that includes the --compact flag
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("SUDO_CODE_PERMISSION_MODE");
         let args = vec![
             "--compact".to_string(),
             "summarize".to_string(),
@@ -9613,7 +9632,7 @@ mod tests {
     fn prompt_subcommand_defaults_compact_to_false() {
         // given a `prompt` subcommand invocation without --compact
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("SUDO_CODE_PERMISSION_MODE");
         let args = vec!["prompt".to_string(), "hello".to_string()];
 
         // when parse_args runs
@@ -9629,7 +9648,7 @@ mod tests {
     #[test]
     fn resolves_model_aliases_in_args() {
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("SUDO_CODE_PERMISSION_MODE");
         let args = vec![
             "--model".to_string(),
             "opus".to_string(),
@@ -9735,10 +9754,10 @@ mod tests {
     #[test]
     fn dangerously_skip_permissions_flag_forces_danger_full_access_in_repl() {
         let _guard = env_lock();
-        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
+        std::env::set_var("SUDO_CODE_PERMISSION_MODE", "read-only");
         let args = vec!["--dangerously-skip-permissions".to_string()];
         let parsed = parse_args(&args).expect("args should parse");
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("SUDO_CODE_PERMISSION_MODE");
 
         assert_eq!(
             parsed,
@@ -9756,7 +9775,7 @@ mod tests {
     #[test]
     fn dangerously_skip_permissions_flag_applies_to_prompt_subcommand() {
         let _guard = env_lock();
-        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
+        std::env::set_var("SUDO_CODE_PERMISSION_MODE", "read-only");
         let args = vec![
             "--dangerously-skip-permissions".to_string(),
             "prompt".to_string(),
@@ -9765,7 +9784,7 @@ mod tests {
             "thing".to_string(),
         ];
         let parsed = parse_args(&args).expect("args should parse");
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("SUDO_CODE_PERMISSION_MODE");
 
         assert_eq!(
             parsed,
@@ -9786,7 +9805,7 @@ mod tests {
     #[test]
     fn parses_allowed_tools_flags_with_aliases_and_lists() {
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("SUDO_CODE_PERMISSION_MODE");
         let args = vec![
             "--allowedTools".to_string(),
             "read,glob".to_string(),
@@ -10223,7 +10242,7 @@ mod tests {
         std::fs::create_dir_all(cwd.join(".nexus")).expect("nexus dir");
         // One valid server + one malformed entry missing `command`.
         std::fs::write(
-            cwd.join(".nexus/sudocode.json"),
+            cwd.join(".scode.json"),
             r#"{
   "mcpServers": {
     "everything": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"]},
@@ -10232,7 +10251,7 @@ mod tests {
 }
 "#,
         )
-        .expect("write malformed .nexus/sudocode.json");
+        .expect("write malformed .scode.json");
 
         let context = with_current_dir(&cwd, || {
             super::status_context(None)
@@ -10370,7 +10389,7 @@ mod tests {
     #[test]
     fn parses_single_word_command_aliases_without_falling_back_to_prompt_mode() {
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("SUDO_CODE_PERMISSION_MODE");
         assert_eq!(
             parse_args(&["help".to_string()]).expect("help should parse"),
             CliAction::Help {
@@ -10518,7 +10537,7 @@ mod tests {
     fn parses_bare_export_subcommand_targeting_latest_session() {
         // given
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("SUDO_CODE_PERMISSION_MODE");
         let args = vec!["export".to_string()];
 
         // when
@@ -10819,7 +10838,7 @@ mod tests {
     #[test]
     fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("SUDO_CODE_PERMISSION_MODE");
         // Input is ["--model", "opus", "please", "debug", "this"] so the joined
         // prompt shorthand must stay a normal multi-word prompt while still
         // honoring alias validation at parse time.

