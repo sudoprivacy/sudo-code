@@ -58,8 +58,8 @@ use tools::{
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 
-/// #148: Model provenance for `claw status` JSON/text output. Records where
-/// the resolved model string came from so claws don't have to re-read argv
+/// #148: Model provenance for `scode status` JSON/text output. Records where
+/// the resolved model string came from so consumers don't have to re-read argv
 /// to audit whether their `--model` flag was honored vs falling back to env
 /// or config or default.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +68,7 @@ enum ModelSource {
     Flag,
     /// ANTHROPIC_MODEL environment variable (when no flag was passed).
     Env,
-    /// `model` key in `.claw.json` / `.claw/settings.json` (when neither
+    /// `model` key in `.nexus/sudocode.json` / `.nexus/sudocode/settings.json` (when neither
     /// flag nor env set it).
     Config,
     /// Compiled-in DEFAULT_MODEL fallback.
@@ -168,9 +168,9 @@ const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
-const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/claw-code";
-const OFFICIAL_REPO_SLUG: &str = "ultraworkers/claw-code";
-const DEPRECATED_INSTALL_COMMAND: &str = "cargo install claw-code";
+const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/sudo-code";
+const OFFICIAL_REPO_SLUG: &str = "ultraworkers/sudo-code";
+const DEPRECATED_INSTALL_COMMAND: &str = "cargo install sudo-code";
 const LATEST_SESSION_REFERENCE: &str = "latest";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
 const CLI_OPTION_SUGGESTIONS: &[&str] = &[
@@ -210,7 +210,7 @@ fn main() {
             .any(|w| w[0] == "--output-format" && w[1] == "json")
             || argv.iter().any(|a| a == "--output-format=json");
         if json_output {
-            // #77: classify error by prefix so downstream claws can route without
+            // #77: classify error by prefix so downstream consumers can route without
             // regex-scraping the prose. Split short-reason from hint-runbook.
             let kind = classify_error_kind(&message);
             let (short_reason, hint) = split_error_hint(&message);
@@ -227,15 +227,17 @@ fn main() {
             // #156: Add machine-readable error kind to text output so stderr observers
             // don't need to regex-scrape the prose.
             let kind = classify_error_kind(&message);
-            if message.contains("`claw --help`") {
-                eprintln!("[error-kind: {kind}]
-error: {message}");
+            if message.contains("`scode --help`") {
+                eprintln!(
+                    "[error-kind: {kind}]
+error: {message}"
+                );
             } else {
                 eprintln!(
                     "[error-kind: {kind}]
 error: {message}
 
-Run `claw --help` for usage."
+Run `scode --help` for usage."
                 );
             }
         }
@@ -372,7 +374,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model_flag_raw,
             permission_mode,
             output_format,
-        } => print_status_snapshot(&model, model_flag_raw.as_deref(), permission_mode, output_format)?,
+        } => print_status_snapshot(
+            &model,
+            model_flag_raw.as_deref(),
+            permission_mode,
+            output_format,
+        )?,
         CliAction::Sandbox { output_format } => print_sandbox_status_snapshot(output_format)?,
         CliAction::Prompt {
             prompt,
@@ -412,19 +419,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Config {
             section,
             output_format,
-        } => {
-            match output_format {
-                CliOutputFormat::Text => {
-                    println!("{}", render_config_report(section.as_deref())?);
-                }
-                CliOutputFormat::Json => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&render_config_json(section.as_deref())?)?
-                    );
-                }
+        } => match output_format {
+            CliOutputFormat::Text => {
+                println!("{}", render_config_report(section.as_deref())?);
             }
-        }
+            CliOutputFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&render_config_json(section.as_deref())?)?
+                );
+            }
+        },
         CliAction::Diff { output_format } => match output_format {
             CliOutputFormat::Text => {
                 println!("{}", render_diff_report()?);
@@ -537,7 +542,7 @@ enum CliAction {
     Init {
         output_format: CliOutputFormat,
     },
-    // #146: `claw config` and `claw diff` are pure-local read-only
+    // #146: `scode config` and `scode diff` are pure-local read-only
     // introspection commands; wire them as standalone CLI subcommands.
     Config {
         section: Option<String>,
@@ -573,7 +578,7 @@ enum LocalHelpTopic {
     Doctor,
     Acp,
     // #141: extend the local-help pattern to every subcommand so
-    // `claw <subcommand> --help` has one consistent contract.
+    // `scode <subcommand> --help` has one consistent contract.
     Init,
     State,
     Export,
@@ -627,16 +632,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--help" | "-h"
                 if !rest.is_empty()
-                    && matches!(
-                        rest[0].as_str(),
-                        "prompt"
-                            | "commit"
-                            | "pr"
-                            | "issue"
-                    ) =>
+                    && matches!(rest[0].as_str(), "prompt" | "commit" | "pr" | "issue") =>
             {
                 // `--help` following a subcommand that would otherwise forward
-                // the arg to the API (e.g. `claw prompt --help`) should show
+                // the arg to the API (e.g. `scode prompt --help`) should show
                 // top-level help instead. Subcommands that consume their own
                 // args (agents, mcp, plugins, skills) and local help-topic
                 // subcommands (status, sandbox, doctor, init, state, export,
@@ -734,7 +733,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             "-p" => {
-                // Claw Code compat: -p "prompt" = one-shot prompt
+                // Sudo Code compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
                 if prompt.trim().is_empty() {
                     return Err("-p requires a prompt string".to_string());
@@ -753,7 +752,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 });
             }
             "--print" => {
-                // Claw Code compat: --print makes output non-interactive
+                // Sudo Code compat: --print makes output non-interactive
                 output_format = CliOutputFormat::Text;
                 index += 1;
             }
@@ -844,9 +843,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     if let Some(action) = parse_local_help_action(&rest) {
         return action;
     }
-    if let Some(action) =
-        parse_single_word_command_alias(&rest, &model, model_flag_raw.as_deref(), permission_mode_override, output_format)
-    {
+    if let Some(action) = parse_single_word_command_alias(
+        &rest,
+        &model,
+        model_flag_raw.as_deref(),
+        permission_mode_override,
+        output_format,
+    ) {
         return action;
     }
 
@@ -864,8 +867,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
         }),
         // #145: `plugins` was routed through the prompt fallback because no
-        // top-level parser arm produced CliAction::Plugins. That made `claw
-        // plugins` (and `claw plugins --help`, `claw plugins list`, ...)
+        // top-level parser arm produced CliAction::Plugins. That made `scode
+        // plugins` (and `scode plugins --help`, `scode plugins list`, ...)
         // attempt an Anthropic network call, surfacing the misleading error
         // `missing Anthropic credentials` even though the command is purely
         // local introspection. Mirror `agents`/`mcp`/`skills`: action is the
@@ -876,7 +879,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let target = tail.get(1).cloned();
             if tail.len() > 2 {
                 return Err(format!(
-                    "unexpected extra arguments after `claw plugins {}`: {}",
+                    "unexpected extra arguments after `scode plugins {}`: {}",
                     tail[..2].join(" "),
                     tail[2..].join(" ")
                 ));
@@ -888,9 +891,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             })
         }
         // #146: `config` is pure-local read-only introspection (merges
-        // `.claw.json` + `.claw/settings.json` from disk, no network, no
+        // `.nexus/sudocode.json` + `.nexus/sudocode/settings.json` from disk, no network, no
         // state mutation). Previously callers had to spin up a session with
-        // `claw --resume SESSION.jsonl /config` to see their own config,
+        // `scode --resume SESSION.jsonl /config` to see their own config,
         // which is synthetic friction. Accepts an optional section name
         // (env|hooks|model|plugins) matching the slash command shape.
         "config" => {
@@ -898,7 +901,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let section = tail.first().cloned();
             if tail.len() > 1 {
                 return Err(format!(
-                    "unexpected extra arguments after `claw config {}`: {}",
+                    "unexpected extra arguments after `scode config {}`: {}",
                     tail[0],
                     tail[1..].join(" ")
                 ));
@@ -913,7 +916,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "diff" => {
             if rest.len() > 1 {
                 return Err(format!(
-                    "unexpected extra arguments after `claw diff`: {}",
+                    "unexpected extra arguments after `scode diff`: {}",
                     rest[1..].join(" ")
                 ));
             }
@@ -981,21 +984,21 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                         message.push_str(&line);
                     }
                     message.push_str(
-                        "\nRun `claw --help` for the full list. If you meant to send a prompt literally, use `claw prompt <text>`.",
+                        "\nRun `scode --help` for the full list. If you meant to send a prompt literally, use `scode prompt <text>`.",
                     );
                     return Err(message);
                 }
             }
             // #147: guard empty/whitespace-only prompts at the fallthrough
             // path the same way `"prompt"` arm above does. Without this,
-            // `claw ""`, `claw "   "`, and `claw "" ""` silently route to
+            // `scode ""`, `scode "   "`, and `scode "" ""` silently route to
             // the Anthropic call and surface a misleading
             // `missing Anthropic credentials` error (or burn API tokens on
             // an empty prompt when credentials are present).
             let joined = rest.join(" ");
             if joined.trim().is_empty() {
                 return Err(
-                    "empty prompt: provide a subcommand (run `claw --help`) or a non-empty prompt string"
+                    "empty prompt: provide a subcommand (run `scode --help`) or a non-empty prompt string"
                         .to_string(),
                 );
             }
@@ -1128,11 +1131,11 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
         .find(|spec| spec.name == command_name)?;
     let guidance = if slash_command.resume_supported {
         format!(
-            "`claw {command_name}` is a slash command. Use `claw --resume SESSION.jsonl /{command_name}` or start `claw` and run `/{command_name}`."
+            "`scode {command_name}` is a slash command. Use `scode --resume SESSION.jsonl /{command_name}` or start `scode` and run `/{command_name}`."
         )
     } else {
         format!(
-            "`claw {command_name}` is a slash command. Start `claw` and run `/{command_name}` inside the REPL."
+            "`scode {command_name}` is a slash command. Start `scode` and run `/{command_name}` inside the REPL."
         )
     };
     Some(guidance)
@@ -1140,7 +1143,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
 
 fn removed_auth_surface_error(command_name: &str) -> String {
     format!(
-        "`claw {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
+        "`scode {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
     )
 }
 
@@ -1149,7 +1152,7 @@ fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<Cli
         [] => Ok(CliAction::Acp { output_format }),
         [subcommand] if subcommand == "serve" => Ok(CliAction::Acp { output_format }),
         _ => Err(String::from(
-            "unsupported ACP invocation. Use `claw acp`, `claw acp serve`, `claw --acp`, or `claw -acp`.",
+            "unsupported ACP invocation. Use `scode acp`, `scode acp serve`, `scode --acp`, or `scode -acp`.",
         )),
     }
 }
@@ -1227,7 +1230,7 @@ fn parse_direct_slash_cli_action(
         Ok(Some(command)) => Err({
             let _ = command;
             format!(
-                "slash command {command_name} is interactive-only. Start `claw` and run it there, or use `claw --resume SESSION.jsonl {command_name}` / `claw --resume {latest} {command_name}` when the command is marked [resume] in /help.",
+                "slash command {command_name} is interactive-only. Start `scode` and run it there, or use `scode --resume SESSION.jsonl {command_name}` / `scode --resume {latest} {command_name}` when the command is marked [resume] in /help.",
                 command_name = rest[0],
                 latest = LATEST_SESSION_REFERENCE,
             )
@@ -1244,7 +1247,7 @@ fn format_unknown_option(option: &str) -> String {
         message.push_str(suggestion);
         message.push('?');
     }
-    message.push_str("\nRun `claw --help` for usage.");
+    message.push_str("\nRun `scode --help` for usage.");
     message
 }
 
@@ -1259,7 +1262,7 @@ fn format_unknown_direct_slash_command(name: &str) -> String {
         message.push('\n');
         message.push_str(note);
     }
-    message.push_str("\nRun `claw --help` for CLI usage, or start `claw` and use /help.");
+    message.push_str("\nRun `scode --help` for CLI usage, or start `scode` and use /help.");
     message
 }
 
@@ -1281,7 +1284,7 @@ fn format_unknown_slash_command(name: &str) -> String {
 fn omc_compatibility_note_for_unknown_slash_command(name: &str) -> Option<&'static str> {
     name.starts_with("oh-my-claudecode:")
         .then_some(
-            "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `claw` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
+            "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `scode` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
         )
 }
 
@@ -1312,7 +1315,6 @@ fn suggest_closest_term<'a>(input: &str, candidates: &'a [&'a str]) -> Option<&'
     ranked_suggestions(input, candidates).into_iter().next()
 }
 
-
 fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
     const KNOWN_SUBCOMMANDS: &[&str] = &[
         "help",
@@ -1342,8 +1344,7 @@ fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
             let prefix_match = common_prefix_len(&normalized_input, &normalized_candidate) >= 4;
             let substring_match = normalized_candidate.contains(&normalized_input)
                 || normalized_input.contains(&normalized_candidate);
-            ((distance <= 2) || prefix_match || substring_match)
-                .then_some((distance, *candidate))
+            ((distance <= 2) || prefix_match || substring_match).then_some((distance, *candidate))
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|left, right| left.cmp(right).then_with(|| left.1.cmp(right.1)));
@@ -1362,7 +1363,6 @@ fn common_prefix_len(left: &str, right: &str) -> usize {
         .take_while(|(l, r)| l == r)
         .count()
 }
-
 
 fn looks_like_subcommand_typo(input: &str) -> bool {
     !input.is_empty()
@@ -1472,13 +1472,11 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
             err_msg.push_str("\nDid you mean `openai/");
             err_msg.push_str(trimmed);
             err_msg.push_str("`? (Requires OPENAI_API_KEY env var)");
-        }
-        else if trimmed.starts_with("qwen") {
+        } else if trimmed.starts_with("qwen") {
             err_msg.push_str("\nDid you mean `qwen/");
             err_msg.push_str(trimmed);
             err_msg.push_str("`? (Requires DASHSCOPE_API_KEY env var)");
-        }
-        else if trimmed.starts_with("grok") {
+        } else if trimmed.starts_with("grok") {
             err_msg.push_str("\nDid you mean `xai/");
             err_msg.push_str(trimmed);
             err_msg.push_str("`? (Requires XAI_API_KEY env var)");
@@ -1989,33 +1987,36 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Starts a minimal Model Context Protocol server that exposes claw's
+/// Starts a minimal Model Context Protocol server that exposes scode's
 /// built-in tools over stdio.
 ///
 /// Tool descriptors come from [`tools::mvp_tool_specs`] and calls are
 /// dispatched through [`tools::execute_tool`], so this server exposes exactly
-/// Read `.claw/worker-state.json` from the current working directory and print it.
+/// Read `.nexus/sudocode/worker-state.json` from the current working directory and print it.
 /// This is the file-based worker observability surface: `push_event()` in `worker_boot.rs`
-/// atomically writes state transitions here so external observers (clawhip, orchestrators)
+/// atomically writes state transitions here so external observers (sudocodehip, orchestrators)
 /// can poll current `WorkerStatus` without needing an HTTP route on the opencode binary.
 fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let state_path = cwd.join(".claw").join("worker-state.json");
+    let state_path = cwd
+        .join(".nexus")
+        .join("sudocode")
+        .join("worker-state.json");
     if !state_path.exists() {
         // #139: this error used to say "run a worker first" without telling
         // callers how to run one. "worker" is an internal concept (there is
-        // no `claw worker` subcommand), so claws/CI had no discoverable path
+        // no `scode worker` subcommand), so consumers/CI had no discoverable path
         // from the error to a fix. Emit an actionable, structured error that
         // names the two concrete commands that produce worker state.
         //
         // Format in both text and JSON modes is stable so scripts can match:
         //   error: no worker state file found at <path>
         //     Hint: worker state is written by the interactive REPL or a non-interactive prompt.
-        //     Run:   claw               # start the REPL (writes state on first turn)
-        //     Or:    claw prompt <text> # run one non-interactive turn
-        //     Then rerun: claw state [--output-format json]
+        //     Run:   scode               # start the REPL (writes state on first turn)
+        //     Or:    scode prompt <text> # run one non-interactive turn
+        //     Then rerun: scode state [--output-format json]
         return Err(format!(
-            "no worker state file found at {path}\n  Hint: worker state is written by the interactive REPL or a non-interactive prompt.\n  Run:   claw               # start the REPL (writes state on first turn)\n  Or:    claw prompt <text> # run one non-interactive turn\n  Then rerun: claw state [--output-format json]",
+            "no worker state file found at {path}\n  Hint: worker state is written by the interactive REPL or a non-interactive prompt.\n  Run:   scode               # start the REPL (writes state on first turn)\n  Or:    scode prompt <text> # run one non-interactive turn\n  Then rerun: scode state [--output-format json]",
             path = state_path.display()
         )
         .into());
@@ -2046,7 +2047,7 @@ fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     let spec = McpServerSpec {
-        server_name: "claw".to_string(),
+        server_name: "scode".to_string(),
         server_version: VERSION.to_string(),
         tools,
         tool_handler: Box::new(execute_tool),
@@ -2112,7 +2113,7 @@ fn check_auth_health() -> DiagnosticCheck {
                     token_set.scopes.join(",")
                 }
             ),
-            "Suggested action  set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN; `claw login` is removed"
+            "Suggested action  set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN; `scode login` is removed"
                 .to_string(),
         ])
         .with_data(Map::from_iter([
@@ -2274,7 +2275,7 @@ fn check_install_source_health() -> DiagnosticCheck {
         "Recommended path  build from this repo or use the upstream binary documented in README.md"
             .to_string(),
         format!(
-            "Deprecated crate  `{DEPRECATED_INSTALL_COMMAND}` installs a deprecated stub and does not provide the `claw` binary"
+            "Deprecated crate  `{DEPRECATED_INSTALL_COMMAND}` installs a deprecated stub and does not provide the `scode` binary"
         )
             .to_string(),
     ])
@@ -2488,7 +2489,7 @@ fn dump_manifests(
 }
 
 const DUMP_MANIFESTS_OVERRIDE_HINT: &str =
-    "Hint: set CLAUDE_CODE_UPSTREAM=/path/to/upstream or pass `claw dump-manifests --manifests-dir /path/to/upstream`.";
+    "Hint: set CLAUDE_CODE_UPSTREAM=/path/to/upstream or pass `scode dump-manifests --manifests-dir /path/to/upstream`.";
 
 // Internal function for testing that accepts a workspace directory path.
 fn dump_manifests_at_path(
@@ -2802,11 +2803,11 @@ struct StatusContext {
     git_branch: Option<String>,
     git_summary: GitWorkspaceSummary,
     sandbox_status: runtime::SandboxStatus,
-    /// #143: when `.claw.json` (or another loaded config file) fails to parse,
+    /// #143: when `.nexus/sudocode.json` (or another loaded config file) fails to parse,
     /// we capture the parse error here and still populate every field that
     /// doesn't depend on runtime config (workspace, git, sandbox defaults,
     /// discovery counts). Top-level JSON output then reports
-    /// `status: "degraded"` so claws can distinguish "status ran but config
+    /// `status: "degraded"` so consumers can distinguish "status ran but config
     /// is broken" from "status ran cleanly".
     config_load_error: Option<String>,
 }
@@ -2983,7 +2984,7 @@ fn render_resume_usage() -> String {
     format!(
         "Resume
   Usage            /resume <session-path|session-id|{LATEST_SESSION_REFERENCE}>
-  Auto-save        .claw/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}
+  Auto-save        .nexus/sudocode/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}
   Tip              use /session list to inspect saved sessions"
     )
 }
@@ -3181,7 +3182,7 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: cleared,
                 message: Some(format!(
-                    "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  claw --resume {}\n  New session      {new_session_id}\n  Session file     {}",
+                    "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  scode --resume {}\n  New session      {new_session_id}\n  Session file     {}",
                     backup_path.display(),
                     backup_path.display(),
                     session_path.display()
@@ -3342,7 +3343,7 @@ fn run_resume_command(
         SlashCommand::Skills { args } => {
             if let SkillSlashDispatch::Invoke(_) = classify_skills_slash_command(args.as_deref()) {
                 return Err(
-                    "resumed /skills invocations are interactive-only; start `claw` and run `/skills <skill>` in the REPL".into(),
+                    "resumed /skills invocations are interactive-only; start `scode` and run `/skills <skill>` in the REPL".into(),
                 );
             }
             let cwd = env::current_dir()?;
@@ -3503,9 +3504,9 @@ fn enforce_broad_cwd_policy(
     if is_interactive {
         // Interactive mode: print warning and ask for confirmation
         eprintln!(
-            "Warning: claw is running from a very broad directory ({}).\n\
+            "Warning: scode is running from a very broad directory ({}).\n\
              The agent can read and search everything under this path.\n\
-             Consider running from inside your project: cd /path/to/project && claw",
+             Consider running from inside your project: cd /path/to/project && scode",
             cwd.display()
         );
         eprint!("Continue anyway? [y/N]: ");
@@ -3522,10 +3523,10 @@ fn enforce_broad_cwd_policy(
     } else {
         // Non-interactive mode: exit with error (JSON or text)
         let message = format!(
-            "claw is running from a very broad directory ({}). \
+            "scode is running from a very broad directory ({}). \
              The agent can read and search everything under this path. \
              Use --allow-broad-cwd to proceed anyway, \
-             or run from inside your project: cd /path/to/project && claw",
+             or run from inside your project: cd /path/to/project && scode",
             cwd.display()
         );
         match output_format {
@@ -4322,7 +4323,6 @@ impl LiveCli {
         Ok(())
     }
 
-
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
@@ -4850,7 +4850,7 @@ impl LiveCli {
         args: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // `claw mcp serve` starts a stdio MCP server exposing claw's built-in
+        // `scode mcp serve` starts a stdio MCP server exposing scode's built-in
         // tools. All other `mcp` subcommands fall through to the existing
         // configured-server reporter (`list`, `status`, ...).
         if matches!(args.map(str::trim), Some("serve")) {
@@ -5399,7 +5399,7 @@ fn render_repl_help() -> String {
         "  Tab                  Complete commands, modes, and recent sessions".to_string(),
         "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
-        "  Auto-save            .claw/sessions/<session-id>.jsonl".to_string(),
+        "  Auto-save            .nexus/sudocode/sessions/<session-id>.jsonl".to_string(),
         "  Resume latest        /resume latest".to_string(),
         "  Browse sessions      /session list".to_string(),
         "  Show prompt history  /history [count]".to_string(),
@@ -5440,7 +5440,13 @@ fn print_status_snapshot(
     match output_format {
         CliOutputFormat::Text => println!(
             "{}",
-            format_status_report(&provenance.resolved, usage, permission_mode.as_str(), &context, Some(&provenance))
+            format_status_report(
+                &provenance.resolved,
+                usage,
+                permission_mode.as_str(),
+                &context,
+                Some(&provenance)
+            )
         ),
         CliOutputFormat::Json => println!(
             "{}",
@@ -5468,7 +5474,7 @@ fn status_json_value(
     // case both new fields are omitted.
     provenance: Option<&ModelProvenance>,
 ) -> serde_json::Value {
-    // #143: top-level `status` marker so claws can distinguish
+    // #143: top-level `status` marker so consumers can distinguish
     // a clean run from a degraded run (config parse failed but other fields
     // are still populated). `config_load_error` carries the parse-error string
     // when present; it's a string rather than a typed object in Phase 1 and
@@ -5505,7 +5511,7 @@ fn status_json_value(
             "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
             "session_id": context.session_path.as_ref().and_then(|path| {
                 // Session files are named <session-id>.jsonl directly under
-                // .claw/sessions/. Extract the stem (drop the .jsonl extension).
+                // .nexus/sudocode/sessions/. Extract the stem (drop the .jsonl extension).
                 path.file_stem().map(|n| n.to_string_lossy().into_owned())
             }),
             "loaded_config_files": context.loaded_config_files,
@@ -5537,7 +5543,7 @@ fn status_context(
     let loader = ConfigLoader::default_for(&cwd);
     let discovered_config_files = loader.discover().len();
     // #143: degrade gracefully on config parse failure rather than hard-fail.
-    // `claw doctor` already does this; `claw status` now matches that contract
+    // `scode doctor` already does this; `scode status` now matches that contract
     // so that one malformed `mcpServers.*` entry doesn't take down the whole
     // health surface (workspace, git, model, permission, sandbox can still be
     // reported independently).
@@ -5549,7 +5555,7 @@ fn status_context(
         ),
         Err(err) => (
             0,
-            // Fall back to defaults for sandbox resolution so claws still see
+            // Fall back to defaults for sandbox resolution so consumers still see
             // a populated sandbox section instead of a missing field. Defaults
             // produce the same output as a runtime config with no sandbox
             // overrides, which is the right degraded-mode shape: we cannot
@@ -5598,7 +5604,7 @@ fn format_status_report(
     let mut blocks: Vec<String> = Vec::new();
     if let Some(err) = context.config_load_error.as_deref() {
         blocks.push(format!(
-            "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial status\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun"
+            "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial status\n  Details          {err}\n  Hint             `scode doctor` classifies config parse errors; fix the listed field and rerun"
         ));
     }
     // #148: render Model source line after Model, showing where the string
@@ -5778,85 +5784,85 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
 fn render_help_topic(topic: LocalHelpTopic) -> String {
     match topic {
         LocalHelpTopic::Status => "Status
-  Usage            claw status [--output-format <format>]
+  Usage            scode status [--output-format <format>]
   Purpose          show the local workspace snapshot without entering the REPL
   Output           model, permissions, git state, config files, and sandbox status
   Formats          text (default), json
-  Related          /status · claw --resume latest /status"
+  Related          /status · scode --resume latest /status"
             .to_string(),
         LocalHelpTopic::Sandbox => "Sandbox
-  Usage            claw sandbox [--output-format <format>]
+  Usage            scode sandbox [--output-format <format>]
   Purpose          inspect the resolved sandbox and isolation state for the current directory
   Output           namespace, network, filesystem, and fallback details
   Formats          text (default), json
-  Related          /sandbox · claw status"
+  Related          /sandbox · scode status"
             .to_string(),
         LocalHelpTopic::Doctor => "Doctor
-  Usage            claw doctor [--output-format <format>]
+  Usage            scode doctor [--output-format <format>]
   Purpose          diagnose local auth, config, workspace, sandbox, and build metadata
   Output           local-only health report; no provider request or session resume required
   Formats          text (default), json
-  Related          /doctor · claw --resume latest /doctor"
+  Related          /doctor · scode --resume latest /doctor"
             .to_string(),
         LocalHelpTopic::Acp => "ACP / Zed
-  Usage            claw acp [serve] [--output-format <format>]
-  Aliases          claw --acp · claw -acp
+  Usage            scode acp [serve] [--output-format <format>]
+  Aliases          scode --acp · scode -acp
   Purpose          explain the current editor-facing ACP/Zed launch contract without starting the runtime
   Status           discoverability only; `serve` is a status alias and does not launch a daemon yet
   Formats          text (default), json
-  Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · claw --help"
+  Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · scode --help"
             .to_string(),
         LocalHelpTopic::Init => "Init
-  Usage            claw init [--output-format <format>]
-  Purpose          create .claw/, .claw.json, .gitignore, and CLAUDE.md in the current project
+  Usage            scode init [--output-format <format>]
+  Purpose          create .nexus/sudocode/, .nexus/sudocode.json, .gitignore, and CLAUDE.md in the current project
   Output           list of created vs. skipped files (idempotent: safe to re-run)
   Formats          text (default), json
-  Related          claw status · claw doctor"
+  Related          scode status · scode doctor"
             .to_string(),
         LocalHelpTopic::State => "State
-  Usage            claw state [--output-format <format>]
-  Purpose          read .claw/worker-state.json written by the interactive REPL or a one-shot prompt
+  Usage            scode state [--output-format <format>]
+  Purpose          read .nexus/sudocode/worker-state.json written by the interactive REPL or a one-shot prompt
   Output           worker id, model, permissions, session reference (text or json)
   Formats          text (default), json
-  Produces state   `claw` (interactive REPL) or `claw prompt <text>` (one non-interactive turn)
-  Observes state   `claw state` reads; clawhip/CI may poll this file without HTTP
+  Produces state   `scode` (interactive REPL) or `scode prompt <text>` (one non-interactive turn)
+  Observes state   `scode state` reads; sudocodehip/CI may poll this file without HTTP
   Exit codes       0 if state file exists and parses; 1 with actionable hint otherwise
-  Related          claw status · ROADMAP #139 (this worker-concept contract)"
+  Related          scode status · ROADMAP #139 (this worker-concept contract)"
             .to_string(),
         LocalHelpTopic::Export => "Export
-  Usage            claw export [--session <id|latest>] [--output <path>] [--output-format <format>]
+  Usage            scode export [--session <id|latest>] [--output <path>] [--output-format <format>]
   Purpose          serialize a managed session to JSON for review, transfer, or archival
-  Defaults         --session latest (most recent managed session in .claw/sessions/)
+  Defaults         --session latest (most recent managed session in .nexus/sudocode/sessions/)
   Formats          text (default), json
-  Related          /session list · claw --resume latest"
+  Related          /session list · scode --resume latest"
             .to_string(),
         LocalHelpTopic::Version => "Version
-  Usage            claw version [--output-format <format>]
-  Aliases          claw --version · claw -V
-  Purpose          print the claw CLI version and build metadata
+  Usage            scode version [--output-format <format>]
+  Aliases          scode --version · scode -V
+  Purpose          print the scode CLI version and build metadata
   Formats          text (default), json
-  Related          claw doctor (full build/auth/config diagnostic)"
+  Related          scode doctor (full build/auth/config diagnostic)"
             .to_string(),
         LocalHelpTopic::SystemPrompt => "System Prompt
-  Usage            claw system-prompt [--cwd <path>] [--date YYYY-MM-DD] [--output-format <format>]
-  Purpose          render the resolved system prompt that `claw` would send for the given cwd + date
+  Usage            scode system-prompt [--cwd <path>] [--date YYYY-MM-DD] [--output-format <format>]
+  Purpose          render the resolved system prompt that `scode` would send for the given cwd + date
   Options          --cwd overrides the workspace dir · --date injects a deterministic date stamp
   Formats          text (default), json
-  Related          claw doctor · claw dump-manifests"
+  Related          scode doctor · scode dump-manifests"
             .to_string(),
         LocalHelpTopic::DumpManifests => "Dump Manifests
-  Usage            claw dump-manifests [--manifests-dir <path>] [--output-format <format>]
+  Usage            scode dump-manifests [--manifests-dir <path>] [--output-format <format>]
   Purpose          emit every skill/agent/tool manifest the resolver would load for the current cwd
   Options          --manifests-dir scopes discovery to a specific directory
   Formats          text (default), json
-  Related          claw skills · claw agents · claw doctor"
+  Related          scode skills · scode agents · scode doctor"
             .to_string(),
         LocalHelpTopic::BootstrapPlan => "Bootstrap Plan
-  Usage            claw bootstrap-plan [--output-format <format>]
+  Usage            scode bootstrap-plan [--output-format <format>]
   Purpose          list the ordered startup phases the CLI would execute before dispatch
   Output           phase names (text) or structured phase list (json) — primary output is the plan itself
   Formats          text (default), json
-  Related          claw doctor · claw status"
+  Related          scode doctor · scode status"
             .to_string(),
     }
 }
@@ -5866,11 +5872,11 @@ fn print_help_topic(topic: LocalHelpTopic) {
 }
 
 fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let message = "ACP/Zed editor integration is not implemented in claw-code yet. `claw acp serve` is only a discoverability alias today; it does not launch a daemon or Zed-specific protocol endpoint. Use the normal terminal surfaces for now and track ROADMAP #76 for real ACP support.";
+    let message = "ACP/Zed editor integration is not implemented in sudo-code yet. `scode acp serve` is only a discoverability alias today; it does not launch a daemon or Zed-specific protocol endpoint. Use the normal terminal surfaces for now and track ROADMAP #76 for real ACP support.";
     match output_format {
         CliOutputFormat::Text => {
             println!(
-                "ACP / Zed\n  Status           discoverability only\n  Launch           `claw acp serve` / `claw --acp` / `claw -acp` report status only; no editor daemon is available yet\n  Today            use `claw prompt`, the REPL, or `claw doctor` for local verification\n  Tracking         ROADMAP #76\n  Message          {message}"
+                "ACP / Zed\n  Status           discoverability only\n  Launch           `scode acp serve` / `scode --acp` / `scode -acp` report status only; no editor daemon is available yet\n  Today            use `scode prompt`, the REPL, or `scode doctor` for local verification\n  Tracking         ROADMAP #76\n  Message          {message}"
             );
         }
         CliOutputFormat::Json => {
@@ -5887,9 +5893,9 @@ fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::e
                     "discoverability_tracking": "ROADMAP #64a",
                     "tracking": "ROADMAP #76",
                     "recommended_workflows": [
-                        "claw prompt TEXT",
-                        "claw",
-                        "claw doctor"
+                        "scode prompt TEXT",
+                        "scode",
+                        "scode doctor"
                     ],
                 }))?
             );
@@ -6101,7 +6107,7 @@ fn run_init(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Er
 }
 
 /// #142: emit first-class structured fields alongside the legacy `message`
-/// string so claws can detect per-artifact state without substring matching.
+/// string so consumers can detect per-artifact state without substring matching.
 fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_json::Value {
     use crate::init::InitStatus;
     json!({
@@ -6578,7 +6584,7 @@ fn render_version_report() -> String {
     let git_sha = GIT_SHA.unwrap_or("unknown");
     let target = BUILD_TARGET.unwrap_or("unknown");
     format!(
-        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Sudo Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
     )
 }
 
@@ -7454,7 +7460,7 @@ impl AnthropicRuntimeClient {
         // reads `ANTHROPIC_BASE_URL` and is required for the local
         // mock-server test harness
         // (`crates/rusty-claude-cli/tests/compact_output.rs`) to point
-        // claw at its fake Anthropic endpoint. We also attach a
+        // scode at its fake Anthropic endpoint. We also attach a
         // session-scoped prompt cache on the Anthropic path; the
         // prompt cache is Anthropic-only so non-Anthropic variants
         // skip it.
@@ -7817,7 +7823,7 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
     lines.push("Recovery".to_string());
     lines.push("  Compact          /compact".to_string());
     lines.push(format!(
-        "  Resume compact   claw --resume {session_id} /compact"
+        "  Resume compact   scode --resume {session_id} /compact"
     ));
     lines.push("  Fresh session    /clear --confirm".to_string());
     lines.push(
@@ -8833,49 +8839,49 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
 
 #[allow(clippy::too_many_lines)]
 fn print_help_to(out: &mut impl Write) -> io::Result<()> {
-    writeln!(out, "claw v{VERSION}")?;
+    writeln!(out, "scode v{VERSION}")?;
     writeln!(out)?;
     writeln!(out, "Usage:")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
+        "  scode [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
     )?;
     writeln!(out, "      Start the interactive REPL")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] prompt TEXT"
+        "  scode [--model MODEL] [--output-format text|json] prompt TEXT"
     )?;
     writeln!(out, "      Send one prompt and exit")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] TEXT"
+        "  scode [--model MODEL] [--output-format text|json] TEXT"
     )?;
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
     writeln!(
         out,
-        "  claw --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
+        "  scode --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
     )?;
     writeln!(
         out,
         "      Inspect or maintain a saved session without entering the REPL"
     )?;
-    writeln!(out, "  claw help")?;
+    writeln!(out, "  scode help")?;
     writeln!(out, "      Alias for --help")?;
-    writeln!(out, "  claw version")?;
+    writeln!(out, "  scode version")?;
     writeln!(out, "      Alias for --version")?;
-    writeln!(out, "  claw status")?;
+    writeln!(out, "  scode status")?;
     writeln!(
         out,
         "      Show the current local workspace status snapshot"
     )?;
-    writeln!(out, "  claw sandbox")?;
+    writeln!(out, "  scode sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
-    writeln!(out, "  claw doctor")?;
+    writeln!(out, "  scode doctor")?;
     writeln!(
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
-    writeln!(out, "  claw acp [serve]")?;
+    writeln!(out, "  scode acp [serve]")?;
     writeln!(
         out,
         "      Show ACP/Zed editor integration status (currently unsupported; aliases: --acp, -acp)"
@@ -8885,16 +8891,19 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Warning: do not `{DEPRECATED_INSTALL_COMMAND}` (deprecated stub)"
     )?;
-    writeln!(out, "  claw dump-manifests [--manifests-dir PATH]")?;
-    writeln!(out, "  claw bootstrap-plan")?;
-    writeln!(out, "  claw agents")?;
-    writeln!(out, "  claw mcp")?;
-    writeln!(out, "  claw skills")?;
-    writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
-    writeln!(out, "  claw init")?;
+    writeln!(out, "  scode dump-manifests [--manifests-dir PATH]")?;
+    writeln!(out, "  scode bootstrap-plan")?;
+    writeln!(out, "  scode agents")?;
+    writeln!(out, "  scode mcp")?;
+    writeln!(out, "  scode skills")?;
     writeln!(
         out,
-        "  claw export [PATH] [--session SESSION] [--output PATH]"
+        "  scode system-prompt [--cwd PATH] [--date YYYY-MM-DD]"
+    )?;
+    writeln!(out, "  scode init")?;
+    writeln!(
+        out,
+        "  scode export [PATH] [--session SESSION] [--output PATH]"
     )?;
     writeln!(
         out,
@@ -8944,7 +8953,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Session shortcuts:")?;
     writeln!(
         out,
-        "  REPL turns auto-save to .claw/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}"
+        "  REPL turns auto-save to .nexus/sudocode/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}"
     )?;
     writeln!(
         out,
@@ -8955,33 +8964,33 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  Use /session list in the REPL to browse managed sessions"
     )?;
     writeln!(out, "Examples:")?;
-    writeln!(out, "  claw --model claude-opus \"summarize this repo\"")?;
+    writeln!(out, "  scode --model claude-opus \"summarize this repo\"")?;
     writeln!(
         out,
-        "  claw --output-format json prompt \"explain src/main.rs\""
+        "  scode --output-format json prompt \"explain src/main.rs\""
     )?;
-    writeln!(out, "  claw --compact \"summarize Cargo.toml\" | wc -l")?;
+    writeln!(out, "  scode --compact \"summarize Cargo.toml\" | wc -l")?;
     writeln!(
         out,
-        "  claw --allowedTools read,glob \"summarize Cargo.toml\""
+        "  scode --allowedTools read,glob \"summarize Cargo.toml\""
     )?;
-    writeln!(out, "  claw --resume {LATEST_SESSION_REFERENCE}")?;
+    writeln!(out, "  scode --resume {LATEST_SESSION_REFERENCE}")?;
     writeln!(
         out,
-        "  claw --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
+        "  scode --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
     )?;
-    writeln!(out, "  claw agents")?;
-    writeln!(out, "  claw mcp show my-server")?;
-    writeln!(out, "  claw /skills")?;
-    writeln!(out, "  claw doctor")?;
+    writeln!(out, "  scode agents")?;
+    writeln!(out, "  scode mcp show my-server")?;
+    writeln!(out, "  scode /skills")?;
+    writeln!(out, "  scode doctor")?;
     writeln!(out, "  source of truth: {OFFICIAL_REPO_URL}")?;
     writeln!(
         out,
         "  do not run `{DEPRECATED_INSTALL_COMMAND}` — it installs a deprecated stub"
     )?;
-    writeln!(out, "  claw init")?;
-    writeln!(out, "  claw export")?;
-    writeln!(out, "  claw export conversation.md")?;
+    writeln!(out, "  scode init")?;
+    writeln!(out, "  scode export")?;
+    writeln!(out, "  scode export conversation.md")?;
     Ok(())
 }
 
@@ -9006,26 +9015,24 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
-        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
+        classify_error_kind, collect_session_prompt_history, create_managed_session_handle,
+        describe_tool_progress, filter_tool_specs, format_bughunter_report,
+        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
+        format_connected_line, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        classify_error_kind,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
-        split_error_hint,
-        render_help_topic, render_prompt_history_report, render_repl_help, render_resume_usage,
+        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
+        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
-        slash_command_completion_candidates_with_sessions, status_context,
+        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
@@ -9151,7 +9158,7 @@ mod tests {
         );
         assert!(rendered.contains("Compact          /compact"), "{rendered}");
         assert!(
-            rendered.contains("Resume compact   claw --resume session-issue-32 /compact"),
+            rendered.contains("Resume compact   scode --resume session-issue-32 /compact"),
             "{rendered}"
         );
         assert!(
@@ -9224,7 +9231,7 @@ mod tests {
         );
         assert!(rendered.contains("Compact          /compact"), "{rendered}");
         assert!(
-            rendered.contains("Resume compact   claw --resume session-issue-32 /compact"),
+            rendered.contains("Resume compact   scode --resume session-issue-32 /compact"),
             "{rendered}"
         );
     }
@@ -9350,24 +9357,25 @@ mod tests {
         let root = temp_dir();
         let cwd = root.join("project");
         let config_home = root.join("config-home");
-        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir should exist");
+        std::fs::create_dir_all(cwd.join(".nexus").join("sudocode"))
+            .expect("project config dir should exist");
         std::fs::create_dir_all(&config_home).expect("config home should exist");
         std::fs::write(
-            cwd.join(".claw").join("settings.json"),
+            cwd.join(".nexus").join("sudocode").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
         )
         .expect("project config should write");
 
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_config_home = std::env::var("SUDO_CODE_CONFIG_HOME").ok();
         let original_permission_mode = std::env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok();
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
 
         let resolved = with_current_dir(&cwd, super::default_permission_mode);
 
         match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("SUDO_CODE_CONFIG_HOME", value),
+            None => std::env::remove_var("SUDO_CODE_CONFIG_HOME"),
         }
         match original_permission_mode {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
@@ -9384,24 +9392,25 @@ mod tests {
         let root = temp_dir();
         let cwd = root.join("project");
         let config_home = root.join("config-home");
-        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir should exist");
+        std::fs::create_dir_all(cwd.join(".nexus").join("sudocode"))
+            .expect("project config dir should exist");
         std::fs::create_dir_all(&config_home).expect("config home should exist");
         std::fs::write(
-            cwd.join(".claw").join("settings.json"),
+            cwd.join(".nexus").join("sudocode").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
         )
         .expect("project config should write");
 
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_config_home = std::env::var("SUDO_CODE_CONFIG_HOME").ok();
         let original_permission_mode = std::env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok();
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
         std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
 
         let resolved = with_current_dir(&cwd, super::default_permission_mode);
 
         match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("SUDO_CODE_CONFIG_HOME", value),
+            None => std::env::remove_var("SUDO_CODE_CONFIG_HOME"),
         }
         match original_permission_mode {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
@@ -9418,10 +9427,10 @@ mod tests {
         let config_home = temp_dir();
         std::fs::create_dir_all(&config_home).expect("config home should exist");
 
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_config_home = std::env::var("SUDO_CODE_CONFIG_HOME").ok();
         let original_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
         let original_auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
 
@@ -9437,8 +9446,8 @@ mod tests {
             .expect_err("saved oauth should be ignored without env auth");
 
         match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("SUDO_CODE_CONFIG_HOME", value),
+            None => std::env::remove_var("SUDO_CODE_CONFIG_HOME"),
         }
         match original_api_key {
             Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
@@ -9658,16 +9667,17 @@ mod tests {
         let root = temp_dir();
         let cwd = root.join("project");
         let config_home = root.join("config-home");
-        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir should exist");
+        std::fs::create_dir_all(cwd.join(".nexus").join("sudocode"))
+            .expect("project config dir should exist");
         std::fs::create_dir_all(&config_home).expect("config home should exist");
         std::fs::write(
-            cwd.join(".claw").join("settings.json"),
+            cwd.join(".nexus").join("sudocode").join("settings.json"),
             r#"{"aliases":{"fast":"claude-haiku-4-5-20251213","smart":"opus","cheap":"grok-3-mini"}}"#,
         )
         .expect("project config should write");
 
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        let original_config_home = std::env::var("SUDO_CODE_CONFIG_HOME").ok();
+        std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
 
         // when
         let direct = with_current_dir(&cwd, || resolve_model_alias_with_config("fast"));
@@ -9677,8 +9687,8 @@ mod tests {
         let builtin = with_current_dir(&cwd, || resolve_model_alias_with_config("haiku"));
 
         match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            Some(value) => std::env::set_var("SUDO_CODE_CONFIG_HOME", value),
+            None => std::env::remove_var("SUDO_CODE_CONFIG_HOME"),
         }
         std::fs::remove_dir_all(root).expect("temp config root should clean up");
 
@@ -10006,8 +10016,8 @@ mod tests {
         // with a specific error instead of falling through to the prompt
         // path (where they surface a misleading "missing Anthropic
         // credentials" error or burn API tokens on an empty prompt).
-        let empty_err = parse_args(&["".to_string()])
-            .expect_err("empty positional arg should be rejected");
+        let empty_err =
+            parse_args(&["".to_string()]).expect_err("empty positional arg should be rejected");
         assert!(
             empty_err.starts_with("empty prompt:"),
             "empty-arg error should be specific, got: {empty_err}"
@@ -10202,17 +10212,18 @@ mod tests {
 
     #[test]
     fn status_degrades_gracefully_on_malformed_mcp_config_143() {
-        // #143: previously `claw status` hard-failed on any config parse error,
+        // #143: previously `scode status` hard-failed on any config parse error,
         // taking down the entire health surface for one malformed MCP entry.
-        // `claw doctor` already degrades gracefully; this test locks `status`
+        // `scode doctor` already degrades gracefully; this test locks `status`
         // to the same contract.
         let _guard = env_lock();
         let root = temp_dir();
         let cwd = root.join("project-with-malformed-mcp");
         std::fs::create_dir_all(&cwd).expect("project dir should exist");
+        std::fs::create_dir_all(cwd.join(".nexus")).expect("nexus dir");
         // One valid server + one malformed entry missing `command`.
         std::fs::write(
-            cwd.join(".claw.json"),
+            cwd.join(".nexus/sudocode.json"),
             r#"{
   "mcpServers": {
     "everything": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"]},
@@ -10221,10 +10232,11 @@ mod tests {
 }
 "#,
         )
-        .expect("write malformed .claw.json");
+        .expect("write malformed .nexus/sudocode.json");
 
         let context = with_current_dir(&cwd, || {
-            super::status_context(None).expect("status_context should not hard-fail on config parse errors (#143)")
+            super::status_context(None)
+                .expect("status_context should not hard-fail on config parse errors (#143)")
         });
 
         // Phase 1 contract: config_load_error is populated with the parse error.
@@ -10261,7 +10273,8 @@ mod tests {
             cumulative: runtime::TokenUsage::default(),
             estimated_tokens: 0,
         };
-        let json = super::status_json_value(Some("test-model"), usage, "workspace-write", &context, None);
+        let json =
+            super::status_json_value(Some("test-model"), usage, "workspace-write", &context, None);
         assert_eq!(
             json.get("status").and_then(|v| v.as_str()),
             Some("degraded"),
@@ -10278,8 +10291,14 @@ mod tests {
             json.get("model").and_then(|v| v.as_str()),
             Some("test-model")
         );
-        assert!(json.get("workspace").is_some(), "workspace field still reported");
-        assert!(json.get("sandbox").is_some(), "sandbox field still reported");
+        assert!(
+            json.get("workspace").is_some(),
+            "workspace field still reported"
+        );
+        assert!(
+            json.get("sandbox").is_some(),
+            "sandbox field still reported"
+        );
 
         // Clean path: no config error → status: "ok", config_load_error: null.
         let clean_cwd = root.join("project-with-clean-config");
@@ -10288,8 +10307,13 @@ mod tests {
             super::status_context(None).expect("clean status_context should succeed")
         });
         assert!(clean_context.config_load_error.is_none());
-        let clean_json =
-            super::status_json_value(Some("test-model"), usage, "workspace-write", &clean_context, None);
+        let clean_json = super::status_json_value(
+            Some("test-model"),
+            usage,
+            "workspace-write",
+            &clean_context,
+            None,
+        );
         assert_eq!(
             clean_json.get("status").and_then(|v| v.as_str()),
             Some("ok"),
@@ -10299,8 +10323,8 @@ mod tests {
 
     #[test]
     fn state_error_surfaces_actionable_worker_commands_139() {
-        // #139: the error for missing `.claw/worker-state.json` must name
-        // the concrete commands that produce worker state, otherwise claws
+        // #139: the error for missing `.nexus/sudocode/worker-state.json` must name
+        // the concrete commands that produce worker state, otherwise consumers
         // have no discoverable path from the error to a fix.
         let _guard = env_lock();
         let root = temp_dir();
@@ -10319,27 +10343,27 @@ mod tests {
         );
         // New actionable hints — this is what #139 is fixing.
         assert!(
-            message.contains("claw prompt"),
-            "error should name `claw prompt <text>` as a producer: {message}"
+            message.contains("scode prompt"),
+            "error should name `scode prompt <text>` as a producer: {message}"
         );
         assert!(
             message.contains("REPL"),
             "error should mention the interactive REPL as a producer: {message}"
         );
         assert!(
-            message.contains("claw state"),
+            message.contains("scode state"),
             "error should tell the user what to rerun once state exists: {message}"
         );
         // And the State --help topic must document the worker relationship
-        // so claws can discover the contract without hitting the error first.
+        // so consumers can discover the contract without hitting the error first.
         let state_help = render_help_topic(LocalHelpTopic::State);
         assert!(
             state_help.contains("Produces state"),
             "state help must document how state is produced: {state_help}"
         );
         assert!(
-            state_help.contains("claw prompt"),
-            "state help must name `claw prompt <text>` as a producer: {state_help}"
+            state_help.contains("scode prompt"),
+            "state help must name `scode prompt <text>` as a producer: {state_help}"
         );
     }
 
@@ -10388,11 +10412,18 @@ mod tests {
         // Other unrecognized args should NOT trigger the --json hint.
         let err_other = parse_args(&["doctor".to_string(), "garbage".to_string()])
             .expect_err("`doctor garbage` should fail without --json hint");
-        assert!(!err_other.contains("--output-format json"),
-            "unrelated args should not trigger --json hint: {err_other}");
+        assert!(
+            !err_other.contains("--output-format json"),
+            "unrelated args should not trigger --json hint: {err_other}"
+        );
         // #154: model syntax error should hint at provider prefix when applicable
-        let err_gpt = parse_args(&["prompt".to_string(), "test".to_string(), "--model".to_string(), "gpt-4".to_string()])
-            .expect_err("`--model gpt-4` should fail with OpenAI hint");
+        let err_gpt = parse_args(&[
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            "gpt-4".to_string(),
+        ])
+        .expect_err("`--model gpt-4` should fail with OpenAI hint");
         assert!(
             err_gpt.contains("Did you mean `openai/gpt-4`?"),
             "GPT model error should hint openai/ prefix: {err_gpt}"
@@ -10401,8 +10432,13 @@ mod tests {
             err_gpt.contains("OPENAI_API_KEY"),
             "GPT model error should mention env var: {err_gpt}"
         );
-        let err_qwen = parse_args(&["prompt".to_string(), "test".to_string(), "--model".to_string(), "qwen-plus".to_string()])
-            .expect_err("`--model qwen-plus` should fail with DashScope hint");
+        let err_qwen = parse_args(&[
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            "qwen-plus".to_string(),
+        ])
+        .expect_err("`--model qwen-plus` should fail with DashScope hint");
         assert!(
             err_qwen.contains("Did you mean `qwen/qwen-plus`?"),
             "Qwen model error should hint qwen/ prefix: {err_qwen}"
@@ -10412,8 +10448,13 @@ mod tests {
             "Qwen model error should mention env var: {err_qwen}"
         );
         // Unrelated invalid model should NOT get a hint
-        let err_garbage = parse_args(&["prompt".to_string(), "test".to_string(), "--model".to_string(), "asdfgh".to_string()])
-            .expect_err("`--model asdfgh` should fail");
+        let err_garbage = parse_args(&[
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            "asdfgh".to_string(),
+        ])
+        .expect_err("`--model asdfgh` should fail");
         assert!(
             !err_garbage.contains("Did you mean"),
             "Unrelated model errors should not get a hint: {err_garbage}"
@@ -10423,15 +10464,42 @@ mod tests {
     #[test]
     fn classify_error_kind_returns_correct_discriminants() {
         // #77: error kind classification for JSON error payloads
-        assert_eq!(classify_error_kind("missing Anthropic credentials; export ..."), "missing_credentials");
-        assert_eq!(classify_error_kind("no worker state file found at /tmp/..."), "missing_worker_state");
-        assert_eq!(classify_error_kind("session not found: abc123"), "session_not_found");
-        assert_eq!(classify_error_kind("failed to restore session: no managed sessions found"), "session_load_failed");
-        assert_eq!(classify_error_kind("unrecognized argument `--foo` for subcommand `doctor`"), "cli_parse");
-        assert_eq!(classify_error_kind("invalid model syntax: 'gpt-4'. Expected ..."), "invalid_model_syntax");
-        assert_eq!(classify_error_kind("unsupported resumed command: /blargh"), "unsupported_resumed_command");
-        assert_eq!(classify_error_kind("api failed after 3 attempts: ..."), "api_http_error");
-        assert_eq!(classify_error_kind("something completely unknown"), "unknown");
+        assert_eq!(
+            classify_error_kind("missing Anthropic credentials; export ..."),
+            "missing_credentials"
+        );
+        assert_eq!(
+            classify_error_kind("no worker state file found at /tmp/..."),
+            "missing_worker_state"
+        );
+        assert_eq!(
+            classify_error_kind("session not found: abc123"),
+            "session_not_found"
+        );
+        assert_eq!(
+            classify_error_kind("failed to restore session: no managed sessions found"),
+            "session_load_failed"
+        );
+        assert_eq!(
+            classify_error_kind("unrecognized argument `--foo` for subcommand `doctor`"),
+            "cli_parse"
+        );
+        assert_eq!(
+            classify_error_kind("invalid model syntax: 'gpt-4'. Expected ..."),
+            "invalid_model_syntax"
+        );
+        assert_eq!(
+            classify_error_kind("unsupported resumed command: /blargh"),
+            "unsupported_resumed_command"
+        );
+        assert_eq!(
+            classify_error_kind("api failed after 3 attempts: ..."),
+            "api_http_error"
+        );
+        assert_eq!(
+            classify_error_kind("something completely unknown"),
+            "unknown"
+        );
     }
 
     #[test]
@@ -10874,7 +10942,7 @@ mod tests {
         let error = parse_args(&["/status".to_string()])
             .expect_err("/status should remain REPL-only when invoked directly");
         assert!(error.contains("interactive-only"));
-        assert!(error.contains("claw --resume SESSION.jsonl /status"));
+        assert!(error.contains("scode --resume SESSION.jsonl /status"));
     }
 
     #[test]
@@ -10901,7 +10969,6 @@ mod tests {
         assert!(report.contains("Did you mean"));
         assert!(report.contains("Use /help"));
     }
-
 
     #[test]
     fn typoed_doctor_subcommand_returns_did_you_mean_error() {
@@ -10985,11 +11052,10 @@ mod tests {
         );
     }
 
-
     #[test]
     fn punctuation_bearing_single_token_still_dispatches_to_prompt() {
         // #140: Guard against test pollution — isolate cwd + env so this test
-        // doesn't pick up a stale .claw/settings.json from other tests that
+        // doesn't pick up a stale .nexus/sudocode/settings.json from other tests that
         // may have set `permissionMode: acceptEdits` in a shared cwd.
         let _guard = env_lock();
         let root = temp_dir();
@@ -11091,7 +11157,7 @@ mod tests {
         let error = parse_args(&["--resum".to_string()]).expect_err("unknown option should fail");
         assert!(error.contains("unknown option: --resum"));
         assert!(error.contains("Did you mean --resume?"));
-        assert!(error.contains("claw --help"));
+        assert!(error.contains("scode --help"));
     }
 
     #[test]
@@ -11243,7 +11309,7 @@ mod tests {
         assert!(help.contains("/agents"));
         assert!(help.contains("/skills"));
         assert!(help.contains("/exit"));
-        assert!(help.contains("Auto-save            .claw/sessions/<session-id>.jsonl"));
+        assert!(help.contains("Auto-save            .nexus/sudocode/sessions/<session-id>.jsonl"));
         assert!(help.contains("Resume latest        /resume latest"));
     }
 
@@ -11324,7 +11390,7 @@ mod tests {
         fs::create_dir_all(&root).expect("root dir");
         let config_home = root.join("config");
         fs::create_dir_all(&config_home).expect("config home dir");
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_MODEL");
         std::env::set_var("ANTHROPIC_MODEL", "sonnet");
 
@@ -11333,7 +11399,7 @@ mod tests {
         assert_eq!(resolved, "claude-sonnet-4-6");
 
         std::env::remove_var("ANTHROPIC_MODEL");
-        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("SUDO_CODE_CONFIG_HOME");
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -11344,14 +11410,14 @@ mod tests {
         fs::create_dir_all(&root).expect("root dir");
         let config_home = root.join("config");
         fs::create_dir_all(&config_home).expect("config home dir");
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_MODEL");
 
         let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
 
         assert_eq!(resolved, DEFAULT_MODEL);
 
-        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("SUDO_CODE_CONFIG_HOME");
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -11434,20 +11500,20 @@ mod tests {
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
-        assert!(help.contains("claw help"));
-        assert!(help.contains("claw version"));
-        assert!(help.contains("claw status"));
-        assert!(help.contains("claw sandbox"));
-        assert!(help.contains("claw init"));
-        assert!(help.contains("claw acp [serve]"));
-        assert!(help.contains("claw agents"));
-        assert!(help.contains("claw mcp"));
-        assert!(help.contains("claw skills"));
-        assert!(help.contains("claw /skills"));
-        assert!(help.contains("ultraworkers/claw-code"));
-        assert!(help.contains("cargo install claw-code"));
-        assert!(!help.contains("claw login"));
-        assert!(!help.contains("claw logout"));
+        assert!(help.contains("scode help"));
+        assert!(help.contains("scode version"));
+        assert!(help.contains("scode status"));
+        assert!(help.contains("scode sandbox"));
+        assert!(help.contains("scode init"));
+        assert!(help.contains("scode acp [serve]"));
+        assert!(help.contains("scode agents"));
+        assert!(help.contains("scode mcp"));
+        assert!(help.contains("scode skills"));
+        assert!(help.contains("scode /skills"));
+        assert!(help.contains("ultraworkers/sudo-code"));
+        assert!(help.contains("cargo install sudo-code"));
+        assert!(!help.contains("scode login"));
+        assert!(!help.contains("scode logout"));
     }
 
     #[test]
@@ -11843,10 +11909,10 @@ UU conflicted.rs",
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
-        assert!(help.contains("claw --resume [SESSION.jsonl|session-id|latest]"));
+        assert!(help.contains("scode --resume [SESSION.jsonl|session-id|latest]"));
         assert!(help.contains("Use `latest` with --resume, /resume, or /session switch"));
-        assert!(help.contains("claw --resume latest"));
-        assert!(help.contains("claw --resume latest /status /diff /export notes.txt"));
+        assert!(help.contains("scode --resume latest"));
+        assert!(help.contains("scode --resume latest /status /diff /export notes.txt"));
     }
 
     #[test]
@@ -11860,7 +11926,7 @@ UU conflicted.rs",
         let handle = create_managed_session_handle("session-alpha").expect("jsonl handle");
         assert!(handle.path.ends_with("session-alpha.jsonl"));
 
-        let legacy_path = workspace.join(".claw/sessions/legacy.json");
+        let legacy_path = workspace.join(".nexus/sudocode/sessions/legacy.json");
         std::fs::create_dir_all(
             legacy_path
                 .parent()
@@ -11931,7 +11997,7 @@ UU conflicted.rs",
         let previous = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&workspace_b).expect("switch cwd");
 
-        let session_path = workspace_a.join(".claw/sessions/legacy-cross.jsonl");
+        let session_path = workspace_a.join(".nexus/sudocode/sessions/legacy-cross.jsonl");
         std::fs::create_dir_all(
             session_path
                 .parent()
@@ -11988,7 +12054,7 @@ UU conflicted.rs",
     fn resume_usage_mentions_latest_shortcut() {
         let usage = render_resume_usage();
         assert!(usage.contains("/resume <session-path|session-id|latest>"));
-        assert!(usage.contains(".claw/sessions/<session-id>.jsonl"));
+        assert!(usage.contains(".nexus/sudocode/sessions/<session-id>.jsonl"));
         assert!(usage.contains("/session list"));
     }
 
@@ -12020,7 +12086,7 @@ UU conflicted.rs",
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("claw-cli-{label}-{nanos}"))
+        std::env::temp_dir().join(format!("scode-cli-{label}-{nanos}"))
     }
 
     #[test]
@@ -13033,7 +13099,7 @@ mod dump_manifests_tests {
     #[test]
     fn dump_manifests_shows_helpful_error_when_manifests_missing() {
         let root = std::env::temp_dir().join(format!(
-            "claw_test_missing_manifests_{}",
+            "scode_test_missing_manifests_{}",
             std::process::id()
         ));
         let workspace = root.join("workspace");
@@ -13070,7 +13136,7 @@ mod dump_manifests_tests {
     #[test]
     fn dump_manifests_uses_explicit_manifest_dir() {
         let root = std::env::temp_dir().join(format!(
-            "claw_test_explicit_manifest_dir_{}",
+            "scode_test_explicit_manifest_dir_{}",
             std::process::id()
         ));
         let workspace = root.join("workspace");

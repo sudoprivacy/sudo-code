@@ -1622,15 +1622,15 @@ fn detect_claude_code_manifest_contract_gaps(
     for (field, detail) in [
         (
             "skills",
-            "plugin manifest field `skills` uses the Claude Code plugin contract; `claw` does not load plugin-managed skills and instead discovers skills from local roots such as `.claw/skills`, `.omc/skills`, `.agents/skills`, `~/.omc/skills`, and `~/.claude/skills/omc-learned`.",
+            "plugin manifest field `skills` uses the Claude Code plugin contract; `scode` does not load plugin-managed skills and instead discovers skills from local roots such as `.nexus/sudocode/skills`, `.omc/skills`, `.agents/skills`, `~/.omc/skills`, and `~/.claude/skills/omc-learned`.",
         ),
         (
             "mcpServers",
-            "plugin manifest field `mcpServers` uses the Claude Code plugin contract; `claw` does not import MCP servers from plugin manifests.",
+            "plugin manifest field `mcpServers` uses the Claude Code plugin contract; `scode` does not import MCP servers from plugin manifests.",
         ),
         (
             "agents",
-            "plugin manifest field `agents` uses the Claude Code plugin contract; `claw` does not load plugin-managed agent markdown catalogs from plugin manifests.",
+            "plugin manifest field `agents` uses the Claude Code plugin contract; `scode` does not load plugin-managed agent markdown catalogs from plugin manifests.",
         ),
     ] {
         if root.contains_key(field) {
@@ -1646,7 +1646,7 @@ fn detect_claude_code_manifest_contract_gaps(
         .is_some_and(|commands| commands.iter().any(Value::is_string))
     {
         errors.push(PluginManifestValidationError::UnsupportedManifestContract {
-            detail: "plugin manifest field `commands` uses Claude Code-style directory globs; `claw` slash dispatch is still built-in and does not load plugin slash command markdown files.".to_string(),
+            detail: "plugin manifest field `commands` uses Claude Code-style directory globs; `scode` slash dispatch is still built-in and does not load plugin slash command markdown files.".to_string(),
         });
     }
 
@@ -1658,7 +1658,7 @@ fn detect_claude_code_manifest_contract_gaps(
             ) {
                 errors.push(PluginManifestValidationError::UnsupportedManifestContract {
                     detail: format!(
-                        "plugin hook `{hook_name}` uses the Claude Code lifecycle contract; `claw` plugins currently support only PreToolUse, PostToolUse, and PostToolUseFailure."
+                        "plugin hook `{hook_name}` uses the Claude Code lifecycle contract; `scode` plugins currently support only PreToolUse, PostToolUse, and PostToolUseFailure."
                     ),
                 });
             }
@@ -2283,7 +2283,7 @@ fn ensure_object<'a>(root: &'a mut Map<String, Value>, key: &str) -> &'a mut Map
 }
 
 /// Environment variable lock for test isolation.
-/// Guards against concurrent modification of `CLAW_CONFIG_HOME`.
+/// Guards against concurrent modification of `SUDO_CODE_CONFIG_HOME`.
 #[cfg(test)]
 fn env_lock() -> &'static std::sync::Mutex<()> {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -3516,18 +3516,18 @@ mod tests {
         let _ = fs::remove_dir_all(bundled_root);
     }
 
-    /// Regression test for ROADMAP #41: verify that `CLAW_CONFIG_HOME` isolation prevents
-    /// host `~/.claw/plugins/` from bleeding into test runs.
+    /// Regression test for ROADMAP #41: verify that `SUDO_CODE_CONFIG_HOME` isolation prevents
+    /// host `~/.nexus/sudocode/plugins/` from bleeding into test runs.
     #[test]
-    fn claw_config_home_isolation_prevents_host_plugin_leakage() {
+    fn sudocode_config_home_isolation_prevents_host_plugin_leakage() {
         let _guard = env_guard();
 
-        // Create a temp directory to act as our isolated CLAW_CONFIG_HOME
+        // Create a temp directory to act as our isolated SUDO_CODE_CONFIG_HOME
         let config_home = temp_dir("isolated-home");
         let bundled_root = temp_dir("isolated-bundled");
 
-        // Set CLAW_CONFIG_HOME to our temp directory
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        // Set SUDO_CODE_CONFIG_HOME to our temp directory
+        std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
 
         // Create a test fixture plugin in the isolated config home
         let install_root = config_home.join("plugins").join("installed");
@@ -3541,7 +3541,7 @@ mod tests {
 }"#,
         );
 
-        // Create PluginManager with isolated bundled_root - it should use the temp config_home, not host ~/.claw/
+        // Create PluginManager with isolated bundled_root - it should use the temp config_home, not host ~/.nexus/sudocode/
         let mut config = PluginManagerConfig::new(&config_home);
         config.bundled_root = Some(bundled_root.clone());
         let manager = PluginManager::new(config);
@@ -3555,7 +3555,7 @@ mod tests {
         assert_eq!(
             installed.len(),
             1,
-            "should only see the test fixture plugin, not host ~/.claw/plugins/"
+            "should only see the test fixture plugin, not host ~/.nexus/sudocode/plugins/"
         );
         assert_eq!(
             installed[0].metadata.id, "isolated-test-plugin@external",
@@ -3563,7 +3563,7 @@ mod tests {
         );
 
         // Cleanup
-        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("SUDO_CODE_CONFIG_HOME");
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(bundled_root);
     }

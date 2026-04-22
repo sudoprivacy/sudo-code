@@ -1,7 +1,7 @@
 target/
 .omx/
-.clawd-agents/
-# Claw Code local artifacts
-.claw/settings.local.json
-.claw/sessions/
-.clawhip/
+.sudocode-agents/
+# Sudo Code local artifacts
+.nexus/sudocode/settings.local.json
+.nexus/sudocode/sessions/
+.sudocodehip/

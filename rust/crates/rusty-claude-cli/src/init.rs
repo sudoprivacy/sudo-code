@@ -1,15 +1,19 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const STARTER_CLAW_JSON: &str = concat!(
+const STARTER_CONFIG_JSON: &str = concat!(
     "{\n",
     "  \"permissions\": {\n",
     "    \"defaultMode\": \"dontAsk\"\n",
     "  }\n",
     "}\n",
 );
-const GITIGNORE_COMMENT: &str = "# Claw Code local artifacts";
-const GITIGNORE_ENTRIES: [&str; 3] = [".claw/settings.local.json", ".claw/sessions/", ".clawhip/"];
+const GITIGNORE_COMMENT: &str = "# Sudo Code local artifacts";
+const GITIGNORE_ENTRIES: [&str; 3] = [
+    ".nexus/sudocode/settings.local.json",
+    ".nexus/sudocode/sessions/",
+    ".sudocodehip/",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InitStatus {
@@ -29,7 +33,7 @@ impl InitStatus {
     }
 
     /// Machine-stable identifier for structured output (#142).
-    /// Unlike `label()`, this never changes wording: claws can switch on
+    /// Unlike `label()`, this never changes wording: consumers can switch on
     /// these values without brittle substring matching.
     #[must_use]
     pub(crate) fn json_tag(self) -> &'static str {
@@ -71,7 +75,7 @@ impl InitReport {
         lines.join("\n")
     }
 
-    /// Summary constant that claws can embed in JSON output without having
+    /// Summary constant that consumers can embed in JSON output without having
     /// to read it out of the human-formatted `message` string (#142).
     pub(crate) const NEXT_STEP: &'static str = "Review and tailor the generated guidance";
 
@@ -122,16 +126,16 @@ struct RepoDetection {
 pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::error::Error>> {
     let mut artifacts = Vec::new();
 
-    let claw_dir = cwd.join(".claw");
+    let config_dir = cwd.join(".nexus").join("sudocode");
     artifacts.push(InitArtifact {
-        name: ".claw/",
-        status: ensure_dir(&claw_dir)?,
+        name: ".nexus/sudocode/",
+        status: ensure_dir(&config_dir)?,
     });
 
-    let claw_json = cwd.join(".claw.json");
+    let config_json = cwd.join(".nexus/sudocode.json");
     artifacts.push(InitArtifact {
-        name: ".claw.json",
-        status: write_file_if_missing(&claw_json, STARTER_CLAW_JSON)?,
+        name: ".nexus/sudocode.json",
+        status: write_file_if_missing(&config_json, STARTER_CONFIG_JSON)?,
     });
 
     let gitignore = cwd.join(".gitignore");
@@ -206,7 +210,7 @@ pub(crate) fn render_init_claude_md(cwd: &Path) -> String {
     let mut lines = vec![
         "# CLAUDE.md".to_string(),
         String::new(),
-        "This file provides guidance to Claw Code (clawcode.dev) when working with code in this repository.".to_string(),
+        "This file provides guidance to Sudo Code (sudocode.dev) when working with code in this repository.".to_string(),
         String::new(),
     ];
 
@@ -251,7 +255,7 @@ pub(crate) fn render_init_claude_md(cwd: &Path) -> String {
 
     lines.push("## Working agreement".to_string());
     lines.push("- Prefer small, reviewable changes and keep generated bootstrap files aligned with actual repo workflows.".to_string());
-    lines.push("- Keep shared defaults in `.claw.json`; reserve `.claw/settings.local.json` for machine-local overrides.".to_string());
+    lines.push("- Keep shared defaults in `.nexus/sudocode.json`; reserve `.nexus/sudocode/settings.local.json` for machine-local overrides.".to_string());
     lines.push("- Do not overwrite existing `CLAUDE.md` content automatically; update it intentionally when repo workflows change.".to_string());
     lines.push(String::new());
 
@@ -396,16 +400,16 @@ mod tests {
 
         let report = initialize_repo(&root).expect("init should succeed");
         let rendered = report.render();
-        assert!(rendered.contains(".claw/"));
-        assert!(rendered.contains(".claw.json"));
+        assert!(rendered.contains(".nexus/sudocode/"));
+        assert!(rendered.contains(".nexus/sudocode.json"));
         assert!(rendered.contains("created"));
         assert!(rendered.contains(".gitignore       created"));
         assert!(rendered.contains("CLAUDE.md        created"));
-        assert!(root.join(".claw").is_dir());
-        assert!(root.join(".claw.json").is_file());
+        assert!(root.join(".nexus").join("sudocode").is_dir());
+        assert!(root.join(".nexus/sudocode.json").is_file());
         assert!(root.join("CLAUDE.md").is_file());
         assert_eq!(
-            fs::read_to_string(root.join(".claw.json")).expect("read claw json"),
+            fs::read_to_string(root.join(".nexus/sudocode.json")).expect("read config json"),
             concat!(
                 "{\n",
                 "  \"permissions\": {\n",
@@ -415,9 +419,9 @@ mod tests {
             )
         );
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
-        assert!(gitignore.contains(".claw/settings.local.json"));
-        assert!(gitignore.contains(".claw/sessions/"));
-        assert!(gitignore.contains(".clawhip/"));
+        assert!(gitignore.contains(".nexus/sudocode/settings.local.json"));
+        assert!(gitignore.contains(".nexus/sudocode/sessions/"));
+        assert!(gitignore.contains(".sudocodehip/"));
         let claude_md = fs::read_to_string(root.join("CLAUDE.md")).expect("read claude md");
         assert!(claude_md.contains("Languages: Rust."));
         assert!(claude_md.contains("cargo clippy --workspace --all-targets -- -D warnings"));
@@ -430,7 +434,11 @@ mod tests {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("create root");
         fs::write(root.join("CLAUDE.md"), "custom guidance\n").expect("write existing claude md");
-        fs::write(root.join(".gitignore"), ".claw/settings.local.json\n").expect("write gitignore");
+        fs::write(
+            root.join(".gitignore"),
+            ".nexus/sudocode/settings.local.json\n",
+        )
+        .expect("write gitignore");
 
         let first = initialize_repo(&root).expect("first init should succeed");
         assert!(first
@@ -438,8 +446,8 @@ mod tests {
             .contains("CLAUDE.md        skipped (already exists)"));
         let second = initialize_repo(&root).expect("second init should succeed");
         let second_rendered = second.render();
-        assert!(second_rendered.contains(".claw/"));
-        assert!(second_rendered.contains(".claw.json"));
+        assert!(second_rendered.contains(".nexus/sudocode/"));
+        assert!(second_rendered.contains(".nexus/sudocode.json"));
         assert!(second_rendered.contains("skipped (already exists)"));
         assert!(second_rendered.contains(".gitignore       skipped (already exists)"));
         assert!(second_rendered.contains("CLAUDE.md        skipped (already exists)"));
@@ -448,9 +456,14 @@ mod tests {
             "custom guidance\n"
         );
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
-        assert_eq!(gitignore.matches(".claw/settings.local.json").count(), 1);
-        assert_eq!(gitignore.matches(".claw/sessions/").count(), 1);
-        assert_eq!(gitignore.matches(".clawhip/").count(), 1);
+        assert_eq!(
+            gitignore
+                .matches(".nexus/sudocode/settings.local.json")
+                .count(),
+            1
+        );
+        assert_eq!(gitignore.matches(".nexus/sudocode/sessions/").count(), 1);
+        assert_eq!(gitignore.matches(".sudocodehip/").count(), 1);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -468,8 +481,8 @@ mod tests {
         assert_eq!(
             created_names,
             vec![
-                ".claw/".to_string(),
-                ".claw.json".to_string(),
+                ".nexus/sudocode/".to_string(),
+                ".nexus/sudocode.json".to_string(),
                 ".gitignore".to_string(),
                 "CLAUDE.md".to_string(),
             ],
@@ -485,8 +498,8 @@ mod tests {
         assert_eq!(
             skipped_names,
             vec![
-                ".claw/".to_string(),
-                ".claw.json".to_string(),
+                ".nexus/sudocode/".to_string(),
+                ".nexus/sudocode.json".to_string(),
                 ".gitignore".to_string(),
                 "CLAUDE.md".to_string(),
             ],
