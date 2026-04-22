@@ -16,7 +16,7 @@ mod init;
 mod input;
 mod render;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -49,12 +49,12 @@ use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
-    load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
-    ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
-    ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
-    McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
-    ToolError, ToolExecutor, UsageTracker,
+    load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status, AcpError,
+    AcpSessionUpdateObserver, ApiClient, ApiRequest, AssistantEvent, CompactionConfig,
+    ConfigLoader, ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
+    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
+    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -416,7 +416,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
-        CliAction::Acp { output_format } => print_acp_status(output_format)?,
+        CliAction::Acp {
+            model,
+            model_flag_raw,
+            allowed_tools,
+            permission_mode_override,
+            reasoning_effort,
+        } => run_acp_server(
+            model,
+            model_flag_raw,
+            allowed_tools,
+            permission_mode_override,
+            reasoning_effort,
+        )?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         // #146: dispatch pure-local introspection. Text mode uses existing
@@ -540,7 +552,11 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Acp {
-        output_format: CliOutputFormat,
+        model: String,
+        model_flag_raw: Option<String>,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode_override: Option<PermissionMode>,
+        reasoning_effort: Option<String>,
     },
     State {
         output_format: CliOutputFormat,
@@ -949,7 +965,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
-        "acp" => parse_acp_args(&rest[1..], output_format),
+        "acp" => parse_acp_args(
+            &rest[1..],
+            model,
+            model_flag_raw,
+            allowed_tools,
+            permission_mode_override,
+            reasoning_effort,
+        ),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
@@ -1153,10 +1176,29 @@ fn removed_auth_surface_error(command_name: &str) -> String {
     )
 }
 
-fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+fn parse_acp_args(
+    args: &[String],
+    model: String,
+    model_flag_raw: Option<String>,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode_override: Option<PermissionMode>,
+    reasoning_effort: Option<String>,
+) -> Result<CliAction, String> {
     match args {
-        [] => Ok(CliAction::Acp { output_format }),
-        [subcommand] if subcommand == "serve" => Ok(CliAction::Acp { output_format }),
+        [] => Ok(CliAction::Acp {
+            model,
+            model_flag_raw,
+            allowed_tools,
+            permission_mode_override,
+            reasoning_effort,
+        }),
+        [subcommand] if subcommand == "serve" => Ok(CliAction::Acp {
+            model,
+            model_flag_raw,
+            allowed_tools,
+            permission_mode_override,
+            reasoning_effort,
+        }),
         _ => Err(String::from(
             "unsupported ACP invocation. Use `scode acp`, `scode acp serve`, `scode --acp`, or `scode -acp`.",
         )),
@@ -3772,6 +3814,183 @@ impl Drop for BuiltRuntime {
     }
 }
 
+struct AcpCliSession {
+    cwd: PathBuf,
+    handle: SessionHandle,
+    runtime: BuiltRuntime,
+}
+
+struct AcpCliAgent {
+    model: String,
+    model_flag_raw: Option<String>,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode_override: Option<PermissionMode>,
+    reasoning_effort: Option<String>,
+    sessions: HashMap<String, AcpCliSession>,
+}
+
+impl AcpCliAgent {
+    fn new(
+        model: String,
+        model_flag_raw: Option<String>,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode_override: Option<PermissionMode>,
+        reasoning_effort: Option<String>,
+    ) -> Self {
+        Self {
+            model,
+            model_flag_raw,
+            allowed_tools,
+            permission_mode_override,
+            reasoning_effort,
+            sessions: HashMap::new(),
+        }
+    }
+
+    fn build_session(&self, cwd: PathBuf) -> Result<AcpCliSession, AcpError> {
+        let cwd = canonical_session_cwd(cwd)?;
+        let model = self.resolve_model_for_cwd(&cwd)?;
+        let permission_mode = self.resolve_permission_mode_for_cwd(&cwd)?;
+        let system_prompt = build_system_prompt_for(&cwd).map_err(|error| {
+            AcpError::internal(format!("failed to build system prompt: {error}"))
+        })?;
+        let session_state = new_cli_session_for(&cwd)
+            .map_err(|error| AcpError::internal(format!("failed to create session: {error}")))?;
+        let handle = create_managed_session_handle_for(&cwd, &session_state.session_id).map_err(
+            |error| AcpError::internal(format!("failed to create session handle: {error}")),
+        )?;
+        let mut runtime = build_runtime_for_cwd(
+            &cwd,
+            session_state.with_persistence_path(handle.path.clone()),
+            &handle.id,
+            model,
+            system_prompt,
+            true,
+            false,
+            self.allowed_tools.clone(),
+            permission_mode,
+            None,
+        )
+        .map_err(|error| AcpError::internal(format!("failed to build runtime: {error}")))?;
+        if let Some(runtime) = runtime.runtime.as_mut() {
+            runtime
+                .api_client_mut()
+                .set_reasoning_effort(self.reasoning_effort.clone());
+        }
+        runtime
+            .session()
+            .save_to_path(&handle.path)
+            .map_err(|error| AcpError::internal(format!("failed to persist session: {error}")))?;
+
+        Ok(AcpCliSession {
+            cwd,
+            handle,
+            runtime,
+        })
+    }
+
+    fn resolve_model_for_cwd(&self, cwd: &Path) -> Result<String, AcpError> {
+        if self.model_flag_raw.is_some() {
+            return Ok(self.model.clone());
+        }
+        let _guard = ScopedCurrentDir::change_to(cwd)
+            .map_err(|error| AcpError::internal(format!("failed to enter cwd: {error}")))?;
+        Ok(resolve_repl_model(self.model.clone()))
+    }
+
+    fn resolve_permission_mode_for_cwd(&self, cwd: &Path) -> Result<PermissionMode, AcpError> {
+        if let Some(mode) = self.permission_mode_override {
+            return Ok(mode);
+        }
+        let _guard = ScopedCurrentDir::change_to(cwd)
+            .map_err(|error| AcpError::internal(format!("failed to enter cwd: {error}")))?;
+        Ok(default_permission_mode())
+    }
+}
+
+impl runtime::AcpAgent for AcpCliAgent {
+    fn new_session(&mut self, cwd: Option<PathBuf>) -> Result<String, AcpError> {
+        let cwd = cwd
+            .map(Ok)
+            .unwrap_or_else(env::current_dir)
+            .map_err(|error| AcpError::internal(format!("failed to resolve cwd: {error}")))?;
+        let session = self.build_session(cwd)?;
+        let session_id = session.handle.id.clone();
+        self.sessions.insert(session_id.clone(), session);
+        Ok(session_id)
+    }
+
+    fn run_prompt(
+        &mut self,
+        session_id: &str,
+        prompt: String,
+        observer: &mut AcpSessionUpdateObserver<'_>,
+    ) -> Result<(), AcpError> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| AcpError::invalid_params(format!("unknown sessionId: {session_id}")))?;
+        let _guard = ScopedCurrentDir::change_to(&session.cwd)
+            .map_err(|error| AcpError::internal(format!("failed to enter session cwd: {error}")))?;
+        session
+            .runtime
+            .run_turn(prompt, None, Some(observer))
+            .map_err(|error| AcpError::internal(error.to_string()))?;
+        session
+            .runtime
+            .session()
+            .save_to_path(&session.handle.path)
+            .map_err(|error| AcpError::internal(format!("failed to persist session: {error}")))?;
+        Ok(())
+    }
+}
+
+struct ScopedCurrentDir {
+    previous: PathBuf,
+}
+
+impl ScopedCurrentDir {
+    fn change_to(cwd: &Path) -> io::Result<Self> {
+        let previous = env::current_dir()?;
+        env::set_current_dir(cwd)?;
+        Ok(Self { previous })
+    }
+}
+
+impl Drop for ScopedCurrentDir {
+    fn drop(&mut self) {
+        let _ = env::set_current_dir(&self.previous);
+    }
+}
+
+fn canonical_session_cwd(cwd: PathBuf) -> Result<PathBuf, AcpError> {
+    let canonical = fs::canonicalize(&cwd).map_err(|error| {
+        AcpError::invalid_params(format!("params.cwd is not accessible: {error}"))
+    })?;
+    if !canonical.is_dir() {
+        return Err(AcpError::invalid_params("params.cwd must be a directory"));
+    }
+    Ok(canonical)
+}
+
+fn run_acp_server(
+    model: String,
+    model_flag_raw: Option<String>,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode_override: Option<PermissionMode>,
+    reasoning_effort: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let agent = AcpCliAgent::new(
+        model,
+        model_flag_raw,
+        allowed_tools,
+        permission_mode_override,
+        reasoning_effort,
+    );
+    runtime::run_acp_stdio_server(agent, runtime::AcpServerOptions::new(VERSION))?;
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct ToolSearchRequest {
     query: String,
@@ -5236,13 +5455,27 @@ fn current_session_store() -> Result<runtime::SessionStore, Box<dyn std::error::
 }
 
 fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
-    Ok(Session::new().with_workspace_root(env::current_dir()?))
+    new_cli_session_for(&env::current_dir()?)
+}
+
+fn new_cli_session_for(cwd: &Path) -> Result<Session, Box<dyn std::error::Error>> {
+    Ok(Session::new().with_workspace_root(cwd.to_path_buf()))
 }
 
 fn create_managed_session_handle(
     session_id: &str,
 ) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let handle = current_session_store()?.create_handle(session_id);
+    let cwd = env::current_dir()?;
+    create_managed_session_handle_for(&cwd, session_id)
+}
+
+fn create_managed_session_handle_for(
+    cwd: &Path,
+    session_id: &str,
+) -> Result<SessionHandle, Box<dyn std::error::Error>> {
+    let handle = runtime::SessionStore::from_cwd(cwd)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
+        .create_handle(session_id);
     Ok(SessionHandle {
         id: handle.id,
         path: handle.path,
@@ -5824,12 +6057,12 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Related          /doctor · scode --resume latest /doctor"
             .to_string(),
         LocalHelpTopic::Acp => "ACP / Zed
-  Usage            scode acp [serve] [--output-format <format>]
+  Usage            scode acp [serve]
   Aliases          scode --acp · scode -acp
-  Purpose          explain the current editor-facing ACP/Zed launch contract without starting the runtime
-  Status           discoverability only; `serve` is a status alias and does not launch a daemon yet
-  Formats          text (default), json
-  Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · scode --help"
+  Purpose          run the ACP JSON-RPC agent server over stdio for editor integrations
+  Transport        LSP-style Content-Length framed JSON-RPC on stdin/stdout
+  Sessions         session/new creates managed .nexus/sudocode sessions for the requested cwd
+  Related          scode --help"
             .to_string(),
         LocalHelpTopic::Init => "Init
   Usage            scode init [--output-format <format>]
@@ -5888,39 +6121,6 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
 
 fn print_help_topic(topic: LocalHelpTopic) {
     println!("{}", render_help_topic(topic));
-}
-
-fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let message = "ACP/Zed editor integration is not implemented in sudo-code yet. `scode acp serve` is only a discoverability alias today; it does not launch a daemon or Zed-specific protocol endpoint. Use the normal terminal surfaces for now and track ROADMAP #76 for real ACP support.";
-    match output_format {
-        CliOutputFormat::Text => {
-            println!(
-                "ACP / Zed\n  Status           discoverability only\n  Launch           `scode acp serve` / `scode --acp` / `scode -acp` report status only; no editor daemon is available yet\n  Today            use `scode prompt`, the REPL, or `scode doctor` for local verification\n  Tracking         ROADMAP #76\n  Message          {message}"
-            );
-        }
-        CliOutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "kind": "acp",
-                    "status": "discoverability_only",
-                    "supported": false,
-                    "serve_alias_only": true,
-                    "message": message,
-                    "launch_command": serde_json::Value::Null,
-                    "aliases": ["acp", "--acp", "-acp"],
-                    "discoverability_tracking": "ROADMAP #64a",
-                    "tracking": "ROADMAP #76",
-                    "recommended_workflows": [
-                        "scode prompt TEXT",
-                        "scode",
-                        "scode doctor"
-                    ],
-                }))?
-            );
-        }
-    }
-    Ok(())
 }
 
 fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
@@ -6860,8 +7060,12 @@ fn short_tool_id(id: &str) -> String {
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    build_system_prompt_for(&env::current_dir()?)
+}
+
+fn build_system_prompt_for(cwd: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     Ok(load_system_prompt(
-        env::current_dir()?,
+        cwd.to_path_buf(),
         DEFAULT_DATE,
         env::consts::OS,
         "unknown",
@@ -7284,7 +7488,39 @@ fn build_runtime(
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
-    let runtime_plugin_state = build_runtime_plugin_state()?;
+    let cwd = env::current_dir()?;
+    build_runtime_for_cwd(
+        &cwd,
+        session,
+        session_id,
+        model,
+        system_prompt,
+        enable_tools,
+        emit_output,
+        allowed_tools,
+        permission_mode,
+        progress_reporter,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
+fn build_runtime_for_cwd(
+    cwd: &Path,
+    session: Session,
+    session_id: &str,
+    model: String,
+    system_prompt: Vec<String>,
+    enable_tools: bool,
+    emit_output: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    progress_reporter: Option<InternalPromptProgressReporter>,
+) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
+    let loader = ConfigLoader::default_for(cwd);
+    let runtime_config = loader.load()?;
+    let runtime_plugin_state =
+        build_runtime_plugin_state_with_loader(cwd, &loader, &runtime_config)?;
     build_runtime_with_plugin_state(
         session,
         session_id,
@@ -8903,7 +9139,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  scode acp [serve]")?;
     writeln!(
         out,
-        "      Show ACP/Zed editor integration status (currently unsupported; aliases: --acp, -acp)"
+        "      Run the ACP JSON-RPC stdio server for editor integrations (aliases: --acp, -acp)"
     )?;
     writeln!(out, "      Source of truth: {OFFICIAL_REPO_SLUG}")?;
     writeln!(
@@ -10136,30 +10372,63 @@ mod tests {
 
     #[test]
     fn parses_acp_command_surfaces() {
+        let expected = CliAction::Acp {
+            model: DEFAULT_MODEL.to_string(),
+            model_flag_raw: None,
+            allowed_tools: None,
+            permission_mode_override: None,
+            reasoning_effort: None,
+        };
         assert_eq!(
             parse_args(&["acp".to_string()]).expect("acp should parse"),
-            CliAction::Acp {
-                output_format: CliOutputFormat::Text,
-            }
+            expected
         );
         assert_eq!(
             parse_args(&["acp".to_string(), "serve".to_string()]).expect("acp serve should parse"),
-            CliAction::Acp {
-                output_format: CliOutputFormat::Text,
-            }
+            expected
         );
         assert_eq!(
             parse_args(&["--acp".to_string()]).expect("--acp should parse"),
-            CliAction::Acp {
-                output_format: CliOutputFormat::Text,
-            }
+            expected
         );
         assert_eq!(
             parse_args(&["-acp".to_string()]).expect("-acp should parse"),
-            CliAction::Acp {
-                output_format: CliOutputFormat::Text,
-            }
+            expected
         );
+    }
+
+    #[test]
+    fn parses_acp_with_runtime_global_options() {
+        match parse_args(&[
+            "--model".to_string(),
+            "sonnet".to_string(),
+            "--allowedTools".to_string(),
+            "read,glob".to_string(),
+            "--permission-mode".to_string(),
+            "read-only".to_string(),
+            "--reasoning-effort".to_string(),
+            "low".to_string(),
+            "acp".to_string(),
+        ])
+        .expect("acp with globals should parse")
+        {
+            CliAction::Acp {
+                model,
+                model_flag_raw,
+                allowed_tools,
+                permission_mode_override,
+                reasoning_effort,
+            } => {
+                assert_eq!(model, resolve_model_alias_with_config("sonnet"));
+                assert_eq!(model_flag_raw.as_deref(), Some("sonnet"));
+                let allowed_tools = allowed_tools.expect("allowed tools");
+                assert!(allowed_tools.contains("read_file"));
+                assert!(allowed_tools.contains("glob_search"));
+                assert_eq!(permission_mode_override, Some(PermissionMode::ReadOnly));
+                assert_eq!(reasoning_effort.as_deref(), Some("low"));
+            }
+            other => panic!("expected CliAction::Acp, got: {other:?}"),
+        }
     }
 
     #[test]
