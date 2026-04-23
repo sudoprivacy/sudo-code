@@ -49,15 +49,13 @@ use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     check_base_commit, clear_oauth_credentials, format_stale_base_warning, format_usd,
-    generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt,
-    loopback_redirect_uri, parse_oauth_callback_request_target, pricing_for_model,
-    resolve_expected_base, resolve_sandbox_status, save_oauth_credentials, AcpError,
-    AcpSessionUpdateObserver, ApiClient, ApiRequest, AssistantEvent, CompactionConfig,
-    ConfigLoader, ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
-    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
-    OAuthTokenExchangeRequest, OAuthTokenSet, PermissionMode, PermissionPolicy, ProjectContext,
-    PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError,
-    ToolExecutor, UsageTracker,
+    load_oauth_credentials, load_system_prompt, pricing_for_model, resolve_expected_base,
+    resolve_sandbox_status, AcpError, AcpSessionUpdateObserver, ApiClient, ApiRequest,
+    AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool,
+    MessageRole, ModelPricing, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
+    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -2034,102 +2032,27 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
 }
 
 fn run_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    let config = ConfigLoader::default_for(&cwd).load()?;
-    let oauth_config = config.oauth().ok_or(
-        "no OAuth configuration found; add an \"oauth\" section to your scode settings file",
-    )?;
-
-    let pkce = generate_pkce_pair()?;
-    let state = generate_state()?;
-    let port = oauth_config.callback_port.unwrap_or(8160);
-    let redirect_uri = loopback_redirect_uri(port);
-
-    let auth_request =
-        OAuthAuthorizationRequest::from_config(oauth_config, &redirect_uri, &state, &pkce);
-    let authorize_url = auth_request.build_url();
-
-    let listener = TcpListener::bind(format!("127.0.0.1:{port}"))?;
-    eprintln!("Opening browser to log in...");
-    eprintln!("If the browser does not open, visit:\n  {authorize_url}");
-    open_url_in_browser(&authorize_url);
-
-    let (mut stream, _) = listener.accept()?;
-    let mut buf = [0_u8; 4096];
-    let n = io::Read::read(&mut stream, &mut buf)?;
-    let raw_request = String::from_utf8_lossy(&buf[..n]);
-    let request_target = raw_request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .ok_or("failed to parse HTTP request from OAuth callback")?;
-
-    let params = parse_oauth_callback_request_target(request_target)
-        .map_err(|err| format!("failed to parse callback: {err}"))?;
-
-    if let Some(error) = &params.error {
-        let description = params
-            .error_description
-            .as_deref()
-            .unwrap_or("unknown error");
-        let html_body = format!(
-            "<html><body><h2>Login failed</h2><p>{error}: {description}</p><p>You may close this tab.</p></body></html>"
-        );
-        let response = format!(
-            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            html_body.len(),
-            html_body,
-        );
-        io::Write::write_all(&mut stream, response.as_bytes())?;
-        return Err(format!("OAuth error: {error} — {description}").into());
+    let claude = find_claude_cli()?;
+    eprintln!("Delegating login to Claude Code...");
+    let status = Command::new(&claude)
+        .args(["auth", "login"])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()?;
+    if !status.success() {
+        return Err("claude auth login failed".into());
     }
-
-    let code = params
-        .code
-        .ok_or("no authorization code received in callback")?;
-    let returned_state = params.state.as_deref().unwrap_or("");
-    if returned_state != state {
-        return Err("OAuth state mismatch — possible CSRF attack".into());
-    }
-
-    eprintln!("Authorization received, exchanging for token...");
-    let exchange = OAuthTokenExchangeRequest::from_config(
-        oauth_config,
-        &code,
-        &state,
-        &pkce.verifier,
-        &redirect_uri,
-    );
-    let client = AnthropicClient::from_auth(AuthSource::None);
-    let token_set = tokio::runtime::Runtime::new()?
-        .block_on(async { client.exchange_oauth_code(oauth_config, &exchange).await })?;
-
-    save_oauth_credentials(&OAuthTokenSet {
-        access_token: token_set.access_token.clone(),
-        refresh_token: token_set.refresh_token.clone(),
-        expires_at: token_set.expires_at,
-        scopes: token_set.scopes.clone(),
-    })?;
-
-    let html_body =
-        "<html><body><h2>Login successful!</h2><p>You may close this tab and return to the terminal.</p></body></html>";
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        html_body.len(),
-        html_body,
-    );
-    io::Write::write_all(&mut stream, response.as_bytes())?;
-
     match output_format {
         CliOutputFormat::Text => {
-            eprintln!("Login successful! OAuth credentials saved.");
+            eprintln!("Login successful via Claude Code.");
         }
         CliOutputFormat::Json => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "status": "ok",
-                    "message": "Login successful",
+                    "message": "Login successful via Claude Code",
                 }))?
             );
         }
@@ -2138,17 +2061,28 @@ fn run_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::E
 }
 
 fn run_logout(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    clear_oauth_credentials()?;
+    let claude = find_claude_cli()?;
+    let status = Command::new(&claude)
+        .args(["auth", "logout"])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()?;
+    if !status.success() {
+        return Err("claude auth logout failed".into());
+    }
+    // Also clear any locally saved OAuth credentials.
+    let _ = clear_oauth_credentials();
     match output_format {
         CliOutputFormat::Text => {
-            eprintln!("Logged out. OAuth credentials cleared.");
+            eprintln!("Logged out via Claude Code.");
         }
         CliOutputFormat::Json => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "status": "ok",
-                    "message": "Logged out",
+                    "message": "Logged out via Claude Code",
                 }))?
             );
         }
@@ -2156,17 +2090,24 @@ fn run_logout(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-fn open_url_in_browser(url: &str) {
-    let result = if cfg!(target_os = "macos") {
-        Command::new("open").arg(url).spawn()
-    } else if cfg!(target_os = "windows") {
-        Command::new("cmd").args(["/c", "start", url]).spawn()
-    } else {
-        Command::new("xdg-open").arg(url).spawn()
-    };
-    if let Err(err) = result {
-        eprintln!("Could not open browser automatically: {err}");
+fn find_claude_cli() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    // Check CLAUDE_BIN env override first, then search PATH.
+    if let Some(bin) = env::var_os("CLAUDE_BIN") {
+        let path = PathBuf::from(bin);
+        if path.is_file() {
+            return Ok(path);
+        }
     }
+    which_command("claude").ok_or_else(|| {
+        "Claude Code CLI (`claude`) not found. Install it first: https://docs.anthropic.com/en/docs/claude-code".into()
+    })
+}
+
+fn which_command(name: &str) -> Option<PathBuf> {
+    let path_var = env::var_os("PATH")?;
+    env::split_paths(&path_var)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
