@@ -6,7 +6,7 @@
 
 **Sudo Code** is a high-performance, autonomous-first AI agent engine written in Rust. It is designed to act as a robust, machine-readable "Operating System" for AI coding swarms.
 
-Originally forked from [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code), Sudo Code has been evolved to support the **Agent Communication Protocol (ACP)** and is the core engine powering the **Sudowork** platform.
+Originally forked from [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code) (last synced: 2026-04-23), Sudo Code has been evolved to support the **Agent Communication Protocol (ACP)** and is the core engine powering the **Sudowork** platform.
 
 ## Key Features
 
@@ -31,10 +31,7 @@ cargo build --workspace --release
 
 ## Documentation
 
-- [Usage Guide](./USAGE.md) — Commands, auth, and integration.
 - [Rust Workspace](./rust/README.md) — Crate architecture and internals.
-- [Roadmap](./ROADMAP.md) — The future of autonomous reliability.
-- [Philosophy](./PHILOSOPHY.md) — The "Machine-in-the-loop" design principles.
 
 ---
 
