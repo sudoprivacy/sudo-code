@@ -12206,7 +12206,7 @@ UU conflicted.rs",
     }
 
     #[test]
-    fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
+    fn managed_sessions_default_to_jsonl_and_resolve_legacy_json_extension() {
         let _guard = cwd_guard();
         let workspace = temp_workspace("session-resolution");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
@@ -12216,28 +12216,23 @@ UU conflicted.rs",
         let handle = create_managed_session_handle("session-alpha").expect("jsonl handle");
         assert!(handle.path.ends_with("session-alpha.jsonl"));
 
-        let legacy_path = workspace.join(".nexus/sudocode/sessions/legacy.json");
-        std::fs::create_dir_all(
-            legacy_path
-                .parent()
-                .expect("legacy path should have parent directory"),
-        )
-        .expect("session dir should exist");
+        // Place a .json session in the managed sessions dir (legacy extension, new path)
+        let managed_dir = handle.path.parent().expect("handle should have parent dir");
+        let json_path = managed_dir.join("legacy-ext.json");
         Session::new()
             .with_workspace_root(workspace.clone())
-            .with_persistence_path(legacy_path.clone())
-            .save_to_path(&legacy_path)
-            .expect("legacy session should save");
+            .with_persistence_path(json_path.clone())
+            .save_to_path(&json_path)
+            .expect("json session should save");
 
-        let resolved = resolve_session_reference("legacy").expect("legacy session should resolve");
+        let resolved =
+            resolve_session_reference("legacy-ext").expect("json session should resolve");
         assert_eq!(
             resolved
                 .path
                 .canonicalize()
                 .expect("resolved path should exist"),
-            legacy_path
-                .canonicalize()
-                .expect("legacy path should exist")
+            json_path.canonicalize().expect("json path should exist")
         );
 
         std::env::set_current_dir(previous).expect("restore cwd");
@@ -12287,7 +12282,7 @@ UU conflicted.rs",
         let previous = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&workspace_b).expect("switch cwd");
 
-        let session_path = workspace_a.join(".nexus/sudocode/sessions/legacy-cross.jsonl");
+        let session_path = workspace_a.join(".scode/sessions/cross-workspace.jsonl");
         std::fs::create_dir_all(
             session_path
                 .parent()
