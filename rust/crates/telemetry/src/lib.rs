@@ -84,6 +84,12 @@ impl AnthropicRequestProfile {
     }
 
     #[must_use]
+    pub fn with_betas(mut self, betas: Vec<String>) -> Self {
+        self.betas = betas;
+        self
+    }
+
+    #[must_use]
     pub fn with_extra_body(mut self, key: impl Into<String>, value: Value) -> Self {
         self.extra_body.insert(key.into(), value);
         self

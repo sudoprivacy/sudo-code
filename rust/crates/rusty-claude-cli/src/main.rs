@@ -30,10 +30,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AnthropicRequestProfile,
+    AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
+    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
@@ -7818,7 +7819,13 @@ impl AnthropicRuntimeClient {
                     .with_base_url(api::read_base_url())
                     .with_prompt_cache(PromptCache::new(session_id));
                 if api::is_claude_code_oauth_token() {
-                    inner = inner.with_beta("oauth-2025-04-20");
+                    // Replace the default betas with only the OAuth beta.
+                    // The default claude-code-20250219 beta routes to a
+                    // backend that rejects raw OAuth tokens.
+                    inner = inner.with_request_profile(
+                        AnthropicRequestProfile::default()
+                            .with_betas(vec!["oauth-2025-04-20".to_string()]),
+                    );
                 }
                 ApiProviderClient::Anthropic(inner)
             }
