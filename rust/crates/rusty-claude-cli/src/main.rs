@@ -10067,6 +10067,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_allowed_tools() {
+        let _guard = env_lock();
         let error = parse_args(&["--allowedTools".to_string(), "teleport".to_string()])
             .expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool in --allowedTools: teleport"));
@@ -10399,6 +10400,7 @@ mod tests {
 
     #[test]
     fn parses_acp_with_runtime_global_options() {
+        let _guard = env_lock();
         match parse_args(&[
             "--model".to_string(),
             "sonnet".to_string(),
