@@ -131,17 +131,6 @@ impl SessionStore {
                 return Ok(path);
             }
         }
-        for legacy_root in self.legacy_sessions_roots() {
-            for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
-                let path = legacy_root.join(format!("{session_id}.{extension}"));
-                if !path.exists() {
-                    continue;
-                }
-                let session = Session::load_from_path(&path)?;
-                self.validate_loaded_session(&path, &session)?;
-                return Ok(path);
-            }
-        }
         Err(SessionControlError::Format(
             format_missing_session_reference(session_id, &self.sessions_root),
         ))
@@ -150,12 +139,6 @@ impl SessionStore {
     pub fn list_sessions(&self) -> Result<Vec<ManagedSessionSummary>, SessionControlError> {
         let mut sessions = Vec::new();
         self.collect_sessions_from_dir(&self.sessions_root, &mut sessions)?;
-        for legacy_root in self.legacy_sessions_roots() {
-            self.collect_sessions_from_dir(&legacy_root, &mut sessions)?;
-        }
-        // Deduplicate by session ID: primary (first added) wins.
-        let mut seen = std::collections::HashSet::new();
-        sessions.retain(|s| seen.insert(s.id.clone()));
         sort_managed_sessions(&mut sessions);
         Ok(sessions)
     }
@@ -206,55 +189,6 @@ impl SessionStore {
         })
     }
 
-    /// Returns legacy session roots to search for backward compatibility.
-    ///
-    /// Covers:
-    /// 1. Flat `.scode/sessions/` (parent of fingerprinted dir)
-    /// 2. Fingerprinted `.nexus/sudocode/sessions/<hash>/` (old project-local)
-    /// 3. Flat `.nexus/sudocode/sessions/` (old project-local)
-    /// 4. Global fingerprinted `~/.nexus/sudocode/sessions/<hash>/`
-    /// 5. Global flat `~/.nexus/sudocode/sessions/`
-    fn legacy_sessions_roots(&self) -> Vec<PathBuf> {
-        let mut roots = Vec::new();
-        // 1. Flat .scode/sessions/ (parent of the fingerprinted primary dir)
-        if let Some(parent) = self.sessions_root.parent() {
-            if parent.file_name().is_some_and(|name| name == "sessions") {
-                roots.push(parent.to_path_buf());
-            }
-        }
-        // 2. Fingerprinted .nexus/sudocode/sessions/<hash>/ (old project-local)
-        let old_fingerprinted = self
-            .workspace_root
-            .join(".nexus")
-            .join("sudocode")
-            .join("sessions")
-            .join(workspace_fingerprint(&self.workspace_root));
-        if old_fingerprinted != self.sessions_root {
-            roots.push(old_fingerprinted);
-        }
-        // 3. Flat .nexus/sudocode/sessions/ (old project-local)
-        let old_flat = self
-            .workspace_root
-            .join(".nexus")
-            .join("sudocode")
-            .join("sessions");
-        roots.push(old_flat);
-        // 4 & 5. Global paths via default_config_home()
-        let global_home = crate::config::default_config_home();
-        let global_fingerprinted = global_home
-            .join("sessions")
-            .join(workspace_fingerprint(&self.workspace_root));
-        if global_fingerprinted != self.sessions_root {
-            roots.push(global_fingerprinted);
-        }
-        let global_flat = global_home.join("sessions");
-        // Avoid duplicates with old_flat (which may equal global_flat when cwd == $HOME)
-        if !roots.contains(&global_flat) {
-            roots.push(global_flat);
-        }
-        roots
-    }
-
     fn validate_loaded_session(
         &self,
         session_path: &Path,
@@ -264,11 +198,8 @@ impl SessionStore {
             if path_is_within_workspace(session_path, &self.workspace_root) {
                 return Ok(());
             }
-            if path_is_within_global_sessions(session_path) {
-                return Ok(());
-            }
             return Err(SessionControlError::Format(
-                format_legacy_session_missing_workspace_root(session_path, &self.workspace_root),
+                format_session_missing_workspace_root(session_path, &self.workspace_root),
             ));
         };
         if workspace_roots_match(actual, &self.workspace_root) {
@@ -591,12 +522,9 @@ fn format_no_managed_sessions(sessions_root: &Path) -> String {
     )
 }
 
-fn format_legacy_session_missing_workspace_root(
-    session_path: &Path,
-    workspace_root: &Path,
-) -> String {
+fn format_session_missing_workspace_root(session_path: &Path, workspace_root: &Path) -> String {
     format!(
-        "legacy session is missing workspace binding: {}\nOpen it from its original workspace or re-save it from {}.",
+        "session is missing workspace binding: {}\nOpen it from its original workspace or re-save it from {}.",
         session_path.display(),
         workspace_root.display()
     )
@@ -614,18 +542,12 @@ fn path_is_within_workspace(path: &Path, workspace_root: &Path) -> bool {
     canonicalize_for_compare(path).starts_with(canonicalize_for_compare(workspace_root))
 }
 
-fn path_is_within_global_sessions(path: &Path) -> bool {
-    let global_sessions = crate::config::default_config_home().join("sessions");
-    canonicalize_for_compare(path).starts_with(canonicalize_for_compare(&global_sessions))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         create_managed_session_handle_for, fork_managed_session_for, is_session_reference_alias,
         list_managed_sessions_for, load_managed_session_for, resolve_session_reference_for,
-        workspace_fingerprint, ManagedSessionSummary, SessionControlError, SessionStore,
-        LATEST_SESSION_REFERENCE,
+        workspace_fingerprint, ManagedSessionSummary, SessionStore, LATEST_SESSION_REFERENCE,
     };
     use crate::session::Session;
     use std::fs;
@@ -930,104 +852,6 @@ mod tests {
     }
 
     #[test]
-    fn session_store_rejects_legacy_session_from_other_workspace() {
-        // given
-        let base = temp_dir();
-        let workspace_a = base.join("repo-alpha");
-        let workspace_b = base.join("repo-beta");
-        fs::create_dir_all(&workspace_a).expect("workspace a should exist");
-        fs::create_dir_all(&workspace_b).expect("workspace b should exist");
-        // #151: canonicalize so test expectations match the store's canonical
-        // workspace_root. Without this, the test builds sessions with a raw
-        // path but the store resolves to the canonical form.
-        let workspace_a = fs::canonicalize(&workspace_a).unwrap_or(workspace_a);
-        let workspace_b = fs::canonicalize(&workspace_b).unwrap_or(workspace_b);
-
-        let store_b = SessionStore::from_cwd(&workspace_b).expect("store b should build");
-        let legacy_root = workspace_b.join(".nexus").join("sudocode").join("sessions");
-        fs::create_dir_all(&legacy_root).expect("legacy root should exist");
-        let legacy_path = legacy_root.join("legacy-cross.jsonl");
-        let session = Session::new()
-            .with_workspace_root(workspace_a.clone())
-            .with_persistence_path(legacy_path.clone());
-        session
-            .save_to_path(&legacy_path)
-            .expect("legacy session should persist");
-
-        // when
-        let err = store_b
-            .load_session("legacy-cross")
-            .expect_err("workspace mismatch should be rejected");
-
-        // then
-        match err {
-            SessionControlError::WorkspaceMismatch { expected, actual } => {
-                assert_eq!(expected, workspace_b);
-                assert_eq!(actual, workspace_a);
-            }
-            other => panic!("expected workspace mismatch, got {other:?}"),
-        }
-        fs::remove_dir_all(base).expect("temp dir should clean up");
-    }
-
-    #[test]
-    fn session_store_loads_safe_legacy_session_from_same_workspace() {
-        // given
-        let base = temp_dir();
-        fs::create_dir_all(&base).expect("base dir should exist");
-        // #151: canonicalize for path-representation consistency with store.
-        let base = fs::canonicalize(&base).unwrap_or(base);
-        let store = SessionStore::from_cwd(&base).expect("store should build");
-        let legacy_root = base.join(".nexus").join("sudocode").join("sessions");
-        let legacy_path = legacy_root.join("legacy-safe.jsonl");
-        fs::create_dir_all(&legacy_root).expect("legacy root should exist");
-        let session = Session::new()
-            .with_workspace_root(base.clone())
-            .with_persistence_path(legacy_path.clone());
-        session
-            .save_to_path(&legacy_path)
-            .expect("legacy session should persist");
-
-        // when
-        let loaded = store
-            .load_session("legacy-safe")
-            .expect("same-workspace legacy session should load");
-
-        // then
-        assert_eq!(loaded.handle.id, session.session_id);
-        assert_eq!(loaded.handle.path, legacy_path);
-        assert_eq!(loaded.session.workspace_root(), Some(base.as_path()));
-        fs::remove_dir_all(base).expect("temp dir should clean up");
-    }
-
-    #[test]
-    fn session_store_loads_unbound_legacy_session_from_same_workspace() {
-        // given
-        let base = temp_dir();
-        fs::create_dir_all(&base).expect("base dir should exist");
-        // #151: canonicalize for path-representation consistency with store.
-        let base = fs::canonicalize(&base).unwrap_or(base);
-        let store = SessionStore::from_cwd(&base).expect("store should build");
-        let legacy_root = base.join(".nexus").join("sudocode").join("sessions");
-        let legacy_path = legacy_root.join("legacy-unbound.json");
-        fs::create_dir_all(&legacy_root).expect("legacy root should exist");
-        let session = Session::new().with_persistence_path(legacy_path.clone());
-        session
-            .save_to_path(&legacy_path)
-            .expect("legacy session should persist");
-
-        // when
-        let loaded = store
-            .load_session("legacy-unbound")
-            .expect("same-workspace legacy session without workspace binding should load");
-
-        // then
-        assert_eq!(loaded.handle.path, legacy_path);
-        assert_eq!(loaded.session.workspace_root(), None);
-        fs::remove_dir_all(base).expect("temp dir should clean up");
-    }
-
-    #[test]
     fn session_store_latest_and_resolve_reference() {
         // given
         let base = temp_dir();
@@ -1075,43 +899,6 @@ mod tests {
             forked.handle.path.starts_with(store.sessions_dir()),
             "forked session path must be inside the store namespace"
         );
-        fs::remove_dir_all(base).expect("temp dir should clean up");
-    }
-
-    #[test]
-    fn session_store_discovers_sessions_in_old_nexus_path() {
-        // given — a session stored at the old .nexus/sudocode/sessions/ location
-        let base = temp_dir();
-        fs::create_dir_all(&base).expect("base dir should exist");
-        let base = fs::canonicalize(&base).unwrap_or(base);
-        let store = SessionStore::from_cwd(&base).expect("store should build");
-
-        // Place a session in the old .nexus/sudocode/sessions/ path (flat, no fingerprint)
-        let old_sessions = base.join(".nexus").join("sudocode").join("sessions");
-        fs::create_dir_all(&old_sessions).expect("old sessions dir should exist");
-        let session = Session::new().with_workspace_root(base.clone());
-        let session_id = session.session_id.clone();
-        let file_path = old_sessions.join(format!("{session_id}.jsonl"));
-        let session = session.with_persistence_path(file_path.clone());
-        session
-            .save_to_path(&file_path)
-            .expect("old session should persist");
-
-        // when — the store lists sessions
-        let sessions = store.list_sessions().expect("list sessions");
-
-        // then — the old nexus session should be discovered
-        assert!(
-            sessions.iter().any(|s| s.id == session_id),
-            "session from .nexus/sudocode/sessions/ should be discovered"
-        );
-
-        // also test resolve_managed_path finds it
-        let path = store
-            .resolve_managed_path(&session_id)
-            .expect("old nexus session should resolve");
-        assert_eq!(path, file_path);
-
         fs::remove_dir_all(base).expect("temp dir should clean up");
     }
 }
