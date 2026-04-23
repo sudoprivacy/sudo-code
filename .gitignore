@@ -10,3 +10,9 @@ archive/
 .nexus/sudocode/sessions/
 .sudocodehip/
 status-help.txt
+# Legacy tool artifacts
+.claw.json
+.claw/
+.clawd-todos.json
+.omc/
+.sandbox-home/
