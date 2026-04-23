@@ -16,9 +16,7 @@
 use std::io;
 
 use serde_json::{json, Value as JsonValue};
-use tokio::io::{
-    stdin, stdout, BufReader, Stdin, Stdout,
-};
+use tokio::io::{stdin, stdout, BufReader, Stdin, Stdout};
 
 use crate::mcp_stdio::{
     JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpInitializeResult,
@@ -140,10 +138,7 @@ impl McpServer {
         }
     }
 
-    async fn write_response(
-        &mut self,
-        response: &JsonRpcResponse<JsonValue>,
-    ) -> io::Result<()> {
+    async fn write_response(&mut self, response: &JsonRpcResponse<JsonValue>) -> io::Result<()> {
         let body = serde_json::to_vec(response)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         crate::jsonrpc_transport::write_msg(&mut self.stdout, &body).await
