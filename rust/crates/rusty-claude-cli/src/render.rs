@@ -267,7 +267,7 @@ impl TerminalRenderer {
             );
         }
 
-        output.trim_end().to_string()
+        output
     }
 
     #[must_use]
