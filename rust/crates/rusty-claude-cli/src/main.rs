@@ -3045,7 +3045,7 @@ fn render_resume_usage() -> String {
     format!(
         "Resume
   Usage            /resume <session-path|session-id|{LATEST_SESSION_REFERENCE}>
-  Auto-save        .nexus/sudocode/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}
+  Auto-save        .scode/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}
   Tip              use /session list to inspect saved sessions"
     )
 }
@@ -5651,7 +5651,7 @@ fn render_repl_help() -> String {
         "  Tab                  Complete commands, modes, and recent sessions".to_string(),
         "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
-        "  Auto-save            .nexus/sudocode/sessions/<session-id>.jsonl".to_string(),
+        "  Auto-save            .scode/sessions/<session-id>.jsonl".to_string(),
         "  Resume latest        /resume latest".to_string(),
         "  Browse sessions      /session list".to_string(),
         "  Show prompt history  /history [count]".to_string(),
@@ -5763,7 +5763,7 @@ fn status_json_value(
             "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
             "session_id": context.session_path.as_ref().and_then(|path| {
                 // Session files are named <session-id>.jsonl directly under
-                // .nexus/sudocode/sessions/. Extract the stem (drop the .jsonl extension).
+                // .scode/sessions/. Extract the stem (drop the .jsonl extension).
                 path.file_stem().map(|n| n.to_string_lossy().into_owned())
             }),
             "loaded_config_files": context.loaded_config_files,
@@ -6061,7 +6061,7 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Aliases          scode --acp · scode -acp
   Purpose          run the ACP JSON-RPC agent server over stdio for editor integrations
   Transport        LSP-style Content-Length framed JSON-RPC on stdin/stdout
-  Sessions         session/new creates managed .nexus/sudocode sessions for the requested cwd
+  Sessions         session/new creates managed .scode sessions for the requested cwd
   Related          scode --help"
             .to_string(),
         LocalHelpTopic::Init => "Init
@@ -6084,7 +6084,7 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
         LocalHelpTopic::Export => "Export
   Usage            scode export [--session <id|latest>] [--output <path>] [--output-format <format>]
   Purpose          serialize a managed session to JSON for review, transfer, or archival
-  Defaults         --session latest (most recent managed session in .nexus/sudocode/sessions/)
+  Defaults         --session latest (most recent managed session in .scode/sessions/)
   Formats          text (default), json
   Related          /session list · scode --resume latest"
             .to_string(),
@@ -9208,7 +9208,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Session shortcuts:")?;
     writeln!(
         out,
-        "  REPL turns auto-save to .nexus/sudocode/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}"
+        "  REPL turns auto-save to .scode/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}"
     )?;
     writeln!(
         out,
@@ -11599,7 +11599,7 @@ mod tests {
         assert!(help.contains("/agents"));
         assert!(help.contains("/skills"));
         assert!(help.contains("/exit"));
-        assert!(help.contains("Auto-save            .nexus/sudocode/sessions/<session-id>.jsonl"));
+        assert!(help.contains("Auto-save            .scode/sessions/<session-id>.jsonl"));
         assert!(help.contains("Resume latest        /resume latest"));
     }
 
@@ -12344,7 +12344,7 @@ UU conflicted.rs",
     fn resume_usage_mentions_latest_shortcut() {
         let usage = render_resume_usage();
         assert!(usage.contains("/resume <session-path|session-id|latest>"));
-        assert!(usage.contains(".nexus/sudocode/sessions/<session-id>.jsonl"));
+        assert!(usage.contains(".scode/sessions/<session-id>.jsonl"));
         assert!(usage.contains("/session list"));
     }
 

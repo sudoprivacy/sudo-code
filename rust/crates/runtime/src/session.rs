@@ -81,8 +81,8 @@ struct SessionPersistence {
 /// Persisted conversational state for the runtime and CLI session manager.
 ///
 /// `workspace_root` binds the session to the worktree it was created in. The
-/// global session store under `~/.local/share/opencode` is shared across every
-/// `opencode serve` instance, so without an explicit workspace root parallel
+/// global session store under `~/.nexus/sudocode` is shared across every
+/// `scode serve` instance, so without an explicit workspace root parallel
 /// lanes can race and report success while writes land in the wrong CWD. See
 /// ROADMAP.md item 41 (Phantom completions root cause) for the full
 /// background.
@@ -1491,7 +1491,7 @@ mod tests {
 
 /// Per-worktree session isolation: returns a session directory namespaced
 /// by the workspace fingerprint of the given working directory.
-/// This prevents parallel `opencode serve` instances from colliding.
+/// This prevents parallel `scode serve` instances from colliding.
 /// Called by external consumers (e.g. sudocodehip) to enumerate sessions for a CWD.
 #[allow(dead_code)]
 pub fn workspace_sessions_dir(cwd: &std::path::Path) -> Result<std::path::PathBuf, SessionError> {
