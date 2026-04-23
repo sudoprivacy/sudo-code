@@ -258,6 +258,20 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "login",
+        aliases: &[],
+        summary: "Log in with OAuth (browser-based)",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "logout",
+        aliases: &[],
+        summary: "Clear saved OAuth credentials",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "plan",
         aliases: &[],
         summary: "Toggle or inspect planning mode",
@@ -1387,12 +1401,13 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Doctor
         }
-        "login" | "logout" => {
-            return Err(command_error(
-                "This auth flow was removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead.",
-                command,
-                "",
-            ));
+        "login" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Login
+        }
+        "logout" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Logout
         }
         "vim" => {
             validate_no_args(command, &args)?;
@@ -4660,11 +4675,15 @@ mod tests {
     }
 
     #[test]
-    fn removed_login_and_logout_commands_report_env_auth_guidance() {
-        let login_error = parse_error_message("/login");
-        assert!(login_error.contains("ANTHROPIC_API_KEY"));
-        let logout_error = parse_error_message("/logout");
-        assert!(logout_error.contains("ANTHROPIC_AUTH_TOKEN"));
+    fn login_and_logout_commands_parse_successfully() {
+        let login = SlashCommand::parse("/login")
+            .expect("login should parse")
+            .expect("login should be Some");
+        assert_eq!(login.slash_name(), "/login");
+        let logout = SlashCommand::parse("/logout")
+            .expect("logout should parse")
+            .expect("logout should be Some");
+        assert_eq!(logout.slash_name(), "/logout");
     }
 
     #[test]
@@ -4708,9 +4727,9 @@ mod tests {
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
         assert!(help.contains("aliases: /skill"));
-        assert!(!help.contains("/login"));
-        assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 139);
+        assert!(help.contains("/login"));
+        assert!(help.contains("/logout"));
+        assert_eq!(slash_command_specs().len(), 141);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

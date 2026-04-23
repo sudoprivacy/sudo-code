@@ -630,6 +630,14 @@ impl AuthSource {
         if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
             return Ok(Self::BearerToken(bearer_token));
         }
+        if let Some(bearer_token) = read_env_non_empty("SCODE_TOKEN")? {
+            return Ok(Self::BearerToken(bearer_token));
+        }
+        if let Some(token_set) = load_saved_oauth_token()? {
+            if !oauth_token_is_expired(&token_set) {
+                return Ok(Self::BearerToken(token_set.access_token));
+            }
+        }
         Err(anthropic_missing_credentials())
     }
 }
@@ -650,14 +658,15 @@ pub fn resolve_saved_oauth_token(config: &OAuthConfig) -> Result<Option<OAuthTok
 
 pub fn has_auth_from_env_or_saved() -> Result<bool, ApiError> {
     Ok(read_env_non_empty("ANTHROPIC_API_KEY")?.is_some()
-        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some())
+        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some()
+        || read_env_non_empty("SCODE_TOKEN")?.is_some()
+        || load_saved_oauth_token()?.is_some())
 }
 
 pub fn resolve_startup_auth_source<F>(load_oauth_config: F) -> Result<AuthSource, ApiError>
 where
     F: FnOnce() -> Result<Option<OAuthConfig>, ApiError>,
 {
-    let _ = load_oauth_config;
     if let Some(api_key) = read_env_non_empty("ANTHROPIC_API_KEY")? {
         return match read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
             Some(bearer_token) => Ok(AuthSource::ApiKeyAndBearer {
@@ -669,6 +678,18 @@ where
     }
     if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
         return Ok(AuthSource::BearerToken(bearer_token));
+    }
+    if let Some(bearer_token) = read_env_non_empty("SCODE_TOKEN")? {
+        return Ok(AuthSource::BearerToken(bearer_token));
+    }
+    if let Some(token_set) = load_saved_oauth_token()? {
+        if let Some(config) = load_oauth_config()? {
+            let resolved = resolve_saved_oauth_token_set(&config, token_set)?;
+            return Ok(AuthSource::BearerToken(resolved.access_token));
+        }
+        if !oauth_token_is_expired(&token_set) {
+            return Ok(AuthSource::BearerToken(token_set.access_token));
+        }
     }
     Err(anthropic_missing_credentials())
 }
@@ -1154,12 +1175,13 @@ mod tests {
     }
 
     #[test]
-    fn auth_source_from_env_or_saved_ignores_saved_oauth_when_env_absent() {
+    fn auth_source_from_env_or_saved_uses_saved_oauth_when_env_absent() {
         let _guard = env_lock();
         let config_home = temp_config_home();
         std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("SCODE_TOKEN");
         save_oauth_credentials(&runtime::OAuthTokenSet {
             access_token: "saved-access-token".to_string(),
             refresh_token: Some("refresh".to_string()),
@@ -1168,8 +1190,8 @@ mod tests {
         })
         .expect("save oauth credentials");
 
-        let error = AuthSource::from_env_or_saved().expect_err("saved oauth should be ignored");
-        assert!(error.to_string().contains("ANTHROPIC_API_KEY"));
+        let auth = AuthSource::from_env_or_saved().expect("saved oauth should be used");
+        assert_eq!(auth.bearer_token(), Some("saved-access-token"));
 
         clear_oauth_credentials().expect("clear credentials");
         std::env::remove_var("SUDO_CODE_CONFIG_HOME");
@@ -1225,12 +1247,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_startup_auth_source_ignores_saved_oauth_without_loading_config() {
+    fn resolve_startup_auth_source_uses_saved_oauth_when_no_env() {
         let _guard = env_lock();
         let config_home = temp_config_home();
         std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("SCODE_TOKEN");
         save_oauth_credentials(&runtime::OAuthTokenSet {
             access_token: "saved-access-token".to_string(),
             refresh_token: Some("refresh".to_string()),
@@ -1239,9 +1262,8 @@ mod tests {
         })
         .expect("save oauth credentials");
 
-        let error = resolve_startup_auth_source(|| panic!("config should not be loaded"))
-            .expect_err("saved oauth should be ignored");
-        assert!(error.to_string().contains("ANTHROPIC_API_KEY"));
+        let auth = resolve_startup_auth_source(|| Ok(None)).expect("saved oauth should be used");
+        assert_eq!(auth.bearer_token(), Some("saved-access-token"));
 
         clear_oauth_credentials().expect("clear credentials");
         std::env::remove_var("SUDO_CODE_CONFIG_HOME");
