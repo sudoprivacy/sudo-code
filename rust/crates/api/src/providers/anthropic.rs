@@ -633,6 +633,9 @@ impl AuthSource {
         if let Some(bearer_token) = read_env_non_empty("SCODE_TOKEN")? {
             return Ok(Self::BearerToken(bearer_token));
         }
+        if let Some(bearer_token) = read_env_non_empty("CLAUDE_CODE_OAUTH_TOKEN")? {
+            return Ok(Self::BearerToken(bearer_token));
+        }
         if let Some(token_set) = load_saved_oauth_token()? {
             if !oauth_token_is_expired(&token_set) {
                 return Ok(Self::BearerToken(token_set.access_token));
@@ -640,6 +643,14 @@ impl AuthSource {
         }
         Err(anthropic_missing_credentials())
     }
+}
+
+/// Returns `true` when the active auth source comes from `CLAUDE_CODE_OAUTH_TOKEN`.
+pub fn is_claude_code_oauth_token() -> bool {
+    read_env_non_empty("CLAUDE_CODE_OAUTH_TOKEN")
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 #[must_use]
@@ -660,6 +671,7 @@ pub fn has_auth_from_env_or_saved() -> Result<bool, ApiError> {
     Ok(read_env_non_empty("ANTHROPIC_API_KEY")?.is_some()
         || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some()
         || read_env_non_empty("SCODE_TOKEN")?.is_some()
+        || read_env_non_empty("CLAUDE_CODE_OAUTH_TOKEN")?.is_some()
         || load_saved_oauth_token()?.is_some())
 }
 
@@ -680,6 +692,9 @@ where
         return Ok(AuthSource::BearerToken(bearer_token));
     }
     if let Some(bearer_token) = read_env_non_empty("SCODE_TOKEN")? {
+        return Ok(AuthSource::BearerToken(bearer_token));
+    }
+    if let Some(bearer_token) = read_env_non_empty("CLAUDE_CODE_OAUTH_TOKEN")? {
         return Ok(AuthSource::BearerToken(bearer_token));
     }
     if let Some(token_set) = load_saved_oauth_token()? {

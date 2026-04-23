@@ -393,7 +393,12 @@ pub(crate) fn anthropic_missing_credentials_hint() -> Option<String> {
 /// signal instead of a generic "missing Anthropic credentials" wall.
 pub(crate) fn anthropic_missing_credentials() -> ApiError {
     const PROVIDER: &str = "Anthropic";
-    const ENV_VARS: &[&str] = &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "SCODE_TOKEN"];
+    const ENV_VARS: &[&str] = &[
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "SCODE_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ];
     match anthropic_missing_credentials_hint() {
         Some(hint) => ApiError::missing_credentials_with_hint(PROVIDER, ENV_VARS, hint),
         None => ApiError::missing_credentials(PROVIDER, ENV_VARS),
@@ -1043,7 +1048,12 @@ NO_EQUALS_LINE
                 assert_eq!(*provider, "Anthropic");
                 assert_eq!(
                     *env_vars,
-                    &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "SCODE_TOKEN"]
+                    &[
+                        "ANTHROPIC_AUTH_TOKEN",
+                        "ANTHROPIC_API_KEY",
+                        "SCODE_TOKEN",
+                        "CLAUDE_CODE_OAUTH_TOKEN"
+                    ]
                 );
                 assert!(
                     hint.is_none(),
@@ -1080,7 +1090,12 @@ NO_EQUALS_LINE
                 assert_eq!(*provider, "Anthropic");
                 assert_eq!(
                     *env_vars,
-                    &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "SCODE_TOKEN"]
+                    &[
+                        "ANTHROPIC_AUTH_TOKEN",
+                        "ANTHROPIC_API_KEY",
+                        "SCODE_TOKEN",
+                        "CLAUDE_CODE_OAUTH_TOKEN"
+                    ]
                 );
                 let hint_value = hint.as_deref().expect("hint should be populated");
                 assert!(

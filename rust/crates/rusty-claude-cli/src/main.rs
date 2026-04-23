@@ -7814,9 +7814,12 @@ impl AnthropicRuntimeClient {
         let client = match detect_provider_kind(&resolved_model) {
             ProviderKind::Anthropic => {
                 let auth = resolve_cli_auth_source()?;
-                let inner = AnthropicClient::from_auth(auth)
+                let mut inner = AnthropicClient::from_auth(auth)
                     .with_base_url(api::read_base_url())
                     .with_prompt_cache(PromptCache::new(session_id));
+                if api::is_claude_code_oauth_token() {
+                    inner = inner.with_beta("oauth-2025-04-20");
+                }
                 ApiProviderClient::Anthropic(inner)
             }
             ProviderKind::Xai | ProviderKind::OpenAi => {
@@ -7871,7 +7874,18 @@ impl ApiClient for AnthropicRuntimeClient {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
-            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
+            system: if api::is_claude_code_oauth_token() {
+                let joined = request.system_prompt.join("\n\n");
+                if joined.is_empty() {
+                    Some("You are Claude Code, Anthropic's official CLI for Claude.".to_string())
+                } else {
+                    Some(format!(
+                        "You are Claude Code, Anthropic's official CLI for Claude.\n\n{joined}"
+                    ))
+                }
+            } else {
+                (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"))
+            },
             tools: self
                 .enable_tools
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
