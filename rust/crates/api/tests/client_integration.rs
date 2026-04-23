@@ -892,6 +892,85 @@ fn http_response_with_headers(
     )
 }
 
+#[tokio::test]
+async fn send_message_dumps_request_body_when_env_is_set() {
+    let dump_dir = std::env::temp_dir().join(format!(
+        "scode-debug-integration-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let dump_path = dump_dir.join("api-dump.json");
+
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state,
+        vec![http_response(
+            "200 OK",
+            "application/json",
+            concat!(
+                "{",
+                "\"id\":\"msg_dump\",",
+                "\"type\":\"message\",",
+                "\"role\":\"assistant\",",
+                "\"content\":[{\"type\":\"text\",\"text\":\"Hi\"}],",
+                "\"model\":\"claude-3-7-sonnet-latest\",",
+                "\"stop_reason\":\"end_turn\",",
+                "\"stop_sequence\":null,",
+                "\"usage\":{\"input_tokens\":10,\"output_tokens\":2}",
+                "}"
+            ),
+        )],
+    )
+    .await;
+
+    // Set the debug dump env var for this test.
+    let key = api::DEBUG_API_REQUEST_ENV;
+    let previous = std::env::var_os(key);
+    std::env::set_var(key, dump_path.to_str().unwrap());
+
+    let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("request should succeed");
+
+    // Restore env state.
+    match previous {
+        Some(val) => std::env::set_var(key, val),
+        None => std::env::remove_var(key),
+    }
+
+    assert_eq!(response.id, "msg_dump");
+
+    // Verify the dump file was written and contains expected fields.
+    let contents =
+        std::fs::read_to_string(&dump_path).expect("debug dump file should exist after request");
+    assert!(
+        contents.contains("\"model\": \"claude-3-7-sonnet-latest\""),
+        "dump should contain the model field"
+    );
+    assert!(
+        contents.contains("\"system\": \"Use tools when needed\""),
+        "dump should contain the system prompt"
+    );
+    assert!(
+        contents.contains("\"name\": \"get_weather\""),
+        "dump should contain tool definitions"
+    );
+    assert!(
+        contents.contains("Say hello"),
+        "dump should contain the user message"
+    );
+    assert!(
+        contents.contains("--- request at"),
+        "dump should contain the timestamp header"
+    );
+
+    let _ = std::fs::remove_dir_all(dump_dir);
+}
+
 fn sample_request(stream: bool) -> MessageRequest {
     MessageRequest {
         model: "claude-3-7-sonnet-latest".to_string(),
