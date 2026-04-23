@@ -270,11 +270,13 @@ impl OpenAiCompatClient {
         check_request_body_size(request, self.config())?;
 
         let request_url = chat_completions_endpoint(&self.base_url);
+        let body = build_chat_completion_request(request, self.config());
+        crate::debug_dump::maybe_dump_request_body(&body);
         self.http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
+            .json(&body)
             .send()
             .await
             .map_err(ApiError::from)

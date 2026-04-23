@@ -1,4 +1,5 @@
 mod client;
+mod debug_dump;
 mod error;
 mod http_client;
 mod prompt_cache;
@@ -35,6 +36,7 @@ pub use types::{
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
+pub use debug_dump::DEBUG_API_REQUEST_ENV;
 pub use telemetry::{
     AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, JsonlTelemetrySink,
     MemoryTelemetrySink, SessionTraceRecord, SessionTracer, TelemetryEvent, TelemetrySink,
