@@ -9,9 +9,10 @@ const STARTER_CONFIG_JSON: &str = concat!(
     "}\n",
 );
 const GITIGNORE_COMMENT: &str = "# Sudo Code local artifacts";
-const GITIGNORE_ENTRIES: [&str; 3] = [
+const GITIGNORE_ENTRIES: [&str; 4] = [
     ".nexus/sudocode/settings.local.json",
     ".nexus/sudocode/sessions/",
+    ".scode/sessions/",
     ".sudocodehip/",
 ];
 
@@ -421,6 +422,7 @@ mod tests {
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
         assert!(gitignore.contains(".nexus/sudocode/settings.local.json"));
         assert!(gitignore.contains(".nexus/sudocode/sessions/"));
+        assert!(gitignore.contains(".scode/sessions/"));
         assert!(gitignore.contains(".sudocodehip/"));
         let claude_md = fs::read_to_string(root.join("CLAUDE.md")).expect("read claude md");
         assert!(claude_md.contains("Languages: Rust."));
@@ -463,6 +465,7 @@ mod tests {
             1
         );
         assert_eq!(gitignore.matches(".nexus/sudocode/sessions/").count(), 1);
+        assert_eq!(gitignore.matches(".scode/sessions/").count(), 1);
         assert_eq!(gitignore.matches(".sudocodehip/").count(), 1);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");

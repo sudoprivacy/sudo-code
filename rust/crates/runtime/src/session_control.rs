@@ -8,7 +8,7 @@ use std::time::UNIX_EPOCH;
 use crate::session::{Session, SessionError};
 
 /// Per-worktree session store that namespaces on-disk session files by
-/// workspace fingerprint so that parallel `opencode serve` instances never
+/// workspace fingerprint so that parallel `scode serve` instances never
 /// collide.
 ///
 /// Create via [`SessionStore::from_cwd`] (derives the store path from the
@@ -19,7 +19,7 @@ use crate::session::{Session, SessionError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStore {
     /// Resolved root of the session namespace, e.g.
-    /// `/home/user/project/.nexus/sudocode/sessions/a1b2c3d4e5f60718/`.
+    /// `/home/user/project/.scode/sessions/a1b2c3d4e5f60718/`.
     sessions_root: PathBuf,
     /// The canonical workspace path that was fingerprinted.
     workspace_root: PathBuf,
@@ -28,7 +28,7 @@ pub struct SessionStore {
 impl SessionStore {
     /// Build a store from the server's current working directory.
     ///
-    /// The on-disk layout becomes `<cwd>/.nexus/sudocode/sessions/<workspace_hash>/`.
+    /// The on-disk layout becomes `<cwd>/.scode/sessions/<workspace_hash>/`.
     pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
         let cwd = cwd.as_ref();
         // #151: canonicalize so equivalent paths (symlinks, relative vs
@@ -37,8 +37,7 @@ impl SessionStore {
         // fails (e.g. the directory doesn't exist yet).
         let canonical_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         let sessions_root = canonical_cwd
-            .join(".nexus")
-            .join("sudocode")
+            .join(".scode")
             .join("sessions")
             .join(workspace_fingerprint(&canonical_cwd));
         fs::create_dir_all(&sessions_root)?;
@@ -132,7 +131,7 @@ impl SessionStore {
                 return Ok(path);
             }
         }
-        if let Some(legacy_root) = self.legacy_sessions_root() {
+        for legacy_root in self.legacy_sessions_roots() {
             for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
                 let path = legacy_root.join(format!("{session_id}.{extension}"));
                 if !path.exists() {
@@ -151,9 +150,12 @@ impl SessionStore {
     pub fn list_sessions(&self) -> Result<Vec<ManagedSessionSummary>, SessionControlError> {
         let mut sessions = Vec::new();
         self.collect_sessions_from_dir(&self.sessions_root, &mut sessions)?;
-        if let Some(legacy_root) = self.legacy_sessions_root() {
+        for legacy_root in self.legacy_sessions_roots() {
             self.collect_sessions_from_dir(&legacy_root, &mut sessions)?;
         }
+        // Deduplicate by session ID: primary (first added) wins.
+        let mut seen = std::collections::HashSet::new();
+        sessions.retain(|s| seen.insert(s.id.clone()));
         sort_managed_sessions(&mut sessions);
         Ok(sessions)
     }
@@ -204,11 +206,53 @@ impl SessionStore {
         })
     }
 
-    fn legacy_sessions_root(&self) -> Option<PathBuf> {
-        self.sessions_root
-            .parent()
-            .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
-            .map(Path::to_path_buf)
+    /// Returns legacy session roots to search for backward compatibility.
+    ///
+    /// Covers:
+    /// 1. Flat `.scode/sessions/` (parent of fingerprinted dir)
+    /// 2. Fingerprinted `.nexus/sudocode/sessions/<hash>/` (old project-local)
+    /// 3. Flat `.nexus/sudocode/sessions/` (old project-local)
+    /// 4. Global fingerprinted `~/.nexus/sudocode/sessions/<hash>/`
+    /// 5. Global flat `~/.nexus/sudocode/sessions/`
+    fn legacy_sessions_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        // 1. Flat .scode/sessions/ (parent of the fingerprinted primary dir)
+        if let Some(parent) = self.sessions_root.parent() {
+            if parent.file_name().is_some_and(|name| name == "sessions") {
+                roots.push(parent.to_path_buf());
+            }
+        }
+        // 2. Fingerprinted .nexus/sudocode/sessions/<hash>/ (old project-local)
+        let old_fingerprinted = self
+            .workspace_root
+            .join(".nexus")
+            .join("sudocode")
+            .join("sessions")
+            .join(workspace_fingerprint(&self.workspace_root));
+        if old_fingerprinted != self.sessions_root {
+            roots.push(old_fingerprinted);
+        }
+        // 3. Flat .nexus/sudocode/sessions/ (old project-local)
+        let old_flat = self
+            .workspace_root
+            .join(".nexus")
+            .join("sudocode")
+            .join("sessions");
+        roots.push(old_flat);
+        // 4 & 5. Global paths via default_config_home()
+        let global_home = crate::config::default_config_home();
+        let global_fingerprinted = global_home
+            .join("sessions")
+            .join(workspace_fingerprint(&self.workspace_root));
+        if global_fingerprinted != self.sessions_root {
+            roots.push(global_fingerprinted);
+        }
+        let global_flat = global_home.join("sessions");
+        // Avoid duplicates with old_flat (which may equal global_flat when cwd == $HOME)
+        if !roots.contains(&global_flat) {
+            roots.push(global_flat);
+        }
+        roots
     }
 
     fn validate_loaded_session(
@@ -218,6 +262,9 @@ impl SessionStore {
     ) -> Result<(), SessionControlError> {
         let Some(actual) = session.workspace_root() else {
             if path_is_within_workspace(session_path, &self.workspace_root) {
+                return Ok(());
+            }
+            if path_is_within_global_sessions(session_path) {
                 return Ok(());
             }
             return Err(SessionControlError::Format(
@@ -523,24 +570,24 @@ fn session_id_from_path(path: &Path) -> Option<String> {
 }
 
 fn format_missing_session_reference(reference: &str, sessions_root: &Path) -> String {
-    // #80: show the actual workspace-fingerprint directory instead of lying about .nexus/sudocode/sessions/
+    // #80: show the actual workspace-fingerprint directory instead of a generic path
     let fingerprint_dir = sessions_root
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or("<unknown>");
     format!(
-        "session not found: {reference}\nHint: managed sessions live in .nexus/sudocode/sessions/{fingerprint_dir}/ (workspace-specific partition).\nTry `{LATEST_SESSION_REFERENCE}` for the most recent session or `/session list` in the REPL."
+        "session not found: {reference}\nHint: managed sessions live in .scode/sessions/{fingerprint_dir}/ (workspace-specific partition).\nTry `{LATEST_SESSION_REFERENCE}` for the most recent session or `/session list` in the REPL."
     )
 }
 
 fn format_no_managed_sessions(sessions_root: &Path) -> String {
-    // #80: show the actual workspace-fingerprint directory instead of lying about .nexus/sudocode/sessions/
+    // #80: show the actual workspace-fingerprint directory instead of a generic path
     let fingerprint_dir = sessions_root
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or("<unknown>");
     format!(
-        "no managed sessions found in .nexus/sudocode/sessions/{fingerprint_dir}/\nStart `scode` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`.\nNote: scode partitions sessions per workspace fingerprint; sessions from other CWDs are invisible."
+        "no managed sessions found in .scode/sessions/{fingerprint_dir}/\nStart `scode` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`.\nNote: scode partitions sessions per workspace fingerprint; sessions from other CWDs are invisible."
     )
 }
 
@@ -565,6 +612,11 @@ fn canonicalize_for_compare(path: &Path) -> PathBuf {
 
 fn path_is_within_workspace(path: &Path, workspace_root: &Path) -> bool {
     canonicalize_for_compare(path).starts_with(canonicalize_for_compare(workspace_root))
+}
+
+fn path_is_within_global_sessions(path: &Path) -> bool {
+    let global_sessions = crate::config::default_config_home().join("sessions");
+    canonicalize_for_compare(path).starts_with(canonicalize_for_compare(&global_sessions))
 }
 
 #[cfg(test)]
@@ -1023,6 +1075,43 @@ mod tests {
             forked.handle.path.starts_with(store.sessions_dir()),
             "forked session path must be inside the store namespace"
         );
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn session_store_discovers_sessions_in_old_nexus_path() {
+        // given — a session stored at the old .nexus/sudocode/sessions/ location
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let base = fs::canonicalize(&base).unwrap_or(base);
+        let store = SessionStore::from_cwd(&base).expect("store should build");
+
+        // Place a session in the old .nexus/sudocode/sessions/ path (flat, no fingerprint)
+        let old_sessions = base.join(".nexus").join("sudocode").join("sessions");
+        fs::create_dir_all(&old_sessions).expect("old sessions dir should exist");
+        let session = Session::new().with_workspace_root(base.clone());
+        let session_id = session.session_id.clone();
+        let file_path = old_sessions.join(format!("{session_id}.jsonl"));
+        let session = session.with_persistence_path(file_path.clone());
+        session
+            .save_to_path(&file_path)
+            .expect("old session should persist");
+
+        // when — the store lists sessions
+        let sessions = store.list_sessions().expect("list sessions");
+
+        // then — the old nexus session should be discovered
+        assert!(
+            sessions.iter().any(|s| s.id == session_id),
+            "session from .nexus/sudocode/sessions/ should be discovered"
+        );
+
+        // also test resolve_managed_path finds it
+        let path = store
+            .resolve_managed_path(&session_id)
+            .expect("old nexus session should resolve");
+        assert_eq!(path, file_path);
+
         fs::remove_dir_all(base).expect("temp dir should clean up");
     }
 }
