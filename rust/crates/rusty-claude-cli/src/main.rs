@@ -3706,7 +3706,10 @@ fn run_repl(
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
-    println!("{}", format_connected_line_with_mode(&cli.model, auth_mode));
+    println!(
+        "{}",
+        format_connected_line_with_mode(&cli.config.model, auth_mode)
+    );
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
@@ -3776,14 +3779,10 @@ struct ManagedSessionSummary {
 }
 
 struct LiveCli {
-    model: String,
-    allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    system_prompt: Vec<String>,
+    config: RuntimeConfig,
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
-    auth_mode: Option<AuthMode>,
 }
 
 #[derive(Debug, Clone)]
@@ -3797,6 +3796,21 @@ struct RuntimePluginState {
     tool_registry: GlobalToolRegistry,
     plugin_registry: PluginRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+}
+
+/// Groups the non-session parameters threaded through the `build_runtime*`
+/// call chain so that adding a new knob only touches one struct instead of
+/// 3-4 function signatures and 10+ call sites.
+#[derive(Clone)]
+struct RuntimeConfig {
+    model: String,
+    system_prompt: Vec<String>,
+    enable_tools: bool,
+    emit_output: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    progress_reporter: Option<InternalPromptProgressReporter>,
+    auth_mode: Option<AuthMode>,
 }
 
 struct RuntimeMcpState {
@@ -3937,14 +3951,16 @@ impl AcpCliAgent {
             &cwd,
             session_state.with_persistence_path(handle.path.clone()),
             &handle.id,
-            model,
-            system_prompt,
-            true,
-            false,
-            self.allowed_tools.clone(),
-            permission_mode,
-            None,
-            self.auth_mode,
+            RuntimeConfig {
+                model,
+                system_prompt,
+                enable_tools: true,
+                emit_output: false,
+                allowed_tools: self.allowed_tools.clone(),
+                permission_mode,
+                progress_reporter: None,
+                auth_mode: self.auth_mode,
+            },
         )
         .map_err(|error| AcpError::internal(format!("failed to build runtime: {error}")))?;
         if let Some(runtime) = runtime.runtime.as_mut() {
@@ -4457,27 +4473,26 @@ impl LiveCli {
         let system_prompt = build_system_prompt()?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
+        let config = RuntimeConfig {
+            model,
+            system_prompt,
+            enable_tools,
+            emit_output: true,
+            allowed_tools,
+            permission_mode,
+            progress_reporter: None,
+            auth_mode,
+        };
         let runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
             &session.id,
-            model.clone(),
-            system_prompt.clone(),
-            enable_tools,
-            true,
-            allowed_tools.clone(),
-            permission_mode,
-            None,
-            auth_mode,
+            config.clone(),
         )?;
         let cli = Self {
-            model,
-            allowed_tools,
-            permission_mode,
-            system_prompt,
+            config,
             runtime,
             session,
             prompt_history: Vec::new(),
-            auth_mode,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4523,8 +4538,8 @@ impl LiveCli {
   \x1b[2mSession\x1b[0m          {}\n\
   \x1b[2mAuto-save\x1b[0m        {}\n\n\
   Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
-            self.model,
-            self.permission_mode.as_str(),
+            self.config.model,
+            self.config.permission_mode.as_str(),
             git_branch,
             workspace,
             cwd,
@@ -4535,7 +4550,7 @@ impl LiveCli {
 
     fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         Ok(slash_command_completion_candidates_with_sessions(
-            &self.model,
+            &self.config.model,
             Some(&self.session.id),
             list_managed_sessions()?
                 .into_iter()
@@ -4552,14 +4567,10 @@ impl LiveCli {
         let runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            emit_output,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            self.auth_mode,
+            RuntimeConfig {
+                emit_output,
+                ..self.config.clone()
+            },
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
@@ -4582,7 +4593,7 @@ impl LiveCli {
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
         hook_abort_monitor.stop();
         match result {
@@ -4631,7 +4642,7 @@ impl LiveCli {
 
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
         hook_abort_monitor.stop();
         let summary = result?;
@@ -4644,7 +4655,7 @@ impl LiveCli {
 
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
         hook_abort_monitor.stop();
         let summary = result?;
@@ -4655,7 +4666,7 @@ impl LiveCli {
             json!({
                 "message": final_assistant_text(&summary),
                 "compact": true,
-                "model": self.model,
+                "model": self.config.model,
                 "usage": {
                     "input_tokens": summary.usage.input_tokens,
                     "output_tokens": summary.usage.output_tokens,
@@ -4669,7 +4680,7 @@ impl LiveCli {
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
         hook_abort_monitor.stop();
         let summary = result?;
@@ -4679,7 +4690,7 @@ impl LiveCli {
             "{}",
             json!({
                 "message": final_assistant_text(&summary),
-                "model": self.model,
+                "model": self.config.model,
                 "iterations": summary.iterations,
                 "auto_compaction": summary.auto_compaction.map(|event| json!({
                     "removed_messages": event.removed_message_count,
@@ -4696,7 +4707,7 @@ impl LiveCli {
                 },
                 "estimated_cost": format_usd(
                     summary.usage.estimate_cost_usd_with_pricing(
-                        pricing_for_model(&self.model)
+                        pricing_for_model(&self.config.model)
                             .unwrap_or_else(runtime::ModelPricing::default_sonnet_tier)
                     ).total_cost_usd()
                 )
@@ -4889,7 +4900,7 @@ impl LiveCli {
         println!(
             "{}",
             format_status_report(
-                &self.model,
+                &self.config.model,
                 StatusUsage {
                     message_count: self.runtime.session().messages.len(),
                     turns: self.runtime.usage().turns(),
@@ -4897,7 +4908,7 @@ impl LiveCli {
                     cumulative,
                     estimated_tokens: self.runtime.estimated_tokens(),
                 },
-                self.permission_mode.as_str(),
+                self.config.permission_mode.as_str(),
                 &status_context(Some(&self.session.path)).expect("status context should load"),
                 None, // #148: REPL /status doesn't carry flag provenance
             )
@@ -4971,7 +4982,7 @@ impl LiveCli {
             println!(
                 "{}",
                 format_model_report(
-                    &self.model,
+                    &self.config.model,
                     self.runtime.session().messages.len(),
                     self.runtime.usage().turns(),
                 )
@@ -4981,11 +4992,11 @@ impl LiveCli {
 
         let model = resolve_model_alias_with_config(&model);
 
-        if model == self.model {
+        if model == self.config.model {
             println!(
                 "{}",
                 format_model_report(
-                    &self.model,
+                    &self.config.model,
                     self.runtime.session().messages.len(),
                     self.runtime.usage().turns(),
                 )
@@ -4993,23 +5004,19 @@ impl LiveCli {
             return Ok(false);
         }
 
-        let previous = self.model.clone();
+        let previous = self.config.model.clone();
         let session = self.runtime.session().clone();
         let message_count = session.messages.len();
         let runtime = build_runtime(
             session,
             &self.session.id,
-            model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            self.auth_mode,
+            RuntimeConfig {
+                model: model.clone(),
+                ..self.config.clone()
+            },
         )?;
         self.replace_runtime(runtime)?;
-        self.model.clone_from(&model);
+        self.config.model.clone_from(&model);
         println!(
             "{}",
             format_model_switch_report(&previous, &model, message_count)
@@ -5024,7 +5031,7 @@ impl LiveCli {
         let Some(mode) = mode else {
             println!(
                 "{}",
-                format_permissions_report(self.permission_mode.as_str())
+                format_permissions_report(self.config.permission_mode.as_str())
             );
             return Ok(false);
         };
@@ -5035,26 +5042,15 @@ impl LiveCli {
             )
         })?;
 
-        if normalized == self.permission_mode.as_str() {
+        if normalized == self.config.permission_mode.as_str() {
             println!("{}", format_permissions_report(normalized));
             return Ok(false);
         }
 
-        let previous = self.permission_mode.as_str().to_string();
+        let previous = self.config.permission_mode.as_str().to_string();
         let session = self.runtime.session().clone();
-        self.permission_mode = permission_mode_from_label(normalized);
-        let runtime = build_runtime(
-            session,
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            self.auth_mode,
-        )?;
+        self.config.permission_mode = permission_mode_from_label(normalized);
+        let runtime = build_runtime(session, &self.session.id, self.config.clone())?;
         self.replace_runtime(runtime)?;
         println!(
             "{}",
@@ -5077,22 +5073,15 @@ impl LiveCli {
         let runtime = build_runtime(
             session_state.with_persistence_path(self.session.path.clone()),
             &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            self.auth_mode,
+            self.config.clone(),
         )?;
         self.replace_runtime(runtime)?;
         println!(
             "Session cleared\n  Mode             fresh session\n  Previous session {}\n  Resume previous  /resume {}\n  Preserved model  {}\n  Permission mode  {}\n  New session      {}\n  Session file     {}",
             previous_session.id,
             previous_session.id,
-            self.model,
-            self.permission_mode.as_str(),
+            self.config.model,
+            self.config.permission_mode.as_str(),
             self.session.id,
             self.session.path.display(),
         );
@@ -5116,18 +5105,7 @@ impl LiveCli {
         let (handle, session) = load_session_reference(&session_ref)?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
-        let runtime = build_runtime(
-            session,
-            &handle.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            self.auth_mode,
-        )?;
+        let runtime = build_runtime(session, &handle.id, self.config.clone())?;
         self.replace_runtime(runtime)?;
         self.session = SessionHandle {
             id: session_id,
@@ -5273,18 +5251,7 @@ impl LiveCli {
                 let (handle, session) = load_session_reference(target)?;
                 let message_count = session.messages.len();
                 let session_id = session.session_id.clone();
-                let runtime = build_runtime(
-                    session,
-                    &handle.id,
-                    self.model.clone(),
-                    self.system_prompt.clone(),
-                    true,
-                    true,
-                    self.allowed_tools.clone(),
-                    self.permission_mode,
-                    None,
-                    self.auth_mode,
-                )?;
+                let runtime = build_runtime(session, &handle.id, self.config.clone())?;
                 self.replace_runtime(runtime)?;
                 self.session = SessionHandle {
                     id: session_id,
@@ -5309,18 +5276,7 @@ impl LiveCli {
                 let forked = forked.with_persistence_path(handle.path.clone());
                 let message_count = forked.messages.len();
                 forked.save_to_path(&handle.path)?;
-                let runtime = build_runtime(
-                    forked,
-                    &handle.id,
-                    self.model.clone(),
-                    self.system_prompt.clone(),
-                    true,
-                    true,
-                    self.allowed_tools.clone(),
-                    self.permission_mode,
-                    None,
-                    self.auth_mode,
-                )?;
+                let runtime = build_runtime(forked, &handle.id, self.config.clone())?;
                 self.replace_runtime(runtime)?;
                 self.session = handle;
                 println!(
@@ -5409,14 +5365,7 @@ impl LiveCli {
         let runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            self.auth_mode,
+            self.config.clone(),
         )?;
         self.replace_runtime(runtime)?;
         self.persist_session()
@@ -5430,14 +5379,7 @@ impl LiveCli {
         let runtime = build_runtime(
             result.compacted_session,
             &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            self.auth_mode,
+            self.config.clone(),
         )?;
         self.replace_runtime(runtime)?;
         self.persist_session()?;
@@ -5455,16 +5397,14 @@ impl LiveCli {
         let mut runtime = build_runtime(
             session,
             &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            enable_tools,
-            false,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            progress,
-            self.auth_mode,
+            RuntimeConfig {
+                enable_tools,
+                emit_output: false,
+                progress_reporter: progress,
+                ..self.config.clone()
+            },
         )?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
         let summary = runtime.run_turn(prompt, Some(&mut permission_prompter), None)?;
         let text = final_assistant_text(&summary).trim().to_string();
         runtime.shutdown_plugins()?;
@@ -7565,88 +7505,36 @@ fn describe_tool_progress(name: &str, input: &str) -> String {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::too_many_arguments)]
 fn build_runtime(
     session: Session,
     session_id: &str,
-    model: String,
-    system_prompt: Vec<String>,
-    enable_tools: bool,
-    emit_output: bool,
-    allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    progress_reporter: Option<InternalPromptProgressReporter>,
-    auth_mode: Option<AuthMode>,
+    config: RuntimeConfig,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    build_runtime_for_cwd(
-        &cwd,
-        session,
-        session_id,
-        model,
-        system_prompt,
-        enable_tools,
-        emit_output,
-        allowed_tools,
-        permission_mode,
-        progress_reporter,
-        auth_mode,
-    )
+    build_runtime_for_cwd(&cwd, session, session_id, config)
 }
 
-#[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::too_many_arguments)]
 fn build_runtime_for_cwd(
     cwd: &Path,
     session: Session,
     session_id: &str,
-    model: String,
-    system_prompt: Vec<String>,
-    enable_tools: bool,
-    emit_output: bool,
-    allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    progress_reporter: Option<InternalPromptProgressReporter>,
-    auth_mode: Option<AuthMode>,
+    config: RuntimeConfig,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let loader = ConfigLoader::default_for(cwd);
-    let runtime_config = loader.load()?;
-    let runtime_plugin_state =
-        build_runtime_plugin_state_with_loader(cwd, &loader, &runtime_config)?;
-    build_runtime_with_plugin_state(
-        session,
-        session_id,
-        model,
-        system_prompt,
-        enable_tools,
-        emit_output,
-        allowed_tools,
-        permission_mode,
-        progress_reporter,
-        runtime_plugin_state,
-        auth_mode,
-    )
+    let file_config = loader.load()?;
+    let runtime_plugin_state = build_runtime_plugin_state_with_loader(cwd, &loader, &file_config)?;
+    build_runtime_with_plugin_state(session, session_id, config, runtime_plugin_state)
 }
 
-#[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::too_many_arguments)]
 fn build_runtime_with_plugin_state(
     mut session: Session,
     session_id: &str,
-    model: String,
-    system_prompt: Vec<String>,
-    enable_tools: bool,
-    emit_output: bool,
-    allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    progress_reporter: Option<InternalPromptProgressReporter>,
+    config: RuntimeConfig,
     runtime_plugin_state: RuntimePluginState,
-    auth_mode: Option<AuthMode>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     // Persist the model in session metadata so resumed sessions can report it.
     if session.model.is_none() {
-        session.model = Some(model.clone());
+        session.model = Some(config.model.clone());
     }
     let RuntimePluginState {
         feature_config,
@@ -7655,22 +7543,15 @@ fn build_runtime_with_plugin_state(
         mcp_state,
     } = runtime_plugin_state;
     plugin_registry.initialize()?;
-    let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
+    let policy = permission_policy(config.permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    let system_prompt = config.system_prompt.clone();
+    let emit_output = config.emit_output;
     let mut runtime = ConversationRuntime::new_with_features(
         session,
-        AnthropicRuntimeClient::new(
-            session_id,
-            model,
-            enable_tools,
-            emit_output,
-            allowed_tools.clone(),
-            tool_registry.clone(),
-            progress_reporter,
-            auth_mode,
-        )?,
+        AnthropicRuntimeClient::new(session_id, &config, tool_registry.clone())?,
         CliToolExecutor::new(
-            allowed_tools.clone(),
+            config.allowed_tools,
             emit_output,
             tool_registry.clone(),
             mcp_state.clone(),
@@ -7789,19 +7670,14 @@ struct AnthropicRuntimeClient {
 impl AnthropicRuntimeClient {
     fn new(
         session_id: &str,
-        model: String,
-        enable_tools: bool,
-        emit_output: bool,
-        allowed_tools: Option<AllowedToolSet>,
+        config: &RuntimeConfig,
         tool_registry: GlobalToolRegistry,
-        progress_reporter: Option<InternalPromptProgressReporter>,
-        auth_mode: Option<AuthMode>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let resolved_model = api::resolve_model_alias(&model);
+        let resolved_model = api::resolve_model_alias(&config.model);
         // Resolve the effective auth mode: use the explicit --auth flag if
         // provided, otherwise auto-detect from env vars.  Once we have
         // a mode, the same from_model_and_mode path handles all routing.
-        let effective_mode = match auth_mode {
+        let effective_mode = match config.auth_mode {
             Some(mode) => {
                 validate_auth_env(mode)?;
                 Some(mode)
@@ -7832,12 +7708,12 @@ impl AnthropicRuntimeClient {
             runtime: tokio::runtime::Runtime::new()?,
             client,
             session_id: session_id.to_string(),
-            model,
-            enable_tools,
-            emit_output,
-            allowed_tools,
+            model: config.model.clone(),
+            enable_tools: config.enable_tools,
+            emit_output: config.emit_output,
+            allowed_tools: config.allowed_tools.clone(),
             tool_registry,
-            progress_reporter,
+            progress_reporter: config.progress_reporter.clone(),
             reasoning_effort: None,
         })
     }
@@ -9381,8 +9257,8 @@ mod tests {
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
-        STUB_COMMANDS,
+        PromptHistoryEntry, RuntimeConfig, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -13247,15 +13123,17 @@ UU conflicted.rs",
         let mut runtime = build_runtime_with_plugin_state(
             Session::new(),
             "runtime-plugin-lifecycle",
-            DEFAULT_MODEL.to_string(),
-            vec!["test system prompt".to_string()],
-            true,
-            false,
-            None,
-            PermissionMode::DangerFullAccess,
-            None,
+            RuntimeConfig {
+                model: DEFAULT_MODEL.to_string(),
+                system_prompt: vec!["test system prompt".to_string()],
+                enable_tools: true,
+                emit_output: false,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                progress_reporter: None,
+                auth_mode: None,
+            },
             runtime_plugin_state,
-            None,
         )
         .expect("runtime should build");
 
