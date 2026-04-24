@@ -20,7 +20,7 @@ pub use prompt_cache::{
 };
 pub use providers::anthropic::{
     is_anthropic_api_key, is_anthropic_auth_token, is_claude_code_oauth_token, AnthropicClient,
-    AnthropicClient as ApiClient, AuthSource,
+    AnthropicClient as ApiClient, AuthSource, DEFAULT_BASE_URL,
 };
 pub use providers::openai_compat::{
     build_chat_completion_request, flatten_tool_result_content, is_reasoning_model,

@@ -1657,7 +1657,13 @@ fn format_connected_line(model: &str) -> String {
     } else {
         ""
     };
-    format!("Connected: {model} via {provider}{auth_hint}")
+    let base_url = api::read_base_url();
+    let endpoint_hint = if base_url != api::DEFAULT_BASE_URL {
+        format!("\nEndpoint:  {base_url}")
+    } else {
+        String::new()
+    };
+    format!("Connected: {model} via {provider}{auth_hint}{endpoint_hint}")
 }
 
 fn filter_tool_specs(
