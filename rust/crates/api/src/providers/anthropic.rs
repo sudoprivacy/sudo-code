@@ -696,8 +696,23 @@ impl AuthSource {
     }
 }
 
-/// Returns `true` when the active auth source comes from `CLAUDE_CODE_OAUTH_TOKEN`.
+/// Returns `true` when the active auth source comes from `CLAUDE_CODE_OAUTH_TOKEN`
+/// and no higher-priority auth env var (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+/// `SCODE_TOKEN`) takes precedence.
 pub fn is_claude_code_oauth_token() -> bool {
+    // Mirror the precedence in `from_env_or_saved`.
+    if read_env_non_empty("ANTHROPIC_API_KEY")
+        .ok()
+        .flatten()
+        .is_some()
+        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")
+            .ok()
+            .flatten()
+            .is_some()
+        || read_env_non_empty("SCODE_TOKEN").ok().flatten().is_some()
+    {
+        return false;
+    }
     read_env_non_empty("CLAUDE_CODE_OAUTH_TOKEN")
         .ok()
         .flatten()
