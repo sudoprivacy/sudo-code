@@ -65,6 +65,10 @@ pub fn resolve_auth_mode(explicit: Option<AuthMode>) -> Result<AuthMode, ApiErro
         return Ok(mode);
     }
     // Auto-detect: subscription → proxy → api-key
+    // Note: codex_auth_file_exists() is intentionally NOT checked here.
+    // Codex models short-circuit before auth mode resolution in main.rs,
+    // and checking it here would incorrectly force Subscription mode for
+    // non-Codex models when ~/.codex/auth.json happens to exist.
     if env_present("CLAUDE_CODE_OAUTH_TOKEN") {
         return Ok(AuthMode::Subscription);
     }
@@ -86,9 +90,9 @@ pub fn resolve_auth_mode(explicit: Option<AuthMode>) -> Result<AuthMode, ApiErro
 pub fn validate_auth_env(mode: AuthMode) -> Result<(), ApiError> {
     match mode {
         AuthMode::Subscription => {
-            if !env_present("CLAUDE_CODE_OAUTH_TOKEN") {
+            if !env_present("CLAUDE_CODE_OAUTH_TOKEN") && !codex_auth_file_exists() {
                 return Err(ApiError::Auth(
-                    "--auth subscription requires CLAUDE_CODE_OAUTH_TOKEN to be set.".to_string(),
+                    "--auth subscription requires CLAUDE_CODE_OAUTH_TOKEN to be set or ~/.codex/auth.json to exist.".to_string(),
                 ));
             }
         }
@@ -124,6 +128,20 @@ fn env_present(key: &str) -> bool {
     std::env::var(key)
         .ok()
         .is_some_and(|v| !v.trim().is_empty())
+}
+
+/// Returns `true` when `~/.codex/auth.json` exists on disk, indicating the
+/// Codex CLI has written subscription credentials.
+#[must_use]
+pub fn codex_auth_file_exists() -> bool {
+    std::env::var("HOME")
+        .ok()
+        .map(|home| {
+            std::path::Path::new(&home)
+                .join(".codex/auth.json")
+                .exists()
+        })
+        .unwrap_or(false)
 }
 
 #[allow(dead_code)]

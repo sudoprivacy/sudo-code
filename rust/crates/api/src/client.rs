@@ -67,10 +67,16 @@ impl ProviderClient {
                     AnthropicClient::from_auth_with_mode(auth, Some(mode)).with_base_url(base_url),
                 ))
             }
-            AuthMode::Subscription => Ok(Self::Anthropic(AnthropicClient::from_auth_with_mode(
-                auth,
-                Some(mode),
-            ))),
+            AuthMode::Subscription => {
+                let resolved_model = providers::resolve_model_alias(model);
+                if providers::detect_provider_kind(&resolved_model) == ProviderKind::Codex {
+                    return Ok(Self::Codex(CodexClient::from_auth_file()?));
+                }
+                Ok(Self::Anthropic(AnthropicClient::from_auth_with_mode(
+                    auth,
+                    Some(mode),
+                )))
+            }
             AuthMode::ApiKey => {
                 let resolved_model = providers::resolve_model_alias(model);
                 match providers::detect_provider_kind(&resolved_model) {
