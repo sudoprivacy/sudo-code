@@ -37,6 +37,10 @@ Use `--auth` to explicitly select an auth mode:
 
 ```bash
 scode --auth api-key          # uses ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.
+# To get a subscription token, install Claude Code and run:
+#   claude setup-token
+# Then export the token:
+export CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat-..."
 scode --auth subscription     # uses CLAUDE_CODE_OAUTH_TOKEN
 scode --auth proxy            # uses PROXY_AUTH_TOKEN + PROXY_BASE_URL
 ```
