@@ -7798,19 +7798,23 @@ impl AnthropicRuntimeClient {
         auth_mode: Option<AuthMode>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let resolved_model = api::resolve_model_alias(&model);
-        let client = if let Some(mode) = auth_mode {
-            // Explicit --auth mode: validate required env vars, resolve
-            // auth source for the mode, then build via from_model_and_mode
-            // which handles proxy/subscription/api-key routing.
-            validate_auth_env(mode)?;
+        // Resolve the effective auth mode: use the explicit --auth flag if
+        // provided, otherwise auto-detect from env vars.  Once we have
+        // a mode, the same from_model_and_mode path handles all routing.
+        let effective_mode = match auth_mode {
+            Some(mode) => {
+                validate_auth_env(mode)?;
+                Some(mode)
+            }
+            None => resolve_auth_mode(None).ok(),
+        };
+        let client = if let Some(mode) = effective_mode {
             let auth = AuthSource::for_mode(mode)?;
             ApiProviderClient::from_model_and_mode(&resolved_model, mode, auth)?
                 .with_prompt_cache(PromptCache::new(session_id))
         } else {
-            // Auto-detect: legacy path. For Anthropic we build the client
-            // directly to apply `api::read_base_url()` (needed for the
-            // mock-server test harness) and attach a session-scoped prompt
-            // cache. Non-Anthropic variants route via detect_provider_kind.
+            // No recognised auth env vars at all — fall back to the
+            // legacy provider-detection path for non-Anthropic models.
             match detect_provider_kind(&resolved_model) {
                 ProviderKind::Anthropic => {
                     let auth = resolve_cli_auth_source()?;

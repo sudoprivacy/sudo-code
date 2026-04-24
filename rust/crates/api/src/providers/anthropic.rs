@@ -717,9 +717,14 @@ impl AuthSource {
                 Ok(Self::BearerToken(token))
             }
             super::AuthMode::ApiKey => {
-                let api_key = read_env_non_empty("ANTHROPIC_API_KEY")?
-                    .ok_or_else(anthropic_missing_credentials)?;
-                Ok(Self::ApiKey(api_key))
+                // Try ANTHROPIC_API_KEY first.  When it is absent, return
+                // AuthSource::None — non-Anthropic providers (xai, openai)
+                // load their own keys in from_model_and_mode, so the auth
+                // source from here is unused in those paths.
+                match read_env_non_empty("ANTHROPIC_API_KEY")? {
+                    Some(api_key) => Ok(Self::ApiKey(api_key)),
+                    None => Ok(Self::None),
+                }
             }
         }
     }
