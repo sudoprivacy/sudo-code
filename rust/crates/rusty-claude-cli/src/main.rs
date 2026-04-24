@@ -2225,7 +2225,7 @@ fn check_auth_health() -> DiagnosticCheck {
                     token_set.scopes.join(",")
                 }
             ),
-            "Suggested action  set ANTHROPIC_API_KEY, PROXY_AUTH_TOKEN, or CLAUDE_CODE_OAUTH_TOKEN"
+            "Suggested action  set ANTHROPIC_API_KEY or use --auth; `scode login` is removed"
                 .to_string(),
         ])
         .with_data(Map::from_iter([

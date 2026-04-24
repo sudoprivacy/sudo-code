@@ -43,17 +43,16 @@ pub enum AuthSource {
 
 impl AuthSource {
     pub fn from_env() -> Result<Self, ApiError> {
-        let api_key = read_env_non_empty("ANTHROPIC_API_KEY")?;
-        let proxy_token = read_env_non_empty("PROXY_AUTH_TOKEN")?;
-        match (api_key, proxy_token) {
-            (Some(api_key), Some(bearer_token)) => Ok(Self::ApiKeyAndBearer {
-                api_key,
-                bearer_token,
-            }),
-            (Some(api_key), None) => Ok(Self::ApiKey(api_key)),
-            (None, Some(bearer_token)) => Ok(Self::BearerToken(bearer_token)),
-            (None, None) => Err(anthropic_missing_credentials()),
+        if let Some(api_key) = read_env_non_empty("ANTHROPIC_API_KEY")? {
+            return Ok(Self::ApiKey(api_key));
         }
+        if let Some(token) = read_env_non_empty("PROXY_AUTH_TOKEN")? {
+            return Ok(Self::BearerToken(token));
+        }
+        if let Some(token) = read_env_non_empty("CLAUDE_CODE_OAUTH_TOKEN")? {
+            return Ok(Self::BearerToken(token));
+        }
+        Err(anthropic_missing_credentials())
     }
 
     #[must_use]
@@ -1288,13 +1287,13 @@ mod tests {
     }
 
     #[test]
-    fn auth_source_from_env_combines_api_key_and_bearer_token() {
+    fn auth_source_from_env_prefers_api_key_over_proxy_token() {
         let _guard = env_lock();
-        std::env::set_var("PROXY_AUTH_TOKEN", "auth-token");
-        std::env::set_var("ANTHROPIC_API_KEY", "legacy-key");
+        std::env::set_var("PROXY_AUTH_TOKEN", "proxy-token");
+        std::env::set_var("ANTHROPIC_API_KEY", "api-key");
         let auth = AuthSource::from_env().expect("env auth");
-        assert_eq!(auth.api_key(), Some("legacy-key"));
-        assert_eq!(auth.bearer_token(), Some("auth-token"));
+        assert_eq!(auth.api_key(), Some("api-key"));
+        assert_eq!(auth.bearer_token(), None);
         std::env::remove_var("PROXY_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
