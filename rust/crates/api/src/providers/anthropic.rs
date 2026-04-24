@@ -28,6 +28,7 @@ const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 const DEFAULT_MAX_RETRIES: u32 = 8;
+const OAUTH_SYSTEM_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthSource {
@@ -122,12 +123,10 @@ pub struct AnthropicClient {
     session_tracer: Option<SessionTracer>,
     prompt_cache: Option<PromptCache>,
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
-    /// When set, the `system` field in outgoing requests is split into an
-    /// array of content blocks: the first block contains this exact prefix
-    /// string, and the second block contains the remainder. This is required
-    /// for OAuth subscription tokens where Anthropic gates access by checking
-    /// the first system block for an exact match.
-    oauth_system_prefix: Option<String>,
+    /// When true, prepend `OAUTH_SYSTEM_PREFIX` as the first system content
+    /// block. Required for OAuth subscription tokens where the server gates
+    /// access by checking the first system block for an exact match.
+    oauth_system_prefix: bool,
 }
 
 impl AnthropicClient {
@@ -144,13 +143,14 @@ impl AnthropicClient {
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
-            oauth_system_prefix: None,
+            oauth_system_prefix: false,
         }
     }
 
     #[must_use]
     pub fn from_auth(auth: AuthSource) -> Self {
-        Self {
+        let is_oauth = is_claude_code_oauth_token();
+        let mut client = Self {
             http: build_http_client_or_default(),
             auth,
             base_url: DEFAULT_BASE_URL.to_string(),
@@ -161,8 +161,15 @@ impl AnthropicClient {
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
-            oauth_system_prefix: None,
+            oauth_system_prefix: is_oauth,
+        };
+        if is_oauth {
+            // OAuth subscription tokens require the direct Anthropic API
+            // and the oauth beta header.
+            client.base_url = DEFAULT_BASE_URL.to_string();
+            client.request_profile = client.request_profile.with_beta("oauth-2025-04-20");
         }
+        client
     }
 
     pub fn from_env() -> Result<Self, ApiError> {
@@ -202,7 +209,10 @@ impl AnthropicClient {
 
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
+        // OAuth subscription tokens must always use the direct Anthropic API.
+        if !self.oauth_system_prefix {
+            self.base_url = base_url.into();
+        }
         self
     }
 
@@ -280,12 +290,6 @@ impl AnthropicClient {
     #[must_use]
     pub fn with_request_profile(mut self, request_profile: AnthropicRequestProfile) -> Self {
         self.request_profile = request_profile;
-        self
-    }
-
-    #[must_use]
-    pub fn with_oauth_system_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.oauth_system_prefix = Some(prefix.into());
         self
     }
 
@@ -506,9 +510,10 @@ impl AnthropicClient {
     /// required for OAuth subscription tokens where the server gates access
     /// by checking the first system block for an exact match.
     fn prepend_oauth_system_prefix(&self, body: &mut Value) {
-        let Some(prefix) = &self.oauth_system_prefix else {
+        if !self.oauth_system_prefix {
             return;
-        };
+        }
+        let prefix = OAUTH_SYSTEM_PREFIX;
         let Some(obj) = body.as_object_mut() else {
             return;
         };

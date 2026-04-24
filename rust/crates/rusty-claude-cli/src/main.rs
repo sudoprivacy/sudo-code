@@ -7734,19 +7734,9 @@ impl AnthropicRuntimeClient {
         let client = match detect_provider_kind(&resolved_model) {
             ProviderKind::Anthropic => {
                 let auth = resolve_cli_auth_source()?;
-                let mut inner = AnthropicClient::from_auth(auth)
+                let inner = AnthropicClient::from_auth(auth)
                     .with_base_url(api::read_base_url())
                     .with_prompt_cache(PromptCache::new(session_id));
-                if api::is_claude_code_oauth_token() {
-                    // OAuth tokens require the direct Anthropic API,
-                    // the oauth beta header, and a magic system prefix.
-                    inner = inner
-                        .with_base_url("https://api.anthropic.com".to_string())
-                        .with_beta("oauth-2025-04-20")
-                        .with_oauth_system_prefix(
-                            "You are Claude Code, Anthropic's official CLI for Claude.",
-                        );
-                }
                 ApiProviderClient::Anthropic(inner)
             }
             ProviderKind::Xai | ProviderKind::OpenAi => {
