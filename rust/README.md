@@ -30,14 +30,23 @@ Set your API credentials:
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
-# Or use a proxy
-export ANTHROPIC_BASE_URL="https://your-proxy.com"
 ```
 
-Or provide an OAuth bearer token directly:
+Or use `--auth` to select a specific auth mode:
 
 ```bash
-export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
+# Subscription (OAuth)
+export CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat-..."
+cargo run -p rusty-claude-cli -- --auth subscription
+
+# Proxy
+export PROXY_AUTH_TOKEN="your-token"
+export PROXY_BASE_URL="https://your-proxy.com"
+cargo run -p rusty-claude-cli -- --auth proxy
+
+# API key (default auto-detect)
+export ANTHROPIC_API_KEY="sk-ant-..."
+cargo run -p rusty-claude-cli -- --auth api-key
 ```
 
 ## Mock parity harness
@@ -80,7 +89,7 @@ Primary artifacts:
 | Feature | Status |
 |---------|--------|
 | Anthropic / OpenAI-compatible provider flows + streaming | ✅ |
-| Direct bearer-token auth via `ANTHROPIC_AUTH_TOKEN` | ✅ |
+| Multi-mode auth (`--auth api-key\|subscription\|proxy`) | ✅ |
 | Interactive REPL (rustyline) | ✅ |
 | Tool system (bash, read, write, edit, grep, glob) | ✅ |
 | Web tools (search, fetch) | ✅ |
@@ -122,6 +131,7 @@ scode [OPTIONS] [COMMAND]
 
 Flags:
   --model MODEL
+  --auth MODE                 Auth mode: subscription, proxy, or api-key
   --output-format text|json
   --permission-mode MODE
   --dangerously-skip-permissions
@@ -195,7 +205,7 @@ rust/
 
 ### Crate Responsibilities
 
-- **api** — provider clients, SSE streaming, request/response types, auth (`ANTHROPIC_API_KEY` + bearer-token support), request-size/context-window preflight
+- **api** — provider clients, SSE streaming, request/response types, multi-mode auth (`--auth` / `AuthMode`), request-size/context-window preflight
 - **commands** — slash command definitions, parsing, help text generation, JSON/text command rendering
 - **compat-harness** — extracts tool/prompt manifests from upstream TS source
 - **mock-anthropic-service** — deterministic `/v1/messages` mock for CLI parity tests and local harness runs

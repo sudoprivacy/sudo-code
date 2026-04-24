@@ -699,9 +699,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             "--auth" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --auth; must be subscription, proxy, or api-key".to_string())?;
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "missing value for --auth; must be subscription, proxy, or api-key".to_string()
+                })?;
                 auth_mode = Some(AuthMode::parse(value)?);
                 index += 2;
             }
@@ -9251,6 +9251,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  --model MODEL              Override the active model"
+    )?;
+    writeln!(
+        out,
+        "  --auth MODE                Auth mode: subscription, proxy, or api-key"
     )?;
     writeln!(
         out,
