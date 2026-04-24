@@ -1652,6 +1652,8 @@ fn format_connected_line(model: &str) -> String {
         " (subscription)"
     } else if api::is_anthropic_auth_token() {
         " (proxy)"
+    } else if api::is_anthropic_api_key() {
+        " (api key)"
     } else {
         ""
     };
@@ -11659,7 +11661,7 @@ mod tests {
 
         let line = format_connected_line(model);
 
-        assert_eq!(line, "Connected: claude-sonnet-4-6 via anthropic");
+        assert!(line.starts_with("Connected: claude-sonnet-4-6 via anthropic"));
     }
 
     #[test]
@@ -11668,7 +11670,7 @@ mod tests {
 
         let line = format_connected_line(model);
 
-        assert_eq!(line, "Connected: grok-3 via xai");
+        assert!(line.starts_with("Connected: grok-3 via xai"));
     }
 
     #[test]

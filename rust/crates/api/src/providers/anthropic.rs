@@ -716,6 +716,14 @@ pub fn is_claude_code_oauth_token() -> bool {
         .is_some()
 }
 
+/// Returns `true` when `ANTHROPIC_API_KEY` is set and non-empty.
+pub fn is_anthropic_api_key() -> bool {
+    read_env_non_empty("ANTHROPIC_API_KEY")
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 /// Returns `true` when `ANTHROPIC_AUTH_TOKEN` is set and non-empty.
 pub fn is_anthropic_auth_token() -> bool {
     read_env_non_empty("ANTHROPIC_AUTH_TOKEN")

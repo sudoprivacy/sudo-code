@@ -19,7 +19,7 @@ pub use prompt_cache::{
     PromptCacheStats,
 };
 pub use providers::anthropic::{
-    is_anthropic_auth_token, is_claude_code_oauth_token, AnthropicClient,
+    is_anthropic_api_key, is_anthropic_auth_token, is_claude_code_oauth_token, AnthropicClient,
     AnthropicClient as ApiClient, AuthSource,
 };
 pub use providers::openai_compat::{
