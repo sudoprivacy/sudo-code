@@ -10,6 +10,110 @@ use crate::types::{MessageRequest, MessageResponse};
 pub mod anthropic;
 pub mod openai_compat;
 
+/// Explicit auth mode selected via `--auth` CLI flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    /// OAuth subscription via `CLAUDE_CODE_OAUTH_TOKEN`.
+    Subscription,
+    /// Proxy bearer token via `PROXY_AUTH_TOKEN` + `PROXY_BASE_URL`.
+    Proxy,
+    /// Direct API key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.).
+    ApiKey,
+}
+
+impl AuthMode {
+    /// Parse from a CLI string value.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "subscription" => Ok(Self::Subscription),
+            "proxy" => Ok(Self::Proxy),
+            "api-key" => Ok(Self::ApiKey),
+            other => Err(format!(
+                "invalid value for --auth: '{other}'; must be subscription, proxy, or api-key"
+            )),
+        }
+    }
+
+    /// Human-readable label for display in the connected line.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Subscription => "subscription",
+            Self::Proxy => "proxy",
+            Self::ApiKey => "api key",
+        }
+    }
+}
+
+/// Auto-detect the auth mode from the environment when `--auth` is not specified.
+/// Priority: subscription → proxy → api-key.
+pub fn resolve_auth_mode(explicit: Option<AuthMode>) -> Result<AuthMode, ApiError> {
+    if let Some(mode) = explicit {
+        validate_auth_env(mode)?;
+        return Ok(mode);
+    }
+    // Auto-detect: subscription → proxy → api-key
+    if env_present("CLAUDE_CODE_OAUTH_TOKEN") {
+        return Ok(AuthMode::Subscription);
+    }
+    if env_present("PROXY_AUTH_TOKEN") {
+        return Ok(AuthMode::Proxy);
+    }
+    if env_present("ANTHROPIC_API_KEY")
+        || env_present("OPENAI_API_KEY")
+        || env_present("XAI_API_KEY")
+        || env_present("DASHSCOPE_API_KEY")
+        || env_present("GOOGLE_API_KEY")
+    {
+        return Ok(AuthMode::ApiKey);
+    }
+    Err(anthropic_missing_credentials())
+}
+
+/// Validate that the required env vars for the given mode are present.
+pub fn validate_auth_env(mode: AuthMode) -> Result<(), ApiError> {
+    match mode {
+        AuthMode::Subscription => {
+            if !env_present("CLAUDE_CODE_OAUTH_TOKEN") {
+                return Err(ApiError::Auth(
+                    "--auth subscription requires CLAUDE_CODE_OAUTH_TOKEN to be set.".to_string(),
+                ));
+            }
+        }
+        AuthMode::Proxy => {
+            if !env_present("PROXY_AUTH_TOKEN") {
+                return Err(ApiError::Auth(
+                    "--auth proxy requires PROXY_AUTH_TOKEN to be set.".to_string(),
+                ));
+            }
+            if !env_present("PROXY_BASE_URL") {
+                return Err(ApiError::Auth(
+                    "--auth proxy requires PROXY_BASE_URL to be set.".to_string(),
+                ));
+            }
+        }
+        AuthMode::ApiKey => {
+            if !(env_present("ANTHROPIC_API_KEY")
+                || env_present("OPENAI_API_KEY")
+                || env_present("XAI_API_KEY")
+                || env_present("DASHSCOPE_API_KEY")
+                || env_present("GOOGLE_API_KEY"))
+            {
+                return Err(ApiError::Auth(
+                    "--auth api-key requires one of ANTHROPIC_API_KEY, OPENAI_API_KEY, XAI_API_KEY, DASHSCOPE_API_KEY, or GOOGLE_API_KEY to be set.".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn env_present(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+}
+
 #[allow(dead_code)]
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ApiError>> + Send + 'a>>;
 
@@ -233,7 +337,7 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     {
         return ProviderKind::OpenAi;
     }
-    if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
+    if anthropic::has_anthropic_api_key_env() {
         return ProviderKind::Anthropic;
     }
     if openai_compat::has_api_key("OPENAI_API_KEY") {
@@ -393,7 +497,11 @@ pub(crate) fn anthropic_missing_credentials_hint() -> Option<String> {
 /// signal instead of a generic "missing Anthropic credentials" wall.
 pub(crate) fn anthropic_missing_credentials() -> ApiError {
     const PROVIDER: &str = "Anthropic";
-    const ENV_VARS: &[&str] = &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"];
+    const ENV_VARS: &[&str] = &[
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "PROXY_AUTH_TOKEN",
+    ];
     match anthropic_missing_credentials_hint() {
         Some(hint) => ApiError::missing_credentials_with_hint(PROVIDER, ENV_VARS, hint),
         None => ApiError::missing_credentials(PROVIDER, ENV_VARS),
@@ -1041,7 +1149,14 @@ NO_EQUALS_LINE
                 hint,
             } => {
                 assert_eq!(*provider, "Anthropic");
-                assert_eq!(*env_vars, &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]);
+                assert_eq!(
+                    *env_vars,
+                    &[
+                        "ANTHROPIC_API_KEY",
+                        "CLAUDE_CODE_OAUTH_TOKEN",
+                        "PROXY_AUTH_TOKEN"
+                    ]
+                );
                 assert!(
                     hint.is_none(),
                     "clean environment should not generate a hint, got {hint:?}"
@@ -1075,7 +1190,14 @@ NO_EQUALS_LINE
                 hint,
             } => {
                 assert_eq!(*provider, "Anthropic");
-                assert_eq!(*env_vars, &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]);
+                assert_eq!(
+                    *env_vars,
+                    &[
+                        "ANTHROPIC_API_KEY",
+                        "CLAUDE_CODE_OAUTH_TOKEN",
+                        "PROXY_AUTH_TOKEN"
+                    ]
+                );
                 let hint_value = hint.as_deref().expect("hint should be populated");
                 assert!(
                     hint_value.contains("OPENAI_API_KEY is set"),
@@ -1125,7 +1247,7 @@ NO_EQUALS_LINE
         let _base_url = EnvVarGuard::set("OPENAI_BASE_URL", Some("http://127.0.0.1:11434/v1"));
         let _api_key = EnvVarGuard::set("OPENAI_API_KEY", Some("dummy"));
         let _anthropic_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
-        let _anthropic_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+        let _proxy_token = EnvVarGuard::set("PROXY_AUTH_TOKEN", None);
 
         // when
         let provider = detect_provider_kind("qwen2.5-coder:7b");

@@ -1389,7 +1389,7 @@ pub fn validate_slash_command_input(
         }
         "login" | "logout" => {
             return Err(command_error(
-                "This auth flow was removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead.",
+                "This auth flow was removed. Set ANTHROPIC_API_KEY or use --auth instead.",
                 command,
                 "",
             ));
@@ -4664,7 +4664,7 @@ mod tests {
         let login_error = parse_error_message("/login");
         assert!(login_error.contains("ANTHROPIC_API_KEY"));
         let logout_error = parse_error_message("/logout");
-        assert!(logout_error.contains("ANTHROPIC_AUTH_TOKEN"));
+        assert!(logout_error.contains("--auth"));
     }
 
     #[test]

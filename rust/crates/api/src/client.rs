@@ -2,7 +2,7 @@ use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
-use crate::providers::{self, ProviderKind};
+use crate::providers::{self, AuthMode, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 
 #[allow(clippy::large_enum_variant)]
@@ -42,6 +42,51 @@ impl ProviderClient {
                     _ => OpenAiCompatConfig::openai(),
                 };
                 Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
+            }
+        }
+    }
+
+    /// Build a `ProviderClient` using the explicit auth mode. Proxy mode
+    /// always routes through `AnthropicClient` with bearer token +
+    /// `PROXY_BASE_URL`. Subscription mode uses `AnthropicClient` with
+    /// OAuth token + default URL. Api-key mode routes by
+    /// `detect_provider_kind()`.
+    pub fn from_model_and_mode(
+        model: &str,
+        mode: AuthMode,
+        auth: AuthSource,
+    ) -> Result<Self, ApiError> {
+        match mode {
+            AuthMode::Proxy => {
+                let base_url = anthropic::base_url_for_mode(mode);
+                Ok(Self::Anthropic(
+                    AnthropicClient::from_auth_with_mode(auth, Some(mode)).with_base_url(base_url),
+                ))
+            }
+            AuthMode::Subscription => Ok(Self::Anthropic(AnthropicClient::from_auth_with_mode(
+                auth,
+                Some(mode),
+            ))),
+            AuthMode::ApiKey => {
+                let resolved_model = providers::resolve_model_alias(model);
+                match providers::detect_provider_kind(&resolved_model) {
+                    ProviderKind::Anthropic => Ok(Self::Anthropic(
+                        AnthropicClient::from_auth_with_mode(auth, Some(mode))
+                            .with_base_url(anthropic::read_base_url()),
+                    )),
+                    ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
+                        OpenAiCompatConfig::xai(),
+                    )?)),
+                    ProviderKind::OpenAi => {
+                        let config = match providers::metadata_for_model(&resolved_model) {
+                            Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
+                                OpenAiCompatConfig::dashscope()
+                            }
+                            _ => OpenAiCompatConfig::openai(),
+                        };
+                        Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
+                    }
+                }
             }
         }
     }
@@ -130,7 +175,8 @@ impl MessageStream {
 }
 
 pub use anthropic::{
-    oauth_token_is_expired, resolve_saved_oauth_token, resolve_startup_auth_source, OAuthTokenSet,
+    base_url_for_mode, oauth_token_is_expired, resolve_saved_oauth_token,
+    resolve_startup_auth_source, OAuthTokenSet,
 };
 #[must_use]
 pub fn read_base_url() -> String {

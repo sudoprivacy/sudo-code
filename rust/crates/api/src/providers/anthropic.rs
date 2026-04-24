@@ -28,6 +28,7 @@ const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 const DEFAULT_MAX_RETRIES: u32 = 8;
+const OAUTH_SYSTEM_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthSource {
@@ -42,17 +43,16 @@ pub enum AuthSource {
 
 impl AuthSource {
     pub fn from_env() -> Result<Self, ApiError> {
-        let api_key = read_env_non_empty("ANTHROPIC_API_KEY")?;
-        let auth_token = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?;
-        match (api_key, auth_token) {
-            (Some(api_key), Some(bearer_token)) => Ok(Self::ApiKeyAndBearer {
-                api_key,
-                bearer_token,
-            }),
-            (Some(api_key), None) => Ok(Self::ApiKey(api_key)),
-            (None, Some(bearer_token)) => Ok(Self::BearerToken(bearer_token)),
-            (None, None) => Err(anthropic_missing_credentials()),
+        if let Some(api_key) = read_env_non_empty("ANTHROPIC_API_KEY")? {
+            return Ok(Self::ApiKey(api_key));
         }
+        if let Some(token) = read_env_non_empty("PROXY_AUTH_TOKEN")? {
+            return Ok(Self::BearerToken(token));
+        }
+        if let Some(token) = read_env_non_empty("CLAUDE_CODE_OAUTH_TOKEN")? {
+            return Ok(Self::BearerToken(token));
+        }
+        Err(anthropic_missing_credentials())
     }
 
     #[must_use]
@@ -122,6 +122,10 @@ pub struct AnthropicClient {
     session_tracer: Option<SessionTracer>,
     prompt_cache: Option<PromptCache>,
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
+    /// When true, prepend `OAUTH_SYSTEM_PREFIX` as the first system content
+    /// block. Required for OAuth subscription tokens where the server gates
+    /// access by checking the first system block for an exact match.
+    oauth_system_prefix: bool,
 }
 
 impl AnthropicClient {
@@ -138,12 +142,27 @@ impl AnthropicClient {
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
+            oauth_system_prefix: false,
         }
     }
 
     #[must_use]
     pub fn from_auth(auth: AuthSource) -> Self {
-        Self {
+        Self::from_auth_with_mode(auth, None)
+    }
+
+    /// Build from an `AuthSource` and an optional explicit `AuthMode`. When
+    /// the mode is `Some(Subscription)` the OAuth system prefix and beta
+    /// header are always applied; when `None` the legacy env-sniffer
+    /// (`is_claude_code_oauth_token`) decides.
+    #[must_use]
+    pub fn from_auth_with_mode(auth: AuthSource, mode: Option<super::AuthMode>) -> Self {
+        let is_subscription = match mode {
+            Some(super::AuthMode::Subscription) => true,
+            Some(_) => false,
+            None => is_claude_code_oauth_token(),
+        };
+        let mut client = Self {
             http: build_http_client_or_default(),
             auth,
             base_url: DEFAULT_BASE_URL.to_string(),
@@ -154,7 +173,15 @@ impl AnthropicClient {
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
+            oauth_system_prefix: is_subscription,
+        };
+        if is_subscription {
+            // OAuth subscription tokens require the direct Anthropic API
+            // and the oauth beta header.
+            client.base_url = DEFAULT_BASE_URL.to_string();
+            client.request_profile = client.request_profile.with_beta("oauth-2025-04-20");
         }
+        client
     }
 
     pub fn from_env() -> Result<Self, ApiError> {
@@ -194,7 +221,10 @@ impl AnthropicClient {
 
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
+        // OAuth subscription tokens must always use the direct Anthropic API.
+        if !self.oauth_system_prefix {
+            self.base_url = base_url.into();
+        }
         self
     }
 
@@ -470,6 +500,7 @@ impl AnthropicClient {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
+        self.prepend_oauth_system_prefix(&mut request_body);
         let request_builder = self.build_request(&request_url).json(&request_body);
         request_builder.send().await.map_err(ApiError::from)
     }
@@ -484,6 +515,33 @@ impl AnthropicClient {
             request_builder = request_builder.header(header_name, header_value);
         }
         request_builder
+    }
+
+    /// When `oauth_system_prefix` is set, transform the `system` field into
+    /// an array of content blocks with the prefix as the first block. This is
+    /// required for OAuth subscription tokens where the server gates access
+    /// by checking the first system block for an exact match.
+    fn prepend_oauth_system_prefix(&self, body: &mut Value) {
+        if !self.oauth_system_prefix {
+            return;
+        }
+        let prefix = OAUTH_SYSTEM_PREFIX;
+        let Some(obj) = body.as_object_mut() else {
+            return;
+        };
+        let mut blocks = vec![serde_json::json!({"type": "text", "text": prefix})];
+        if let Some(system_val) = obj.remove("system") {
+            if let Some(s) = system_val.as_str() {
+                if !s.is_empty() {
+                    blocks.push(serde_json::json!({"type": "text", "text": s}));
+                }
+            } else {
+                // Already an array or non-string — put it back as-is.
+                obj.insert("system".to_string(), system_val);
+                return;
+            }
+        }
+        obj.insert("system".to_string(), Value::Array(blocks));
     }
 
     async fn preflight_message_request(&self, request: &MessageRequest) -> Result<(), ApiError> {
@@ -531,6 +589,7 @@ impl AnthropicClient {
         );
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
+        self.prepend_oauth_system_prefix(&mut request_body);
         let response = self
             .build_request(&request_url)
             .json(&request_body)
@@ -619,19 +678,88 @@ fn jitter_for_base(base: Duration) -> Duration {
 impl AuthSource {
     pub fn from_env_or_saved() -> Result<Self, ApiError> {
         if let Some(api_key) = read_env_non_empty("ANTHROPIC_API_KEY")? {
-            return match read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
-                Some(bearer_token) => Ok(Self::ApiKeyAndBearer {
-                    api_key,
-                    bearer_token,
-                }),
-                None => Ok(Self::ApiKey(api_key)),
-            };
+            return Ok(Self::ApiKey(api_key));
         }
-        if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
+        if let Some(bearer_token) = read_env_non_empty("PROXY_AUTH_TOKEN")? {
+            if read_env_non_empty("PROXY_BASE_URL")?.is_none() {
+                return Err(ApiError::Auth(
+                    "PROXY_AUTH_TOKEN requires PROXY_BASE_URL to be set.".to_string(),
+                ));
+            }
             return Ok(Self::BearerToken(bearer_token));
+        }
+        if let Some(bearer_token) = read_env_non_empty("CLAUDE_CODE_OAUTH_TOKEN")? {
+            return Ok(Self::BearerToken(bearer_token));
+        }
+        if let Some(token_set) = load_saved_oauth_token()? {
+            if !oauth_token_is_expired(&token_set) {
+                return Ok(Self::BearerToken(token_set.access_token));
+            }
         }
         Err(anthropic_missing_credentials())
     }
+
+    /// Build an `AuthSource` for a specific `AuthMode`.
+    pub fn for_mode(mode: super::AuthMode) -> Result<Self, ApiError> {
+        match mode {
+            super::AuthMode::Subscription => {
+                let token = read_env_non_empty("CLAUDE_CODE_OAUTH_TOKEN")?.ok_or_else(|| {
+                    ApiError::Auth(
+                        "CLAUDE_CODE_OAUTH_TOKEN is required for subscription mode.".to_string(),
+                    )
+                })?;
+                Ok(Self::BearerToken(token))
+            }
+            super::AuthMode::Proxy => {
+                let token = read_env_non_empty("PROXY_AUTH_TOKEN")?.ok_or_else(|| {
+                    ApiError::Auth("PROXY_AUTH_TOKEN is required for proxy mode.".to_string())
+                })?;
+                Ok(Self::BearerToken(token))
+            }
+            super::AuthMode::ApiKey => {
+                // Try ANTHROPIC_API_KEY first.  When it is absent, return
+                // AuthSource::None — non-Anthropic providers (xai, openai)
+                // load their own keys in from_model_and_mode, so the auth
+                // source from here is unused in those paths.
+                match read_env_non_empty("ANTHROPIC_API_KEY")? {
+                    Some(api_key) => Ok(Self::ApiKey(api_key)),
+                    None => Ok(Self::None),
+                }
+            }
+        }
+    }
+}
+
+/// Returns `true` when the active auth source comes from `CLAUDE_CODE_OAUTH_TOKEN`
+/// and no higher-priority auth env var (`ANTHROPIC_API_KEY`) takes precedence.
+pub fn is_claude_code_oauth_token() -> bool {
+    if read_env_non_empty("ANTHROPIC_API_KEY")
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return false;
+    }
+    read_env_non_empty("CLAUDE_CODE_OAUTH_TOKEN")
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// Returns `true` when `ANTHROPIC_API_KEY` is set and non-empty.
+pub fn is_anthropic_api_key() -> bool {
+    read_env_non_empty("ANTHROPIC_API_KEY")
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// Returns `true` when `PROXY_AUTH_TOKEN` is set and non-empty.
+pub fn is_proxy_auth_token() -> bool {
+    read_env_non_empty("PROXY_AUTH_TOKEN")
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 #[must_use]
@@ -648,27 +776,37 @@ pub fn resolve_saved_oauth_token(config: &OAuthConfig) -> Result<Option<OAuthTok
     resolve_saved_oauth_token_set(config, token_set).map(Some)
 }
 
-pub fn has_auth_from_env_or_saved() -> Result<bool, ApiError> {
-    Ok(read_env_non_empty("ANTHROPIC_API_KEY")?.is_some()
-        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some())
+/// Returns `true` when `ANTHROPIC_API_KEY` is set in the environment.
+/// Used by `detect_provider_kind` to check Anthropic auth without
+/// sniffing proxy tokens.
+pub fn has_anthropic_api_key_env() -> bool {
+    read_env_non_empty("ANTHROPIC_API_KEY")
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 pub fn resolve_startup_auth_source<F>(load_oauth_config: F) -> Result<AuthSource, ApiError>
 where
     F: FnOnce() -> Result<Option<OAuthConfig>, ApiError>,
 {
-    let _ = load_oauth_config;
     if let Some(api_key) = read_env_non_empty("ANTHROPIC_API_KEY")? {
-        return match read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
-            Some(bearer_token) => Ok(AuthSource::ApiKeyAndBearer {
-                api_key,
-                bearer_token,
-            }),
-            None => Ok(AuthSource::ApiKey(api_key)),
-        };
+        return Ok(AuthSource::ApiKey(api_key));
     }
-    if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
+    if let Some(bearer_token) = read_env_non_empty("PROXY_AUTH_TOKEN")? {
         return Ok(AuthSource::BearerToken(bearer_token));
+    }
+    if let Some(bearer_token) = read_env_non_empty("CLAUDE_CODE_OAUTH_TOKEN")? {
+        return Ok(AuthSource::BearerToken(bearer_token));
+    }
+    if let Some(token_set) = load_saved_oauth_token()? {
+        if let Some(config) = load_oauth_config()? {
+            let resolved = resolve_saved_oauth_token_set(&config, token_set)?;
+            return Ok(AuthSource::BearerToken(resolved.access_token));
+        }
+        if !oauth_token_is_expired(&token_set) {
+            return Ok(AuthSource::BearerToken(token_set.access_token));
+        }
     }
     Err(anthropic_missing_credentials())
 }
@@ -756,14 +894,29 @@ fn read_api_key() -> Result<String, ApiError> {
 
 #[cfg(test)]
 fn read_auth_token() -> Option<String> {
-    read_env_non_empty("ANTHROPIC_AUTH_TOKEN")
+    read_env_non_empty("PROXY_AUTH_TOKEN")
         .ok()
         .and_then(std::convert::identity)
 }
 
+/// Read the base URL. For proxy mode uses `PROXY_BASE_URL`, otherwise
+/// falls back to `ANTHROPIC_BASE_URL` (undocumented test override) or
+/// the default Anthropic API endpoint.
 #[must_use]
 pub fn read_base_url() -> String {
     std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
+}
+
+/// Return the base URL appropriate for the given auth mode.
+#[must_use]
+pub fn base_url_for_mode(mode: super::AuthMode) -> String {
+    match mode {
+        super::AuthMode::Proxy => {
+            std::env::var("PROXY_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
+        }
+        super::AuthMode::Subscription => DEFAULT_BASE_URL.to_string(),
+        super::AuthMode::ApiKey => read_base_url(),
+    }
 }
 
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -895,12 +1048,9 @@ const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
 
 /// Anthropic API keys (`sk-ant-*`) are accepted over the `x-api-key` header
 /// and rejected with HTTP 401 "Invalid bearer token" when sent as a Bearer
-/// token via `ANTHROPIC_AUTH_TOKEN`. This happens often enough in the wild
-/// (users copy-paste an `sk-ant-...` key into `ANTHROPIC_AUTH_TOKEN` because
-/// the env var name sounds auth-related) that a bare 401 error is useless.
-/// When we detect this exact shape, append a hint to the error message that
-/// points the user at the one-line fix.
-const SK_ANT_BEARER_HINT: &str = "sk-ant-* keys go in ANTHROPIC_API_KEY (x-api-key header), not ANTHROPIC_AUTH_TOKEN (Bearer header). Move your key to ANTHROPIC_API_KEY.";
+/// token via `PROXY_AUTH_TOKEN`. When we detect this exact shape, append a
+/// hint to the error message that points the user at the one-line fix.
+const SK_ANT_BEARER_HINT: &str = "sk-ant-* keys go in ANTHROPIC_API_KEY (x-api-key header), not PROXY_AUTH_TOKEN (Bearer header). Move your key to ANTHROPIC_API_KEY.";
 
 fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
     let ApiError::Api {
@@ -1085,7 +1235,7 @@ mod tests {
     #[test]
     fn read_api_key_requires_presence() {
         let _guard = env_lock();
-        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("PROXY_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("SUDO_CODE_CONFIG_HOME");
         let error = super::read_api_key().expect_err("missing key should error");
@@ -1098,35 +1248,35 @@ mod tests {
     #[test]
     fn read_api_key_requires_non_empty_value() {
         let _guard = env_lock();
-        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "");
+        std::env::set_var("PROXY_AUTH_TOKEN", "");
         std::env::remove_var("ANTHROPIC_API_KEY");
         let error = super::read_api_key().expect_err("empty key should error");
         assert!(matches!(
             error,
             crate::error::ApiError::MissingCredentials { .. }
         ));
-        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("PROXY_AUTH_TOKEN");
     }
 
     #[test]
     fn read_api_key_prefers_api_key_env() {
         let _guard = env_lock();
-        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
+        std::env::set_var("PROXY_AUTH_TOKEN", "auth-token");
         std::env::set_var("ANTHROPIC_API_KEY", "legacy-key");
         assert_eq!(
             super::read_api_key().expect("api key should load"),
             "legacy-key"
         );
-        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("PROXY_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
 
     #[test]
     fn read_auth_token_reads_auth_token_env() {
         let _guard = env_lock();
-        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
+        std::env::set_var("PROXY_AUTH_TOKEN", "auth-token");
         assert_eq!(super::read_auth_token().as_deref(), Some("auth-token"));
-        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("PROXY_AUTH_TOKEN");
     }
 
     #[test]
@@ -1142,24 +1292,25 @@ mod tests {
     }
 
     #[test]
-    fn auth_source_from_env_combines_api_key_and_bearer_token() {
+    fn auth_source_from_env_prefers_api_key_over_proxy_token() {
         let _guard = env_lock();
-        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "auth-token");
-        std::env::set_var("ANTHROPIC_API_KEY", "legacy-key");
+        std::env::set_var("PROXY_AUTH_TOKEN", "proxy-token");
+        std::env::set_var("ANTHROPIC_API_KEY", "api-key");
         let auth = AuthSource::from_env().expect("env auth");
-        assert_eq!(auth.api_key(), Some("legacy-key"));
-        assert_eq!(auth.bearer_token(), Some("auth-token"));
-        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        assert_eq!(auth.api_key(), Some("api-key"));
+        assert_eq!(auth.bearer_token(), None);
+        std::env::remove_var("PROXY_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
 
     #[test]
-    fn auth_source_from_env_or_saved_ignores_saved_oauth_when_env_absent() {
+    fn auth_source_from_env_or_saved_uses_saved_oauth_when_env_absent() {
         let _guard = env_lock();
         let config_home = temp_config_home();
         std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
-        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("PROXY_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
+
         save_oauth_credentials(&runtime::OAuthTokenSet {
             access_token: "saved-access-token".to_string(),
             refresh_token: Some("refresh".to_string()),
@@ -1168,8 +1319,8 @@ mod tests {
         })
         .expect("save oauth credentials");
 
-        let error = AuthSource::from_env_or_saved().expect_err("saved oauth should be ignored");
-        assert!(error.to_string().contains("ANTHROPIC_API_KEY"));
+        let auth = AuthSource::from_env_or_saved().expect("saved oauth should be used");
+        assert_eq!(auth.bearer_token(), Some("saved-access-token"));
 
         clear_oauth_credentials().expect("clear credentials");
         std::env::remove_var("SUDO_CODE_CONFIG_HOME");
@@ -1197,7 +1348,7 @@ mod tests {
         let _guard = env_lock();
         let config_home = temp_config_home();
         std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
-        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("PROXY_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
         save_oauth_credentials(&runtime::OAuthTokenSet {
             access_token: "expired-access-token".to_string(),
@@ -1225,12 +1376,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_startup_auth_source_ignores_saved_oauth_without_loading_config() {
+    fn resolve_startup_auth_source_uses_saved_oauth_when_no_env() {
         let _guard = env_lock();
         let config_home = temp_config_home();
         std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
-        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("PROXY_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
+
         save_oauth_credentials(&runtime::OAuthTokenSet {
             access_token: "saved-access-token".to_string(),
             refresh_token: Some("refresh".to_string()),
@@ -1239,9 +1391,8 @@ mod tests {
         })
         .expect("save oauth credentials");
 
-        let error = resolve_startup_auth_source(|| panic!("config should not be loaded"))
-            .expect_err("saved oauth should be ignored");
-        assert!(error.to_string().contains("ANTHROPIC_API_KEY"));
+        let auth = resolve_startup_auth_source(|| Ok(None)).expect("saved oauth should be used");
+        assert_eq!(auth.bearer_token(), Some("saved-access-token"));
 
         clear_oauth_credentials().expect("clear credentials");
         std::env::remove_var("SUDO_CODE_CONFIG_HOME");
@@ -1253,7 +1404,7 @@ mod tests {
         let _guard = env_lock();
         let config_home = temp_config_home();
         std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
-        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("PROXY_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
         save_oauth_credentials(&runtime::OAuthTokenSet {
             access_token: "expired-access-token".to_string(),
@@ -1576,7 +1727,7 @@ mod tests {
         );
         assert!(
             rendered.contains(
-                "sk-ant-* keys go in ANTHROPIC_API_KEY (x-api-key header), not ANTHROPIC_AUTH_TOKEN (Bearer header). Move your key to ANTHROPIC_API_KEY."
+                "sk-ant-* keys go in ANTHROPIC_API_KEY (x-api-key header), not PROXY_AUTH_TOKEN (Bearer header). Move your key to ANTHROPIC_API_KEY."
             ),
             "rendered error should include the sk-ant-* hint: {rendered}"
         );
