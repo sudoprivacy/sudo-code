@@ -51,6 +51,41 @@ pub struct RuntimePluginConfig {
     max_output_tokens: Option<u32>,
 }
 
+/// A provider endpoint defined in the `"providers"` config section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderConfigEntry {
+    /// Protocol kind: `"anthropic"` or `"openai-compat"`.
+    pub kind: String,
+    /// Env-var name whose value is the API key.
+    pub api_key_env: Option<String>,
+    /// Fixed base URL for this provider.
+    pub base_url: Option<String>,
+    /// Env-var name that overrides the base URL at runtime.
+    pub base_url_env: Option<String>,
+    /// Human-friendly display name for banners.
+    pub display_name: Option<String>,
+}
+
+/// A model binding defined in the `"models"` config section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelConfigEntry {
+    /// Key into the `"providers"` map.
+    pub provider: String,
+    /// The model identifier sent over the wire.
+    pub model_id: String,
+    /// Optional max output tokens.
+    pub max_output_tokens: Option<u32>,
+    /// Optional context window size.
+    pub context_window: Option<u32>,
+}
+
+/// Parsed `"providers"` + `"models"` sections from config.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProvidersConfig {
+    pub providers: BTreeMap<String, ProviderConfigEntry>,
+    pub models: BTreeMap<String, ModelConfigEntry>,
+}
+
 /// Structured feature configuration consumed by runtime subsystems.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeFeatureConfig {
@@ -65,6 +100,7 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    providers_config: ProvidersConfig,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -319,6 +355,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            providers_config: parse_optional_providers_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -418,6 +455,11 @@ impl RuntimeConfig {
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
+
+    #[must_use]
+    pub fn providers_config(&self) -> &ProvidersConfig {
+        &self.feature_config.providers_config
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -486,6 +528,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
+    }
+
+    #[must_use]
+    pub fn providers_config(&self) -> &ProvidersConfig {
+        &self.providers_config
     }
 }
 
@@ -913,6 +960,79 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
         optional_string_array(object, "trustedRoots", "merged settings.trustedRoots")?
             .unwrap_or_default(),
     )
+}
+
+fn parse_optional_providers_config(root: &JsonValue) -> Result<ProvidersConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(ProvidersConfig::default());
+    };
+
+    let providers = parse_providers_section(object)?;
+    let models = parse_models_section(object)?;
+    Ok(ProvidersConfig { providers, models })
+}
+
+fn parse_providers_section(
+    root: &BTreeMap<String, JsonValue>,
+) -> Result<BTreeMap<String, ProviderConfigEntry>, ConfigError> {
+    let Some(value) = root.get("providers") else {
+        return Ok(BTreeMap::new());
+    };
+    let providers_obj = expect_object(value, "merged settings.providers")?;
+    let mut result = BTreeMap::new();
+    for (name, entry_value) in providers_obj {
+        let entry = expect_object(entry_value, &format!("merged settings.providers.{name}"))?;
+        let context = format!("merged settings.providers.{name}");
+        let kind = expect_string(entry, "kind", &context)?.to_string();
+        if kind != "anthropic" && kind != "openai-compat" {
+            return Err(ConfigError::Parse(format!(
+                "{context}: field kind must be \"anthropic\" or \"openai-compat\", got \"{kind}\""
+            )));
+        }
+        let api_key_env = optional_string(entry, "apiKeyEnv", &context)?.map(str::to_string);
+        let base_url = optional_string(entry, "baseUrl", &context)?.map(str::to_string);
+        let base_url_env = optional_string(entry, "baseUrlEnv", &context)?.map(str::to_string);
+        let display_name = optional_string(entry, "displayName", &context)?.map(str::to_string);
+        result.insert(
+            name.clone(),
+            ProviderConfigEntry {
+                kind,
+                api_key_env,
+                base_url,
+                base_url_env,
+                display_name,
+            },
+        );
+    }
+    Ok(result)
+}
+
+fn parse_models_section(
+    root: &BTreeMap<String, JsonValue>,
+) -> Result<BTreeMap<String, ModelConfigEntry>, ConfigError> {
+    let Some(value) = root.get("models") else {
+        return Ok(BTreeMap::new());
+    };
+    let models_obj = expect_object(value, "merged settings.models")?;
+    let mut result = BTreeMap::new();
+    for (name, entry_value) in models_obj {
+        let entry = expect_object(entry_value, &format!("merged settings.models.{name}"))?;
+        let context = format!("merged settings.models.{name}");
+        let provider = expect_string(entry, "provider", &context)?.to_string();
+        let model_id = expect_string(entry, "modelId", &context)?.to_string();
+        let max_output_tokens = optional_u32(entry, "maxOutputTokens", &context)?;
+        let context_window = optional_u32(entry, "contextWindow", &context)?;
+        result.insert(
+            name.to_ascii_lowercase(),
+            ModelConfigEntry {
+                provider,
+                model_id,
+                max_output_tokens,
+                context_window,
+            },
+        );
+    }
+    Ok(result)
 }
 
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {

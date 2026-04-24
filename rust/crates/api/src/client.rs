@@ -2,6 +2,7 @@ use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
+use crate::providers::registry::{ProviderProtocol, ProviderRegistry};
 use crate::providers::{self, AuthMode, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 
@@ -87,6 +88,97 @@ impl ProviderClient {
                         Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
                     }
                 }
+            }
+        }
+    }
+
+    /// Build a `ProviderClient` using the config-driven registry.
+    ///
+    /// Resolution order:
+    /// 1. Look up the model in the registry's config models.
+    /// 2. If found, resolve the provider from config and build accordingly.
+    /// 3. If not found, fall back to the standard `from_model_and_mode` /
+    ///    `from_model` path.
+    pub fn from_model_with_registry(
+        model: &str,
+        registry: &ProviderRegistry,
+        mode: Option<AuthMode>,
+        auth: Option<AuthSource>,
+    ) -> Result<Self, ApiError> {
+        let resolved_alias = registry.resolve_model_alias(model);
+
+        // Try config-driven resolution first.
+        if let Some(config_model) = registry.config_model(model) {
+            if let Some(provider) = registry.config_provider(&config_model.provider) {
+                return Self::from_config_provider(&config_model.model_id, provider, mode, auth);
+            }
+        }
+
+        // Fall back to standard path.
+        match (mode, auth) {
+            (Some(m), Some(a)) => Self::from_model_and_mode(&resolved_alias, m, a),
+            (_, Some(a)) => Self::from_model_with_anthropic_auth(&resolved_alias, Some(a)),
+            _ => Self::from_model(&resolved_alias),
+        }
+    }
+
+    /// Build a `ProviderClient` from an explicit config provider entry.
+    fn from_config_provider(
+        _model_id: &str,
+        provider: &crate::providers::registry::ConfigProvider,
+        mode: Option<AuthMode>,
+        auth: Option<AuthSource>,
+    ) -> Result<Self, ApiError> {
+        match provider.protocol {
+            ProviderProtocol::Anthropic => {
+                // Anthropic protocol: use AnthropicClient.
+                let client = match (mode, auth) {
+                    (Some(m), Some(a)) => {
+                        let base_url = provider
+                            .base_url
+                            .clone()
+                            .unwrap_or_else(|| anthropic::base_url_for_mode(m));
+                        AnthropicClient::from_auth_with_mode(a, Some(m)).with_base_url(base_url)
+                    }
+                    (_, Some(a)) => {
+                        let mut client = AnthropicClient::from_auth(a);
+                        if let Some(url) = &provider.base_url {
+                            client = client.with_base_url(url.clone());
+                        } else {
+                            client = client.with_base_url(anthropic::read_base_url());
+                        }
+                        client
+                    }
+                    _ => {
+                        let mut client = AnthropicClient::from_env()?;
+                        if let Some(url) = &provider.base_url {
+                            client = client.with_base_url(url.clone());
+                        }
+                        client
+                    }
+                };
+                Ok(Self::Anthropic(client))
+            }
+            ProviderProtocol::OpenAiCompat => {
+                // OpenAI-compat protocol: build OpenAiCompatConfig from the
+                // config provider entry.
+                let config = ProviderRegistry::openai_compat_config_for(provider)
+                    .unwrap_or_else(OpenAiCompatConfig::openai);
+                let mut client = OpenAiCompatClient::from_env(config)?;
+                // If the provider specifies a fixed base_url that differs
+                // from what from_env resolved (which reads the env var),
+                // override it.  The env var takes precedence only when set.
+                if let Some(url) = &provider.base_url {
+                    let env_key = provider.base_url_env.as_deref().unwrap_or("");
+                    let env_set = !env_key.is_empty()
+                        && std::env::var(env_key)
+                            .ok()
+                            .is_some_and(|v| !v.trim().is_empty());
+                    if !env_set {
+                        client = client.with_base_url(url.clone());
+                    }
+                }
+                Ok(Self::OpenAi(client))
             }
         }
     }

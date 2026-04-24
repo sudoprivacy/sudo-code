@@ -1515,6 +1515,14 @@ fn resolve_model_alias(model: &str) -> &str {
 /// user-supplied model string is about to be dispatched to a provider.
 fn resolve_model_alias_with_config(model: &str) -> String {
     let trimmed = model.trim();
+    // Check config-driven model registry first.
+    let registry = load_provider_registry_for_current_dir();
+    if !registry.is_config_empty() {
+        if let Some(entry) = registry.config_model(trimmed) {
+            return entry.model_id.clone();
+        }
+    }
+    // Then check config aliases.
     if let Some(resolved) = config_alias_for_current_dir(trimmed) {
         return resolve_model_alias(&resolved).to_string();
     }
@@ -1575,6 +1583,69 @@ fn config_alias_for_current_dir(alias: &str) -> Option<String> {
     let loader = ConfigLoader::default_for(&cwd);
     let config = loader.load().ok()?;
     config.aliases().get(alias).cloned()
+}
+
+/// Build a [`ProviderRegistry`] from the config for the current directory.
+fn load_provider_registry_for_current_dir() -> api::ProviderRegistry {
+    let Ok(cwd) = env::current_dir() else {
+        return api::ProviderRegistry::default();
+    };
+    load_provider_registry_for_cwd(&cwd)
+}
+
+/// Build a [`ProviderRegistry`] from the config for the given directory.
+fn load_provider_registry_for_cwd(cwd: &Path) -> api::ProviderRegistry {
+    let loader = ConfigLoader::default_for(cwd);
+    let Ok(config) = loader.load() else {
+        return api::ProviderRegistry::default();
+    };
+    build_provider_registry(config.providers_config())
+}
+
+/// Convert the parsed config types into the API-layer [`ProviderRegistry`].
+fn build_provider_registry(config: &runtime::config::ProvidersConfig) -> api::ProviderRegistry {
+    if config.providers.is_empty() && config.models.is_empty() {
+        return api::ProviderRegistry::default();
+    }
+
+    let providers = config
+        .providers
+        .iter()
+        .map(|(name, entry)| {
+            let protocol = match entry.kind.as_str() {
+                "anthropic" => api::ProviderProtocol::Anthropic,
+                _ => api::ProviderProtocol::OpenAiCompat,
+            };
+            (
+                name.clone(),
+                api::ConfigProvider {
+                    protocol,
+                    api_key_env: entry.api_key_env.clone(),
+                    base_url: entry.base_url.clone(),
+                    base_url_env: entry.base_url_env.clone(),
+                    display_name: entry.display_name.clone(),
+                },
+            )
+        })
+        .collect();
+
+    let models = config
+        .models
+        .iter()
+        .map(|(name, entry)| {
+            (
+                name.clone(),
+                api::ConfigModel {
+                    provider: entry.provider.clone(),
+                    model_id: entry.model_id.clone(),
+                    max_output_tokens: entry.max_output_tokens,
+                    context_window: entry.context_window,
+                },
+            )
+        })
+        .collect();
+
+    api::ProviderRegistry::new(providers, models)
 }
 
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
@@ -1684,7 +1755,19 @@ fn format_connected_line(model: &str) -> String {
 }
 
 fn format_connected_line_with_mode(model: &str, mode: Option<AuthMode>) -> String {
-    let provider = provider_label(detect_provider_kind(model));
+    format_connected_line_with_registry(model, mode, &api::ProviderRegistry::default())
+}
+
+fn format_connected_line_with_registry(
+    model: &str,
+    mode: Option<AuthMode>,
+    registry: &api::ProviderRegistry,
+) -> String {
+    // Use registry display name if available, otherwise fall back to provider kind label.
+    let provider = registry
+        .metadata_for_model(model)
+        .and_then(|meta| meta.display_name)
+        .unwrap_or_else(|| provider_label(registry.detect_provider_kind(model)).to_string());
     let resolved_mode = mode.or_else(|| resolve_auth_mode(None).ok());
     let auth_hint = match resolved_mode {
         Some(m) => format!(" ({})", m.label()),
@@ -3759,7 +3842,11 @@ fn run_repl(
     println!("{}", cli.startup_banner());
     println!(
         "{}",
-        format_connected_line_with_mode(&cli.config.model, auth_mode)
+        format_connected_line_with_registry(
+            &cli.config.model,
+            auth_mode,
+            &cli.config.provider_registry
+        )
     );
 
     loop {
@@ -3862,6 +3949,7 @@ struct RuntimeConfig {
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
     auth_mode: Option<AuthMode>,
+    provider_registry: api::ProviderRegistry,
 }
 
 struct RuntimeMcpState {
@@ -4011,6 +4099,7 @@ impl AcpCliAgent {
                 permission_mode,
                 progress_reporter: None,
                 auth_mode: self.auth_mode,
+                provider_registry: load_provider_registry_for_cwd(&cwd),
             },
         )
         .map_err(|error| AcpError::internal(format!("failed to build runtime: {error}")))?;
@@ -4533,6 +4622,7 @@ impl LiveCli {
             permission_mode,
             progress_reporter: None,
             auth_mode,
+            provider_registry: load_provider_registry_for_current_dir(),
         };
         let runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
@@ -7754,7 +7844,8 @@ impl AnthropicRuntimeClient {
         config: &RuntimeConfig,
         tool_registry: GlobalToolRegistry,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let resolved_model = api::resolve_model_alias(&config.model);
+        let registry = &config.provider_registry;
+        let resolved_model = registry.resolve_model_alias(&config.model);
         // Resolve the effective auth mode: use the explicit --auth flag if
         // provided, otherwise auto-detect from env vars.  Once we have
         // a mode, the same from_model_and_mode path handles all routing.
@@ -7765,7 +7856,18 @@ impl AnthropicRuntimeClient {
             }
             None => resolve_auth_mode(None).ok(),
         };
-        let client = if let Some(mode) = effective_mode {
+
+        // Try config-driven resolution first.
+        let client = if !registry.is_config_empty() {
+            let auth = effective_mode.map(AuthSource::for_mode).transpose()?;
+            ApiProviderClient::from_model_with_registry(
+                &config.model,
+                registry,
+                effective_mode,
+                auth,
+            )?
+            .with_prompt_cache(PromptCache::new(session_id))
+        } else if let Some(mode) = effective_mode {
             let auth = AuthSource::for_mode(mode)?;
             ApiProviderClient::from_model_and_mode(&resolved_model, mode, auth)?
                 .with_prompt_cache(PromptCache::new(session_id))
@@ -13217,6 +13319,7 @@ UU conflicted.rs",
                 permission_mode: PermissionMode::DangerFullAccess,
                 progress_reporter: None,
                 auth_mode: None,
+                provider_registry: api::ProviderRegistry::default(),
             },
             runtime_plugin_state,
         )
