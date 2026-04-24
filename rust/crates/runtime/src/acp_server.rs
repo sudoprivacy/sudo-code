@@ -151,7 +151,7 @@ impl<'a> AcpSessionUpdateObserver<'a> {
         }
     }
 
-    fn notify_update(&mut self, update: Value) {
+    fn notify_update(&mut self, update: &Value) {
         if self.write_error.is_some() {
             return;
         }
@@ -171,7 +171,7 @@ impl<'a> AcpSessionUpdateObserver<'a> {
 
 impl RuntimeObserver for AcpSessionUpdateObserver<'_> {
     fn on_text_delta(&mut self, delta: &str) {
-        self.notify_update(json!({
+        self.notify_update(&json!({
             "sessionUpdate": "agent_message_chunk",
             "content": {
                 "type": "text",
@@ -181,7 +181,7 @@ impl RuntimeObserver for AcpSessionUpdateObserver<'_> {
     }
 
     fn on_tool_use(&mut self, id: &str, name: &str, input: &str) {
-        self.notify_update(json!({
+        self.notify_update(&json!({
             "sessionUpdate": "tool_call",
             "toolCallId": id,
             "title": name,
@@ -198,7 +198,7 @@ impl RuntimeObserver for AcpSessionUpdateObserver<'_> {
         output: &str,
         is_error: bool,
     ) {
-        self.notify_update(json!({
+        self.notify_update(&json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": tool_use_id,
             "status": if is_error { "failed" } else { "completed" },
@@ -238,7 +238,7 @@ where
 ///
 /// All stdout writes go through JSON-RPC framing. Diagnostics should be
 /// propagated as errors and rendered by callers on stderr.
-pub fn run_acp_stdio_server<A>(agent: A, options: AcpServerOptions) -> Result<(), AcpServerError>
+pub fn run_acp_stdio_server<A>(agent: A, options: &AcpServerOptions) -> Result<(), AcpServerError>
 where
     A: AcpAgent,
 {
@@ -252,7 +252,7 @@ pub fn run_acp_server_with_io<A, R, W>(
     mut agent: A,
     mut reader: R,
     mut writer: W,
-    options: AcpServerOptions,
+    options: &AcpServerOptions,
 ) -> Result<(), AcpServerError>
 where
     A: AcpAgent,
@@ -269,7 +269,7 @@ where
         let Some(payload) = runtime.block_on(read_msg(&mut reader))? else {
             break;
         };
-        handle_payload(&mut agent, &options, &payload, &mut sink)?;
+        handle_payload(&mut agent, options, &payload, &mut sink)?;
     }
     Ok(())
 }
@@ -284,9 +284,9 @@ where
     A: AcpAgent,
 {
     match serde_json::from_slice::<Value>(payload) {
-        Ok(value) => handle_value(agent, options, value, sink),
+        Ok(value) => handle_value(agent, options, &value, sink),
         Err(error) => sink.send_value(&error_response(
-            Value::Null,
+            &Value::Null,
             PARSE_ERROR,
             format!("parse error: {error}"),
         )),
@@ -296,7 +296,7 @@ where
 fn handle_value<A>(
     agent: &mut A,
     options: &AcpServerOptions,
-    value: Value,
+    value: &Value,
     sink: &mut dyn AcpMessageSink,
 ) -> io::Result<()>
 where
@@ -304,7 +304,7 @@ where
 {
     let Some(object) = value.as_object() else {
         return sink.send_value(&error_response(
-            Value::Null,
+            &Value::Null,
             INVALID_REQUEST,
             "JSON-RPC request must be an object",
         ));
@@ -318,7 +318,7 @@ where
             return Ok(());
         }
         return sink.send_value(&error_response(
-            response_id,
+            &response_id,
             INVALID_REQUEST,
             "JSON-RPC request method must be a string",
         ));
@@ -342,15 +342,15 @@ where
     }
 
     match result {
-        Ok(result) => sink.send_value(&success_response(response_id, result)),
+        Ok(result) => sink.send_value(&success_response(&response_id, &result)),
         Err(AcpError::InvalidParams(message)) if message == "__method_not_found__" => sink
             .send_value(&error_response(
-                response_id,
+                &response_id,
                 METHOD_NOT_FOUND,
                 format!("method not found: {method}"),
             )),
         Err(error) => sink.send_value(&error_response(
-            response_id,
+            &response_id,
             error.code(),
             error.message().to_string(),
         )),
@@ -486,12 +486,11 @@ fn extract_text_block(block: &Value) -> Option<String> {
             .map(str::trim)
             .filter(|text| !text.is_empty())
             .map(ToOwned::to_owned),
-        Some("resource_link") => None,
         _ => None,
     }
 }
 
-fn success_response(id: Value, result: Value) -> Value {
+fn success_response(id: &Value, result: &Value) -> Value {
     json!({
         "jsonrpc": JSONRPC_VERSION,
         "id": id,
@@ -499,7 +498,7 @@ fn success_response(id: Value, result: Value) -> Value {
     })
 }
 
-fn error_response(id: Value, code: i64, message: impl Into<String>) -> Value {
+fn error_response(id: &Value, code: i64, message: impl Into<String>) -> Value {
     json!({
         "jsonrpc": JSONRPC_VERSION,
         "id": id,
@@ -566,7 +565,7 @@ mod tests {
         }
     }
 
-    fn request(id: i64, method: &str, params: Value) -> Value {
+    fn request(id: i64, method: &str, params: &Value) -> Value {
         json!({
             "jsonrpc": JSONRPC_VERSION,
             "id": id,
@@ -584,7 +583,7 @@ mod tests {
         handle_value(
             &mut agent,
             &options,
-            request(1, "initialize", json!({ "protocolVersion": 42 })),
+            &request(1, "initialize", &json!({ "protocolVersion": 42 })),
             &mut sink,
         )
         .expect("initialize should handle");
@@ -614,7 +613,7 @@ mod tests {
         handle_value(
             &mut agent,
             &options,
-            json!({ "jsonrpc": JSONRPC_VERSION, "method": "unknown/notification" }),
+            &json!({ "jsonrpc": JSONRPC_VERSION, "method": "unknown/notification" }),
             &mut sink,
         )
         .expect("notification should handle");
@@ -631,7 +630,7 @@ mod tests {
         handle_value(
             &mut agent,
             &options,
-            request(7, "missing/method", json!({})),
+            &request(7, "missing/method", &json!({})),
             &mut sink,
         )
         .expect("unknown method should handle");
@@ -650,7 +649,7 @@ mod tests {
         handle_value(
             &mut agent,
             &options,
-            request(2, "session/new", json!({ "cwd": "relative/path" })),
+            &request(2, "session/new", &json!({ "cwd": "relative/path" })),
             &mut sink,
         )
         .expect("session/new should handle");
@@ -670,10 +669,10 @@ mod tests {
         handle_value(
             &mut agent,
             &options,
-            request(
+            &request(
                 3,
                 "session/prompt",
-                json!({
+                &json!({
                     "sessionId": "session-1",
                     "prompt": {
                         "content": [
@@ -718,10 +717,10 @@ mod tests {
         handle_value(
             &mut agent,
             &options,
-            request(
+            &request(
                 4,
                 "session/prompt",
-                json!({
+                &json!({
                     "sessionId": "session-1",
                     "prompt": {
                         "content": [{ "type": "resource_link", "uri": "file:///tmp/a.txt" }]
