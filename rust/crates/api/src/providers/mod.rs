@@ -8,6 +8,7 @@ use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
+pub mod codex;
 pub mod openai_compat;
 pub mod registry;
 
@@ -148,6 +149,7 @@ pub enum ProviderKind {
     Anthropic,
     Xai,
     OpenAi,
+    Codex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,6 +248,15 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
         },
     ),
+    (
+        "codex",
+        ProviderMetadata {
+            provider: ProviderKind::Codex,
+            auth_env: "CODEX_AUTH_FILE",
+            base_url_env: "CODEX_BASE_URL",
+            default_base_url: codex::DEFAULT_CODEX_BASE_URL,
+        },
+    ),
 ];
 
 #[must_use]
@@ -270,6 +281,10 @@ pub fn resolve_model_alias(model: &str) -> String {
                 },
                 ProviderKind::OpenAi => match *alias {
                     "kimi" => "kimi-k2.5",
+                    _ => trimmed,
+                },
+                ProviderKind::Codex => match *alias {
+                    "codex" => "codex/gpt-5.4-mini",
                     _ => trimmed,
                 },
             })
@@ -329,6 +344,16 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             auth_env: "DASHSCOPE_API_KEY",
             base_url_env: "DASHSCOPE_BASE_URL",
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
+        });
+    }
+    // OpenAI Codex subscription models routed via chatgpt.com backend.
+    // Matches codex/ prefix. Auth comes from ~/.codex/auth.json.
+    if canonical.starts_with("codex/") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::Codex,
+            auth_env: "CODEX_AUTH_FILE",
+            base_url_env: "CODEX_BASE_URL",
+            default_base_url: codex::DEFAULT_CODEX_BASE_URL,
         });
     }
     None
@@ -410,6 +435,15 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 16_384,
             context_window_tokens: 256_000,
         }),
+        // OpenAI Codex subscription models via chatgpt.com backend.
+        // Strip codex/ prefix before matching.
+        _ if canonical.starts_with("codex/") => match &canonical["codex/".len()..] {
+            "gpt-5.4-mini" | "gpt-5.4" | "gpt-5.5" => Some(ModelTokenLimit {
+                max_output_tokens: 64_000,
+                context_window_tokens: 200_000,
+            }),
+            _ => None,
+        },
         _ => None,
     }
 }
