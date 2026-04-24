@@ -30,11 +30,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AnthropicRequestProfile,
-    AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
-    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
+    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -1655,7 +1654,12 @@ fn provider_label(kind: ProviderKind) -> &'static str {
 
 fn format_connected_line(model: &str) -> String {
     let provider = provider_label(detect_provider_kind(model));
-    format!("Connected: {model} via {provider}")
+    let auth_hint = if api::is_claude_code_oauth_token() {
+        " (subscription)"
+    } else {
+        ""
+    };
+    format!("Connected: {model} via {provider}{auth_hint}")
 }
 
 fn filter_tool_specs(
@@ -7819,13 +7823,17 @@ impl AnthropicRuntimeClient {
                     .with_base_url(api::read_base_url())
                     .with_prompt_cache(PromptCache::new(session_id));
                 if api::is_claude_code_oauth_token() {
-                    // Replace the default betas with only the OAuth beta.
-                    // The default claude-code-20250219 beta routes to a
-                    // backend that rejects raw OAuth tokens.
-                    inner = inner.with_request_profile(
-                        AnthropicRequestProfile::default()
-                            .with_betas(vec!["oauth-2025-04-20".to_string()]),
-                    );
+                    // OAuth tokens require:
+                    // 1. Direct Anthropic API (not proxies)
+                    // 2. The oauth-2025-04-20 beta header
+                    // 3. System prompt split into array blocks where the
+                    //    first block is the exact magic prefix string
+                    inner = inner
+                        .with_base_url("https://api.anthropic.com".to_string())
+                        .with_beta("oauth-2025-04-20")
+                        .with_oauth_system_prefix(
+                            "You are Claude Code, Anthropic's official CLI for Claude.",
+                        );
                 }
                 ApiProviderClient::Anthropic(inner)
             }

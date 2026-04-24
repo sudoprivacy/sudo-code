@@ -122,6 +122,12 @@ pub struct AnthropicClient {
     session_tracer: Option<SessionTracer>,
     prompt_cache: Option<PromptCache>,
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
+    /// When set, the `system` field in outgoing requests is split into an
+    /// array of content blocks: the first block contains this exact prefix
+    /// string, and the second block contains the remainder. This is required
+    /// for OAuth subscription tokens where Anthropic gates access by checking
+    /// the first system block for an exact match.
+    oauth_system_prefix: Option<String>,
 }
 
 impl AnthropicClient {
@@ -138,6 +144,7 @@ impl AnthropicClient {
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
+            oauth_system_prefix: None,
         }
     }
 
@@ -154,6 +161,7 @@ impl AnthropicClient {
             session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
+            oauth_system_prefix: None,
         }
     }
 
@@ -272,6 +280,12 @@ impl AnthropicClient {
     #[must_use]
     pub fn with_request_profile(mut self, request_profile: AnthropicRequestProfile) -> Self {
         self.request_profile = request_profile;
+        self
+    }
+
+    #[must_use]
+    pub fn with_oauth_system_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.oauth_system_prefix = Some(prefix.into());
         self
     }
 
@@ -470,6 +484,7 @@ impl AnthropicClient {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
+        self.split_system_for_oauth(&mut request_body);
         let request_builder = self.build_request(&request_url).json(&request_body);
         request_builder.send().await.map_err(ApiError::from)
     }
@@ -484,6 +499,41 @@ impl AnthropicClient {
             request_builder = request_builder.header(header_name, header_value);
         }
         request_builder
+    }
+
+    /// When `oauth_system_prefix` is set, transform the `system` field from
+    /// a single string into an array of content blocks so the first block
+    /// contains the exact prefix the server expects for OAuth token access.
+    fn split_system_for_oauth(&self, body: &mut Value) {
+        let Some(prefix) = &self.oauth_system_prefix else {
+            return;
+        };
+        let Some(obj) = body.as_object_mut() else {
+            return;
+        };
+        let Some(system_val) = obj.remove("system") else {
+            return;
+        };
+        let system_str = match system_val.as_str() {
+            Some(s) => s.to_string(),
+            None => {
+                // Already an array or non-string — put it back.
+                obj.insert("system".to_string(), system_val);
+                return;
+            }
+        };
+        let mut blocks = vec![serde_json::json!({"type": "text", "text": prefix})];
+        // Strip the prefix from the full system prompt to get the remainder.
+        let remainder = system_str
+            .strip_prefix(prefix.as_str())
+            .unwrap_or(&system_str);
+        let remainder = remainder
+            .trim_start_matches("\n\n")
+            .trim_start_matches('\n');
+        if !remainder.is_empty() {
+            blocks.push(serde_json::json!({"type": "text", "text": remainder}));
+        }
+        obj.insert("system".to_string(), Value::Array(blocks));
     }
 
     async fn preflight_message_request(&self, request: &MessageRequest) -> Result<(), ApiError> {
@@ -531,6 +581,7 @@ impl AnthropicClient {
         );
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
+        self.split_system_for_oauth(&mut request_body);
         let response = self
             .build_request(&request_url)
             .json(&request_body)
