@@ -19,7 +19,8 @@ pub use prompt_cache::{
     PromptCacheStats,
 };
 pub use providers::anthropic::{
-    is_claude_code_oauth_token, AnthropicClient, AnthropicClient as ApiClient, AuthSource,
+    is_anthropic_auth_token, is_claude_code_oauth_token, AnthropicClient,
+    AnthropicClient as ApiClient, AuthSource,
 };
 pub use providers::openai_compat::{
     build_chat_completion_request, flatten_tool_result_content, is_reasoning_model,

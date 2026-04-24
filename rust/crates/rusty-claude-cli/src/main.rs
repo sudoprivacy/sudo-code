@@ -1650,11 +1650,7 @@ fn format_connected_line(model: &str) -> String {
     let provider = provider_label(detect_provider_kind(model));
     let auth_hint = if api::is_claude_code_oauth_token() {
         " (subscription)"
-    } else if std::env::var("ANTHROPIC_AUTH_TOKEN")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .is_some()
-    {
+    } else if api::is_anthropic_auth_token() {
         " (proxy)"
     } else {
         ""

@@ -711,6 +711,14 @@ pub fn is_claude_code_oauth_token() -> bool {
         .is_some()
 }
 
+/// Returns `true` when `ANTHROPIC_AUTH_TOKEN` is set and non-empty.
+pub fn is_anthropic_auth_token() -> bool {
+    read_env_non_empty("ANTHROPIC_AUTH_TOKEN")
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 #[must_use]
 pub fn oauth_token_is_expired(token_set: &OAuthTokenSet) -> bool {
     token_set
