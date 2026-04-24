@@ -547,7 +547,11 @@ mod tests {
         // given
         let error = ApiError::missing_credentials(
             "Anthropic",
-            &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
+            &[
+                "ANTHROPIC_API_KEY",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "PROXY_AUTH_TOKEN",
+            ],
         );
 
         // when
@@ -556,7 +560,7 @@ mod tests {
         // then
         assert!(
             rendered.starts_with(
-                "missing Anthropic credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY before calling the Anthropic API"
+                "missing Anthropic credentials; export ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN or PROXY_AUTH_TOKEN before calling the Anthropic API"
             ),
             "rendered error should lead with the canonical missing-credential message: {rendered}"
         );
@@ -571,7 +575,7 @@ mod tests {
         // given
         let error = ApiError::missing_credentials_with_hint(
             "Anthropic",
-            &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
+            &["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "PROXY_AUTH_TOKEN"],
             "I see OPENAI_API_KEY is set — if you meant to use the OpenAI-compat provider, prefix your model name with `openai/` so prefix routing selects it.",
         );
 

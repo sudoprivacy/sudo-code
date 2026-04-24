@@ -30,10 +30,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    base_url_for_mode, detect_provider_kind, resolve_auth_mode, resolve_startup_auth_source,
+    validate_auth_env, AnthropicClient, AuthMode, AuthSource, ContentBlockDelta, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
+    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -185,6 +186,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--version",
     "-V",
     "--model",
+    "--auth",
     "--output-format",
     "--permission-mode",
     "--dangerously-skip-permissions",
@@ -397,6 +399,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            auth_mode,
         } => {
             enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
             run_stale_base_preflight(base_commit.as_deref());
@@ -411,7 +414,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode, auth_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
@@ -422,12 +425,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allowed_tools,
             permission_mode_override,
             reasoning_effort,
+            auth_mode,
         } => run_acp_server(
             model,
             model_flag_raw,
             allowed_tools,
             permission_mode_override,
             reasoning_effort,
+            auth_mode,
         )?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
@@ -472,6 +477,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            auth_mode,
         } => run_repl(
             model,
             allowed_tools,
@@ -479,6 +485,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            auth_mode,
         )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
@@ -547,6 +554,7 @@ enum CliAction {
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
+        auth_mode: Option<AuthMode>,
     },
     Doctor {
         output_format: CliOutputFormat,
@@ -557,6 +565,7 @@ enum CliAction {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode_override: Option<PermissionMode>,
         reasoning_effort: Option<String>,
+        auth_mode: Option<AuthMode>,
     },
     State {
         output_format: CliOutputFormat,
@@ -585,6 +594,7 @@ enum CliAction {
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
+        auth_mode: Option<AuthMode>,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -634,6 +644,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     // #148: when user passes --model/--model=, capture the raw input so we
     // can attribute source: "flag" later. None means no flag was supplied.
     let mut model_flag_raw: Option<String> = None;
+    let mut auth_mode: Option<AuthMode> = None;
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
     let mut wants_help = false;
@@ -685,6 +696,17 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 validate_model_syntax(value)?;
                 model = resolve_model_alias_with_config(value);
                 model_flag_raw = Some(value.to_string()); // #148
+                index += 1;
+            }
+            "--auth" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --auth; must be subscription, proxy, or api-key".to_string())?;
+                auth_mode = Some(AuthMode::parse(value)?);
+                index += 2;
+            }
+            flag if flag.starts_with("--auth=") => {
+                auth_mode = Some(AuthMode::parse(&flag[7..])?);
                 index += 1;
             }
             "--output-format" => {
@@ -771,6 +793,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     base_commit: base_commit.clone(),
                     reasoning_effort: reasoning_effort.clone(),
                     allow_broad_cwd,
+                    auth_mode,
                 });
             }
             "--print" => {
@@ -847,6 +870,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     base_commit,
                     reasoning_effort,
                     allow_broad_cwd,
+                    auth_mode,
                 });
             }
         }
@@ -857,6 +881,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             base_commit,
             reasoning_effort: reasoning_effort.clone(),
             allow_broad_cwd,
+            auth_mode,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -957,6 +982,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
                     allow_broad_cwd,
+                    auth_mode,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -972,6 +998,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allowed_tools,
             permission_mode_override,
             reasoning_effort,
+            auth_mode,
         ),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => Ok(CliAction::Init { output_format }),
@@ -991,6 +1018,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 base_commit: base_commit.clone(),
                 reasoning_effort: reasoning_effort.clone(),
                 allow_broad_cwd,
+                auth_mode,
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
@@ -1003,6 +1031,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            auth_mode,
         ),
         other => {
             if rest.len() == 1 && looks_like_subcommand_typo(other) {
@@ -1041,6 +1070,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 base_commit,
                 reasoning_effort: reasoning_effort.clone(),
                 allow_broad_cwd,
+                auth_mode,
             })
         }
     }
@@ -1171,9 +1201,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
 }
 
 fn removed_auth_surface_error(command_name: &str) -> String {
-    format!(
-        "`scode {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
-    )
+    format!("`scode {command_name}` has been removed. Set ANTHROPIC_API_KEY or use --auth instead.")
 }
 
 fn parse_acp_args(
@@ -1183,6 +1211,7 @@ fn parse_acp_args(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode_override: Option<PermissionMode>,
     reasoning_effort: Option<String>,
+    auth_mode: Option<AuthMode>,
 ) -> Result<CliAction, String> {
     match args {
         [] => Ok(CliAction::Acp {
@@ -1191,6 +1220,7 @@ fn parse_acp_args(
             allowed_tools,
             permission_mode_override,
             reasoning_effort,
+            auth_mode,
         }),
         [subcommand] if subcommand == "serve" => Ok(CliAction::Acp {
             model,
@@ -1198,6 +1228,7 @@ fn parse_acp_args(
             allowed_tools,
             permission_mode_override,
             reasoning_effort,
+            auth_mode,
         }),
         _ => Err(String::from(
             "unsupported ACP invocation. Use `scode acp`, `scode acp serve`, `scode --acp`, or `scode -acp`.",
@@ -1238,6 +1269,7 @@ fn parse_direct_slash_cli_action(
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
+    auth_mode: Option<AuthMode>,
 ) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
@@ -1267,6 +1299,7 @@ fn parse_direct_slash_cli_action(
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
                     allow_broad_cwd,
+                    auth_mode,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -1647,17 +1680,20 @@ fn provider_label(kind: ProviderKind) -> &'static str {
 }
 
 fn format_connected_line(model: &str) -> String {
+    format_connected_line_with_mode(model, None)
+}
+
+fn format_connected_line_with_mode(model: &str, mode: Option<AuthMode>) -> String {
     let provider = provider_label(detect_provider_kind(model));
-    let auth_hint = if api::is_claude_code_oauth_token() {
-        " (subscription)"
-    } else if api::is_anthropic_auth_token() {
-        " (proxy)"
-    } else if api::is_anthropic_api_key() {
-        " (api key)"
-    } else {
-        ""
+    let resolved_mode = mode.or_else(|| resolve_auth_mode(None).ok());
+    let auth_hint = match resolved_mode {
+        Some(m) => format!(" ({})", m.label()),
+        None => String::new(),
     };
-    let base_url = api::read_base_url();
+    let base_url = match mode {
+        Some(m) => api::base_url_for_mode(m),
+        None => api::read_base_url(),
+    };
     let endpoint_hint = if base_url != api::DEFAULT_BASE_URL {
         format!("\nEndpoint:  {base_url}")
     } else {
@@ -2144,13 +2180,13 @@ fn check_auth_health() -> DiagnosticCheck {
     let api_key_present = env::var("ANTHROPIC_API_KEY")
         .ok()
         .is_some_and(|value| !value.trim().is_empty());
-    let auth_token_present = env::var("ANTHROPIC_AUTH_TOKEN")
+    let proxy_token_present = env::var("PROXY_AUTH_TOKEN")
         .ok()
         .is_some_and(|value| !value.trim().is_empty());
     let env_details = format!(
-        "Environment       api_key={} auth_token={}",
+        "Environment       api_key={} proxy_token={}",
         if api_key_present { "present" } else { "absent" },
-        if auth_token_present {
+        if proxy_token_present {
             "present"
         } else {
             "absent"
@@ -2160,12 +2196,12 @@ fn check_auth_health() -> DiagnosticCheck {
     match load_oauth_credentials() {
         Ok(Some(token_set)) => DiagnosticCheck::new(
             "Auth",
-            if api_key_present || auth_token_present {
+            if api_key_present || proxy_token_present {
                 DiagnosticLevel::Ok
             } else {
                 DiagnosticLevel::Warn
             },
-            if api_key_present || auth_token_present {
+            if api_key_present || proxy_token_present {
                 "supported auth env vars are configured; legacy saved OAuth is ignored"
             } else {
                 "legacy saved OAuth credentials are present but unsupported"
@@ -2189,12 +2225,15 @@ fn check_auth_health() -> DiagnosticCheck {
                     token_set.scopes.join(",")
                 }
             ),
-            "Suggested action  set ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or CLAUDE_CODE_OAUTH_TOKEN"
+            "Suggested action  set ANTHROPIC_API_KEY, PROXY_AUTH_TOKEN, or CLAUDE_CODE_OAUTH_TOKEN"
                 .to_string(),
         ])
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
-            ("auth_token_present".to_string(), json!(auth_token_present)),
+            (
+                "proxy_token_present".to_string(),
+                json!(proxy_token_present),
+            ),
             ("legacy_saved_oauth_present".to_string(), json!(true)),
             (
                 "legacy_saved_oauth_expires_at".to_string(),
@@ -2208,12 +2247,12 @@ fn check_auth_health() -> DiagnosticCheck {
         ])),
         Ok(None) => DiagnosticCheck::new(
             "Auth",
-            if api_key_present || auth_token_present {
+            if api_key_present || proxy_token_present {
                 DiagnosticLevel::Ok
             } else {
                 DiagnosticLevel::Warn
             },
-            if api_key_present || auth_token_present {
+            if api_key_present || proxy_token_present {
                 "supported auth env vars are configured"
             } else {
                 "no supported auth env vars were found"
@@ -2222,7 +2261,10 @@ fn check_auth_health() -> DiagnosticCheck {
         .with_details(vec![env_details])
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
-            ("auth_token_present".to_string(), json!(auth_token_present)),
+            (
+                "proxy_token_present".to_string(),
+                json!(proxy_token_present),
+            ),
             ("legacy_saved_oauth_present".to_string(), json!(false)),
             ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
             ("legacy_refresh_token_present".to_string(), json!(false)),
@@ -2235,12 +2277,18 @@ fn check_auth_health() -> DiagnosticCheck {
         )
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
-            ("auth_token_present".to_string(), json!(auth_token_present)),
+            (
+                "proxy_token_present".to_string(),
+                json!(proxy_token_present),
+            ),
             ("legacy_saved_oauth_present".to_string(), Value::Null),
             ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
             ("legacy_refresh_token_present".to_string(), Value::Null),
             ("legacy_scopes".to_string(), Value::Null),
-            ("legacy_saved_oauth_error".to_string(), json!(error.to_string())),
+            (
+                "legacy_saved_oauth_error".to_string(),
+                json!(error.to_string()),
+            ),
         ])),
     }
 }
@@ -3642,16 +3690,23 @@ fn run_repl(
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
+    auth_mode: Option<AuthMode>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(
+        resolved_model,
+        true,
+        allowed_tools,
+        permission_mode,
+        auth_mode,
+    )?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
-    println!("{}", format_connected_line(&cli.model));
+    println!("{}", format_connected_line_with_mode(&cli.model, auth_mode));
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
@@ -3728,6 +3783,7 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    auth_mode: Option<AuthMode>,
 }
 
 #[derive(Debug, Clone)]
@@ -3841,6 +3897,7 @@ struct AcpCliAgent {
     allowed_tools: Option<AllowedToolSet>,
     permission_mode_override: Option<PermissionMode>,
     reasoning_effort: Option<String>,
+    auth_mode: Option<AuthMode>,
     sessions: HashMap<String, AcpCliSession>,
 }
 
@@ -3851,6 +3908,7 @@ impl AcpCliAgent {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode_override: Option<PermissionMode>,
         reasoning_effort: Option<String>,
+        auth_mode: Option<AuthMode>,
     ) -> Self {
         Self {
             model,
@@ -3858,6 +3916,7 @@ impl AcpCliAgent {
             allowed_tools,
             permission_mode_override,
             reasoning_effort,
+            auth_mode,
             sessions: HashMap::new(),
         }
     }
@@ -3885,6 +3944,7 @@ impl AcpCliAgent {
             self.allowed_tools.clone(),
             permission_mode,
             None,
+            self.auth_mode,
         )
         .map_err(|error| AcpError::internal(format!("failed to build runtime: {error}")))?;
         if let Some(runtime) = runtime.runtime.as_mut() {
@@ -3994,6 +4054,7 @@ fn run_acp_server(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode_override: Option<PermissionMode>,
     reasoning_effort: Option<String>,
+    auth_mode: Option<AuthMode>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let agent = AcpCliAgent::new(
         model,
@@ -4001,6 +4062,7 @@ fn run_acp_server(
         allowed_tools,
         permission_mode_override,
         reasoning_effort,
+        auth_mode,
     );
     runtime::run_acp_stdio_server(agent, runtime::AcpServerOptions::new(VERSION))?;
     Ok(())
@@ -4390,6 +4452,7 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        auth_mode: Option<AuthMode>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let session_state = new_cli_session()?;
@@ -4404,6 +4467,7 @@ impl LiveCli {
             allowed_tools.clone(),
             permission_mode,
             None,
+            auth_mode,
         )?;
         let cli = Self {
             model,
@@ -4413,6 +4477,7 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            auth_mode,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4494,6 +4559,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.auth_mode,
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
@@ -4940,6 +5006,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.auth_mode,
         )?;
         self.replace_runtime(runtime)?;
         self.model.clone_from(&model);
@@ -4986,6 +5053,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.auth_mode,
         )?;
         self.replace_runtime(runtime)?;
         println!(
@@ -5016,6 +5084,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.auth_mode,
         )?;
         self.replace_runtime(runtime)?;
         println!(
@@ -5057,6 +5126,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.auth_mode,
         )?;
         self.replace_runtime(runtime)?;
         self.session = SessionHandle {
@@ -5213,6 +5283,7 @@ impl LiveCli {
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     None,
+                    self.auth_mode,
                 )?;
                 self.replace_runtime(runtime)?;
                 self.session = SessionHandle {
@@ -5248,6 +5319,7 @@ impl LiveCli {
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     None,
+                    self.auth_mode,
                 )?;
                 self.replace_runtime(runtime)?;
                 self.session = handle;
@@ -5344,6 +5416,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.auth_mode,
         )?;
         self.replace_runtime(runtime)?;
         self.persist_session()
@@ -5364,6 +5437,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.auth_mode,
         )?;
         self.replace_runtime(runtime)?;
         self.persist_session()?;
@@ -5388,6 +5462,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             progress,
+            self.auth_mode,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = runtime.run_turn(prompt, Some(&mut permission_prompter), None)?;
@@ -7502,6 +7577,7 @@ fn build_runtime(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    auth_mode: Option<AuthMode>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     build_runtime_for_cwd(
@@ -7515,6 +7591,7 @@ fn build_runtime(
         allowed_tools,
         permission_mode,
         progress_reporter,
+        auth_mode,
     )
 }
 
@@ -7531,6 +7608,7 @@ fn build_runtime_for_cwd(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    auth_mode: Option<AuthMode>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let loader = ConfigLoader::default_for(cwd);
     let runtime_config = loader.load()?;
@@ -7547,6 +7625,7 @@ fn build_runtime_for_cwd(
         permission_mode,
         progress_reporter,
         runtime_plugin_state,
+        auth_mode,
     )
 }
 
@@ -7563,6 +7642,7 @@ fn build_runtime_with_plugin_state(
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
     runtime_plugin_state: RuntimePluginState,
+    auth_mode: Option<AuthMode>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     // Persist the model in session metadata so resumed sessions can report it.
     if session.model.is_none() {
@@ -7587,6 +7667,7 @@ fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            auth_mode,
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -7714,47 +7795,33 @@ impl AnthropicRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+        auth_mode: Option<AuthMode>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Dispatch to the correct provider at construction time.
-        // `ApiProviderClient` (exposed by the api crate as
-        // `ProviderClient`) is an enum over Anthropic / xAI / OpenAI
-        // variants, where xAI and OpenAI both use the OpenAI-compat
-        // wire format under the hood. We consult
-        // `detect_provider_kind(&resolved_model)` so model-name prefix
-        // routing (`openai/`, `gpt-`, `grok`, `qwen/`) wins over
-        // env-var presence.
-        //
-        // For Anthropic we build the client directly instead of going
-        // through `ApiProviderClient::from_model_with_anthropic_auth`
-        // so we can explicitly apply `api::read_base_url()` — that
-        // reads `ANTHROPIC_BASE_URL` and is required for the local
-        // mock-server test harness
-        // (`crates/rusty-claude-cli/tests/compact_output.rs`) to point
-        // scode at its fake Anthropic endpoint. We also attach a
-        // session-scoped prompt cache on the Anthropic path; the
-        // prompt cache is Anthropic-only so non-Anthropic variants
-        // skip it.
         let resolved_model = api::resolve_model_alias(&model);
-        let client = match detect_provider_kind(&resolved_model) {
-            ProviderKind::Anthropic => {
-                let auth = resolve_cli_auth_source()?;
-                let inner = AnthropicClient::from_auth(auth)
-                    .with_base_url(api::read_base_url())
-                    .with_prompt_cache(PromptCache::new(session_id));
-                ApiProviderClient::Anthropic(inner)
-            }
-            ProviderKind::Xai | ProviderKind::OpenAi => {
-                // The api crate's `ProviderClient::from_model_with_anthropic_auth`
-                // with `None` for the anthropic auth routes via
-                // `detect_provider_kind` and builds an
-                // `OpenAiCompatClient::from_env` with the matching
-                // `OpenAiCompatConfig` (openai / xai / dashscope).
-                // That reads the correct API-key env var and BASE_URL
-                // override internally, so this one call covers OpenAI,
-                // OpenRouter, xAI, DashScope, Ollama, and any other
-                // OpenAI-compat endpoint users configure via
-                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
-                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+        let client = if let Some(mode) = auth_mode {
+            // Explicit --auth mode: validate required env vars, resolve
+            // auth source for the mode, then build via from_model_and_mode
+            // which handles proxy/subscription/api-key routing.
+            validate_auth_env(mode)?;
+            let auth = AuthSource::for_mode(mode)?;
+            ApiProviderClient::from_model_and_mode(&resolved_model, mode, auth)?
+                .with_prompt_cache(PromptCache::new(session_id))
+        } else {
+            // Auto-detect: legacy path. For Anthropic we build the client
+            // directly to apply `api::read_base_url()` (needed for the
+            // mock-server test harness) and attach a session-scoped prompt
+            // cache. Non-Anthropic variants route via detect_provider_kind.
+            match detect_provider_kind(&resolved_model) {
+                ProviderKind::Anthropic => {
+                    let auth = resolve_cli_auth_source()?;
+                    let inner = AnthropicClient::from_auth(auth)
+                        .with_base_url(api::read_base_url())
+                        .with_prompt_cache(PromptCache::new(session_id));
+                    ApiProviderClient::Anthropic(inner)
+                }
+                ProviderKind::Xai | ProviderKind::OpenAi => {
+                    ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+                }
             }
         };
         Ok(Self {
@@ -9617,6 +9684,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                auth_mode: None,
             }
         );
     }
@@ -9699,10 +9767,10 @@ mod tests {
 
         let original_config_home = std::env::var("SUDO_CODE_CONFIG_HOME").ok();
         let original_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
-        let original_auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok();
+        let original_auth_token = std::env::var("PROXY_AUTH_TOKEN").ok();
         std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_API_KEY");
-        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("PROXY_AUTH_TOKEN");
 
         save_oauth_credentials(&runtime::OAuthTokenSet {
             access_token: "expired-access-token".to_string(),
@@ -9724,8 +9792,8 @@ mod tests {
             None => std::env::remove_var("ANTHROPIC_API_KEY"),
         }
         match original_auth_token {
-            Some(value) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", value),
-            None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
+            Some(value) => std::env::set_var("PROXY_AUTH_TOKEN", value),
+            None => std::env::remove_var("PROXY_AUTH_TOKEN"),
         }
         std::fs::remove_dir_all(config_home).expect("temp config home should clean up");
 
@@ -9753,6 +9821,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                auth_mode: None,
             }
         );
     }
@@ -9844,6 +9913,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                auth_mode: None,
             }
         );
     }
@@ -9875,6 +9945,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                auth_mode: None,
             }
         );
     }
@@ -9918,6 +9989,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                auth_mode: None,
             }
         );
     }
@@ -9998,6 +10070,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                auth_mode: None,
             }
         );
     }
@@ -10019,6 +10092,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                auth_mode: None,
             }
         );
     }
@@ -10049,6 +10123,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                auth_mode: None,
             }
         );
     }
@@ -10076,6 +10151,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                auth_mode: None,
             }
         );
     }
@@ -10112,7 +10188,7 @@ mod tests {
         let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
         assert!(login.contains("ANTHROPIC_API_KEY"));
         let logout = parse_args(&["logout".to_string()]).expect_err("logout should be removed");
-        assert!(logout.contains("ANTHROPIC_AUTH_TOKEN"));
+        assert!(logout.contains("--auth"));
         assert_eq!(
             parse_args(&["doctor".to_string()]).expect("doctor should parse"),
             CliAction::Doctor {
@@ -10180,6 +10256,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                auth_mode: None,
             }
         );
         assert_eq!(
@@ -10394,6 +10471,7 @@ mod tests {
             allowed_tools: None,
             permission_mode_override: None,
             reasoning_effort: None,
+            auth_mode: None,
         };
         assert_eq!(
             parse_args(&["acp".to_string()]).expect("acp should parse"),
@@ -10435,6 +10513,7 @@ mod tests {
                 allowed_tools,
                 permission_mode_override,
                 reasoning_effort,
+                auth_mode: _,
             } => {
                 assert_eq!(model, resolve_model_alias_with_config("sonnet"));
                 assert_eq!(model_flag_raw.as_deref(), Some("sonnet"));
@@ -11147,6 +11226,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                auth_mode: None,
             }
         );
     }
@@ -11215,6 +11295,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                auth_mode: None,
             }
         );
         assert_eq!(
@@ -11242,6 +11323,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                auth_mode: None,
             }
         );
         let error = parse_args(&["/status".to_string()])
@@ -11334,6 +11416,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                auth_mode: None,
             }
         );
     }
@@ -11353,6 +11436,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                auth_mode: None,
             }
         );
     }
@@ -11382,6 +11466,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                auth_mode: None,
             }
         );
     }
@@ -11649,6 +11734,7 @@ mod tests {
                 true,
                 None,
                 PermissionMode::DangerFullAccess,
+                None,
             )
             .expect("cli should initialize")
             .startup_banner()
@@ -13161,6 +13247,7 @@ UU conflicted.rs",
             PermissionMode::DangerFullAccess,
             None,
             runtime_plugin_state,
+            None,
         )
         .expect("runtime should build");
 
