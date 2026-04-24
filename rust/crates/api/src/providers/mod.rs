@@ -34,6 +34,16 @@ impl AuthMode {
         }
     }
 
+    /// Round-trip-safe string for parsing and display (matches `parse()` input).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Subscription => "subscription",
+            Self::Proxy => "proxy",
+            Self::ApiKey => "api-key",
+        }
+    }
+
     /// Human-readable label for display in the connected line.
     #[must_use]
     pub fn label(self) -> &'static str {

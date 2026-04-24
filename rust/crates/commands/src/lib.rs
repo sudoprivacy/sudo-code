@@ -100,6 +100,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "auth",
+        aliases: &[],
+        summary: "Show or switch the active authentication mode",
+        argument_hint: Some("[subscription|proxy|api-key]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "clear",
         aliases: &[],
         summary: "Start a fresh local session",
@@ -1065,6 +1072,9 @@ pub enum SlashCommand {
     Permissions {
         mode: Option<String>,
     },
+    Auth {
+        mode: Option<String>,
+    },
     Clear {
         confirm: bool,
     },
@@ -1344,6 +1354,9 @@ pub fn validate_slash_command_input(
         "permissions" => SlashCommand::Permissions {
             mode: parse_permissions_mode(&args)?,
         },
+        "auth" => SlashCommand::Auth {
+            mode: parse_auth_mode(&args)?,
+        },
         "clear" => SlashCommand::Clear {
             confirm: parse_clear_args(&args)?,
         },
@@ -1548,6 +1561,21 @@ fn parse_permissions_mode(args: &[&str]) -> Result<Option<String>, SlashCommandP
         ));
     }
 
+    Ok(None)
+}
+
+fn parse_auth_mode(args: &[&str]) -> Result<Option<String>, SlashCommandParseError> {
+    let mode = optional_single_arg("auth", args, "[subscription|proxy|api-key]")?;
+    if let Some(mode) = mode {
+        if matches!(mode.as_str(), "subscription" | "proxy" | "api-key") {
+            return Ok(Some(mode));
+        }
+        return Err(command_error(
+            &format!("Unsupported /auth mode '{mode}'. Use subscription, proxy, or api-key."),
+            "auth",
+            "/auth [subscription|proxy|api-key]",
+        ));
+    }
     Ok(None)
 }
 
@@ -1883,12 +1911,12 @@ fn slash_command_category(name: &str) -> &'static str {
         | "bookmarks" | "context" | "files" | "focus" | "unfocus" | "retry" | "stop" | "undo" => {
             "Session"
         }
-        "model" | "permissions" | "config" | "memory" | "theme" | "vim" | "voice" | "color"
-        | "effort" | "fast" | "brief" | "output-style" | "keybindings" | "privacy-settings"
-        | "stickers" | "language" | "profile" | "max-tokens" | "temperature" | "system-prompt"
-        | "api-key" | "terminal-setup" | "notifications" | "telemetry" | "providers" | "env"
-        | "project" | "reasoning" | "budget" | "rate-limit" | "workspace" | "reset" | "ide"
-        | "desktop" | "upgrade" => "Config",
+        "model" | "permissions" | "auth" | "config" | "memory" | "theme" | "vim" | "voice"
+        | "color" | "effort" | "fast" | "brief" | "output-style" | "keybindings"
+        | "privacy-settings" | "stickers" | "language" | "profile" | "max-tokens"
+        | "temperature" | "system-prompt" | "api-key" | "terminal-setup" | "notifications"
+        | "telemetry" | "providers" | "env" | "project" | "reasoning" | "budget" | "rate-limit"
+        | "workspace" | "reset" | "ide" | "desktop" | "upgrade" => "Config",
         "debug-tool-call" | "doctor" | "sandbox" | "diagnostics" | "tool-details" | "changelog"
         | "metrics" => "Debug",
         _ => "Tools",
@@ -4118,6 +4146,7 @@ pub fn handle_slash_command(
         | SlashCommand::Sandbox
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
+        | SlashCommand::Auth { .. }
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost
         | SlashCommand::Resume { .. }
@@ -4689,6 +4718,7 @@ mod tests {
         assert!(help.contains("/debug-tool-call"));
         assert!(help.contains("/model [model]"));
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
+        assert!(help.contains("/auth [subscription|proxy|api-key]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
@@ -4710,7 +4740,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 139);
+        assert_eq!(slash_command_specs().len(), 140);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
