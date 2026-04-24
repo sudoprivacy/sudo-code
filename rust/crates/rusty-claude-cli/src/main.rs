@@ -7738,11 +7738,8 @@ impl AnthropicRuntimeClient {
                     .with_base_url(api::read_base_url())
                     .with_prompt_cache(PromptCache::new(session_id));
                 if api::is_claude_code_oauth_token() {
-                    // OAuth tokens require:
-                    // 1. Direct Anthropic API (not proxies)
-                    // 2. The oauth-2025-04-20 beta header
-                    // 3. System prompt split into array blocks where the
-                    //    first block is the exact magic prefix string
+                    // OAuth tokens require the direct Anthropic API,
+                    // the oauth beta header, and a magic system prefix.
                     inner = inner
                         .with_base_url("https://api.anthropic.com".to_string())
                         .with_beta("oauth-2025-04-20")
@@ -7804,18 +7801,7 @@ impl ApiClient for AnthropicRuntimeClient {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
-            system: if api::is_claude_code_oauth_token() {
-                let joined = request.system_prompt.join("\n\n");
-                if joined.is_empty() {
-                    Some("You are Claude Code, Anthropic's official CLI for Claude.".to_string())
-                } else {
-                    Some(format!(
-                        "You are Claude Code, Anthropic's official CLI for Claude.\n\n{joined}"
-                    ))
-                }
-            } else {
-                (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"))
-            },
+            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self
                 .enable_tools
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
