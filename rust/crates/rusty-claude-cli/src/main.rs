@@ -3079,6 +3079,56 @@ fn format_permissions_switch_report(previous: &str, next: &str) -> String {
     )
 }
 
+fn format_auth_report(current: &str) -> String {
+    let modes = [
+        (
+            "subscription",
+            "OAuth subscription token",
+            current == "subscription",
+        ),
+        ("proxy", "Proxy bearer token", current == "proxy"),
+        ("api-key", "Direct API key", current == "api-key"),
+    ]
+    .into_iter()
+    .map(|(name, description, is_current)| {
+        let marker = if is_current {
+            "● current"
+        } else {
+            "○ available"
+        };
+        format!("  {name:<18} {marker:<11} {description}")
+    })
+    .collect::<Vec<_>>()
+    .join(
+        "
+",
+    );
+
+    format!(
+        "Auth
+  Active mode      {current}
+  Mode status      live session default
+
+Modes
+{modes}
+
+Usage
+  Inspect current mode with /auth
+  Switch modes with /auth <mode>"
+    )
+}
+
+fn format_auth_switch_report(previous: &str, next: &str) -> String {
+    format!(
+        "Auth updated
+  Result           mode switched
+  Previous mode    {previous}
+  Active mode      {next}
+  Applies to       subsequent API calls
+  Usage            /auth to inspect current mode"
+    )
+}
+
 fn format_cost_report(usage: TokenUsage) -> String {
     format!(
         "Cost
@@ -3549,6 +3599,7 @@ fn run_resume_command(
         | SlashCommand::Resume { .. }
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
+        | SlashCommand::Auth { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
         | SlashCommand::Login
@@ -4768,6 +4819,7 @@ impl LiveCli {
             }
             SlashCommand::Model { model } => self.set_model(model)?,
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
+            SlashCommand::Auth { mode } => self.set_auth(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => {
                 self.print_cost();
@@ -5056,6 +5108,35 @@ impl LiveCli {
             "{}",
             format_permissions_switch_report(&previous, normalized)
         );
+        Ok(true)
+    }
+
+    fn set_auth(&mut self, mode: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
+        let current_str = self.config.auth_mode.map_or_else(
+            || resolve_auth_mode(None).map(|m| m.as_str().to_string()),
+            |m| Ok(m.as_str().to_string()),
+        )?;
+
+        let Some(mode) = mode else {
+            println!("{}", format_auth_report(&current_str));
+            return Ok(false);
+        };
+
+        let parsed = AuthMode::parse(&mode).map_err(|e| e)?;
+
+        if parsed.as_str() == current_str {
+            println!("{}", format_auth_report(&current_str));
+            return Ok(false);
+        }
+
+        validate_auth_env(parsed)?;
+
+        let previous = current_str;
+        let session = self.runtime.session().clone();
+        self.config.auth_mode = Some(parsed);
+        let runtime = build_runtime(session, &self.session.id, self.config.clone())?;
+        self.replace_runtime(runtime)?;
+        println!("{}", format_auth_switch_report(&previous, parsed.as_str()));
         Ok(true)
     }
 
@@ -8280,6 +8361,10 @@ fn slash_command_completion_candidates_with_sessions(
         "/permissions read-only",
         "/permissions workspace-write",
         "/permissions danger-full-access",
+        "/auth ",
+        "/auth subscription",
+        "/auth proxy",
+        "/auth api-key",
         "/plugin list",
         "/plugin install ",
         "/plugin enable ",
