@@ -973,6 +973,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode_override,
             reasoning_effort,
         ),
+        "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
@@ -1167,6 +1168,12 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
         )
     };
     Some(guidance)
+}
+
+fn removed_auth_surface_error(command_name: &str) -> String {
+    format!(
+        "`scode {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
+    )
 }
 
 fn parse_acp_args(
@@ -3492,6 +3499,8 @@ fn run_resume_command(
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
+        | SlashCommand::Login
+        | SlashCommand::Logout
         | SlashCommand::Vim
         | SlashCommand::Upgrade
         | SlashCommand::Share
@@ -4750,7 +4759,9 @@ impl LiveCli {
                 println!("{}", format_cost_report(usage));
                 false
             }
-            SlashCommand::Vim
+            SlashCommand::Login
+            | SlashCommand::Logout
+            | SlashCommand::Vim
             | SlashCommand::Upgrade
             | SlashCommand::Share
             | SlashCommand::Feedback
@@ -8190,6 +8201,8 @@ fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json
 /// in this build. Used to filter both REPL completions and help output so the
 /// discovery surface only shows commands that actually work (ROADMAP #39).
 const STUB_COMMANDS: &[&str] = &[
+    "login",
+    "logout",
     "vim",
     "upgrade",
     "share",
@@ -10115,7 +10128,11 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_subcommands_parse_successfully() {
+    fn removed_login_and_logout_subcommands_error_helpfully() {
+        let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
+        assert!(login.contains("ANTHROPIC_API_KEY"));
+        let logout = parse_args(&["logout".to_string()]).expect_err("logout should be removed");
+        assert!(logout.contains("ANTHROPIC_AUTH_TOKEN"));
         assert_eq!(
             parse_args(&["doctor".to_string()]).expect("doctor should parse"),
             CliAction::Doctor {

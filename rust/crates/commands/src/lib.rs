@@ -1101,6 +1101,8 @@ pub enum SlashCommand {
         args: Option<String>,
     },
     Doctor,
+    Login,
+    Logout,
     Vim,
     Upgrade,
     Stats,
@@ -1237,6 +1239,8 @@ impl SlashCommand {
             Self::Permissions { .. } => "/permissions",
             Self::Session { .. } => "/session",
             Self::Plugins { .. } => "/plugins",
+            Self::Login => "/login",
+            Self::Logout => "/logout",
             Self::Vim => "/vim",
             Self::Upgrade => "/upgrade",
             Self::Share => "/share",
@@ -1382,6 +1386,13 @@ pub fn validate_slash_command_input(
         "doctor" | "providers" => {
             validate_no_args(command, &args)?;
             SlashCommand::Doctor
+        }
+        "login" | "logout" => {
+            return Err(command_error(
+                "This auth flow was removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead.",
+                command,
+                "",
+            ));
         }
         "vim" => {
             validate_no_args(command, &args)?;
@@ -4122,6 +4133,8 @@ pub fn handle_slash_command(
         | SlashCommand::Agents { .. }
         | SlashCommand::Skills { .. }
         | SlashCommand::Doctor
+        | SlashCommand::Login
+        | SlashCommand::Logout
         | SlashCommand::Vim
         | SlashCommand::Upgrade
         | SlashCommand::Stats
@@ -4647,6 +4660,14 @@ mod tests {
     }
 
     #[test]
+    fn removed_login_and_logout_commands_report_env_auth_guidance() {
+        let login_error = parse_error_message("/login");
+        assert!(login_error.contains("ANTHROPIC_API_KEY"));
+        let logout_error = parse_error_message("/logout");
+        assert!(logout_error.contains("ANTHROPIC_AUTH_TOKEN"));
+    }
+
+    #[test]
     fn renders_help_from_shared_specs() {
         let help = render_slash_command_help();
         assert!(help.contains("Start here        /status, /diff, /agents, /skills, /commit"));
@@ -4687,6 +4708,8 @@ mod tests {
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
         assert!(help.contains("aliases: /skill"));
+        assert!(!help.contains("/login"));
+        assert!(!help.contains("/logout"));
         assert_eq!(slash_command_specs().len(), 139);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
