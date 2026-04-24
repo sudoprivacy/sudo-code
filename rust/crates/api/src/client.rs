@@ -2,7 +2,7 @@ use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
-use crate::providers::registry::{ProviderProtocol, ProviderRegistry};
+use crate::providers::registry::{ApiFormat, Credential, ResolvedProvider};
 use crate::providers::{self, AuthMode, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 
@@ -92,93 +92,68 @@ impl ProviderClient {
         }
     }
 
-    /// Build a `ProviderClient` using the config-driven registry.
+    /// Build a `ProviderClient` from a fully resolved provider config.
     ///
-    /// Resolution order:
-    /// 1. Look up the model in the registry's config models.
-    /// 2. If found, resolve the provider from config and build accordingly.
-    /// 3. If not found, fall back to the standard `from_model_and_mode` /
-    ///    `from_model` path.
-    pub fn from_model_with_registry(
-        model: &str,
-        registry: &ProviderRegistry,
-        mode: Option<AuthMode>,
-        auth: Option<AuthSource>,
-    ) -> Result<Self, ApiError> {
-        let resolved_alias = registry.resolve_model_alias(model);
-
-        // Try config-driven resolution first.
-        if let Some(config_model) = registry.config_model(model) {
-            if let Some(provider) = registry.config_provider(&config_model.provider) {
-                return Self::from_config_provider(&config_model.model_id, provider, mode, auth);
-            }
-        }
-
-        // Fall back to standard path.
-        match (mode, auth) {
-            (Some(m), Some(a)) => Self::from_model_and_mode(&resolved_alias, m, a),
-            (_, Some(a)) => Self::from_model_with_anthropic_auth(&resolved_alias, Some(a)),
-            _ => Self::from_model(&resolved_alias),
-        }
-    }
-
-    /// Build a `ProviderClient` from an explicit config provider entry.
-    fn from_config_provider(
-        _model_id: &str,
-        provider: &crate::providers::registry::ConfigProvider,
-        mode: Option<AuthMode>,
-        auth: Option<AuthSource>,
-    ) -> Result<Self, ApiError> {
-        match provider.protocol {
-            ProviderProtocol::Anthropic => {
-                // Anthropic protocol: use AnthropicClient.
-                let client = match (mode, auth) {
-                    (Some(m), Some(a)) => {
-                        let base_url = provider
-                            .base_url
-                            .clone()
-                            .unwrap_or_else(|| anthropic::base_url_for_mode(m));
-                        AnthropicClient::from_auth_with_mode(a, Some(m)).with_base_url(base_url)
+    /// This is the primary entry point for config-driven provider construction.
+    /// The caller is responsible for calling `resolve_provider_from_config()`
+    /// first to obtain the `ResolvedProvider`.
+    pub fn from_resolved(resolved: &ResolvedProvider) -> Result<Self, ApiError> {
+        match resolved.api_format {
+            ApiFormat::AnthropicMessages => {
+                // Build AnthropicClient with the resolved credential + base URL.
+                let auth = match &resolved.credential {
+                    Credential::ApiKey(key) => AuthSource::ApiKey(key.clone()),
+                    Credential::Token(token) => AuthSource::BearerToken(token.clone()),
+                    Credential::AuthFile(path) => {
+                        // Load token from auth file (e.g. ~/.claude/credentials.json).
+                        let content = std::fs::read_to_string(path).map_err(|e| {
+                            ApiError::Configuration(format!(
+                                "failed to read auth file {}: {e}",
+                                path.display()
+                            ))
+                        })?;
+                        // Try to parse as JSON and extract an accessToken field,
+                        // falling back to the raw file content as a token.
+                        let token = serde_json::from_str::<serde_json::Value>(&content)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("accessToken")
+                                    .or_else(|| v.get("token"))
+                                    .and_then(|t| t.as_str().map(String::from))
+                            })
+                            .unwrap_or_else(|| content.trim().to_string());
+                        AuthSource::BearerToken(token)
                     }
-                    (_, Some(a)) => {
-                        let mut client = AnthropicClient::from_auth(a);
-                        if let Some(url) = &provider.base_url {
-                            client = client.with_base_url(url.clone());
-                        } else {
-                            client = client.with_base_url(anthropic::read_base_url());
-                        }
-                        client
-                    }
-                    _ => {
-                        let mut client = AnthropicClient::from_env()?;
-                        if let Some(url) = &provider.base_url {
-                            client = client.with_base_url(url.clone());
-                        }
-                        client
+                    Credential::None => {
+                        return Err(ApiError::Configuration(
+                            "no credential available for Anthropic provider".to_string(),
+                        ));
                     }
                 };
+                let client =
+                    AnthropicClient::from_auth(auth).with_base_url(resolved.base_url.clone());
                 Ok(Self::Anthropic(client))
             }
-            ProviderProtocol::OpenAiCompat => {
-                // OpenAI-compat protocol: build OpenAiCompatConfig from the
-                // config provider entry.
-                let config = ProviderRegistry::openai_compat_config_for(provider)
-                    .unwrap_or_else(OpenAiCompatConfig::openai);
-                let mut client = OpenAiCompatClient::from_env(config)?;
-                // If the provider specifies a fixed base_url that differs
-                // from what from_env resolved (which reads the env var),
-                // override it.  The env var takes precedence only when set.
-                if let Some(url) = &provider.base_url {
-                    let env_key = provider.base_url_env.as_deref().unwrap_or("");
-                    let env_set = !env_key.is_empty()
-                        && std::env::var(env_key)
-                            .ok()
-                            .is_some_and(|v| !v.trim().is_empty());
-                    if !env_set {
-                        client = client.with_base_url(url.clone());
+            ApiFormat::OpenAiCompletions | ApiFormat::OpenAiResponses => {
+                // Build OpenAiCompatClient with the resolved credential + base URL.
+                let api_key = match &resolved.credential {
+                    Credential::ApiKey(key) => key.clone(),
+                    Credential::Token(token) => token.clone(),
+                    Credential::None => String::new(),
+                    Credential::AuthFile(_) => {
+                        return Err(ApiError::Configuration(
+                            "auth file credential not supported for OpenAI-compat providers"
+                                .to_string(),
+                        ));
                     }
+                };
+                let config = OpenAiCompatConfig::openai();
+                let client = OpenAiCompatClient::new(api_key, config)
+                    .with_base_url(resolved.base_url.clone());
+                match resolved.kind {
+                    ProviderKind::Xai => Ok(Self::Xai(client)),
+                    _ => Ok(Self::OpenAi(client)),
                 }
-                Ok(Self::OpenAi(client))
             }
         }
     }

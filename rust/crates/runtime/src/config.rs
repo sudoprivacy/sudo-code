@@ -51,38 +51,59 @@ pub struct RuntimePluginConfig {
     max_output_tokens: Option<u32>,
 }
 
-/// A provider endpoint defined in the `"providers"` config section.
+/// Connection details for a provider under a specific auth mode.
+///
+/// Parsed from `auth_modes.<mode>.<provider>` in `sudocode.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderConfigEntry {
-    /// Protocol kind: `"anthropic"` or `"openai-compat"`.
-    pub kind: String,
-    /// Env-var name whose value is the API key.
+pub struct ProviderConnectionConfig {
+    /// Base URL for API requests.
+    pub base_url: String,
+    /// Inline API key (api-key / proxy mode).
+    pub api_key: Option<String>,
+    /// Env var name for API key.
     pub api_key_env: Option<String>,
-    /// Fixed base URL for this provider.
-    pub base_url: Option<String>,
-    /// Env-var name that overrides the base URL at runtime.
-    pub base_url_env: Option<String>,
-    /// Human-friendly display name for banners.
-    pub display_name: Option<String>,
+    /// Inline token (subscription mode).
+    pub token: Option<String>,
+    /// Env var name for token.
+    pub token_env: Option<String>,
+    /// Path to auth/credentials file (subscription mode).
+    pub auth_file: Option<String>,
 }
 
-/// A model binding defined in the `"models"` config section.
+/// Which provider + wire model ID to use for a model under a given auth mode.
+///
+/// Parsed from `models.<alias>.providers.<mode>` in `sudocode.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProviderMapping {
+    /// Key into `auth_modes.<mode>`.
+    pub provider: String,
+    /// Provider-specific wire model ID.
+    pub model: String,
+    /// Wire format override (only needed for proxy providers).
+    pub api: Option<String>,
+}
+
+/// Model entry in the config registry.
+///
+/// Parsed from `models.<alias>` in `sudocode.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelConfigEntry {
-    /// Key into the `"providers"` map.
-    pub provider: String,
-    /// The model identifier sent over the wire.
-    pub model_id: String,
-    /// Optional max output tokens.
-    pub max_output_tokens: Option<u32>,
-    /// Optional context window size.
-    pub context_window: Option<u32>,
+    /// Short alias (also the map key), e.g. `"opus"`.
+    pub alias: String,
+    /// Display name, e.g. `"Claude Opus 4.6"`.
+    pub name: String,
+    /// Input modalities (informational).
+    pub input: Vec<String>,
+    /// Auth mode → provider mapping.
+    pub providers: BTreeMap<String, ModelProviderMapping>,
 }
 
-/// Parsed `"providers"` + `"models"` sections from config.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ProvidersConfig {
-    pub providers: BTreeMap<String, ProviderConfigEntry>,
+/// Top-level config from `sudocode.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SudoCodeConfig {
+    /// `auth_modes.<mode>.<provider_name>` → connection details.
+    pub auth_modes: BTreeMap<String, BTreeMap<String, ProviderConnectionConfig>>,
+    /// `models.<alias>` → model config.
     pub models: BTreeMap<String, ModelConfigEntry>,
 }
 
@@ -100,7 +121,6 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
-    providers_config: ProvidersConfig,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -355,7 +375,6 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
-            providers_config: parse_optional_providers_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -363,6 +382,17 @@ impl ConfigLoader {
             loaded_entries,
             feature_config,
         })
+    }
+
+    /// Load `sudocode.json` from the config home directory.
+    ///
+    /// Returns `SudoCodeConfig::default()` if the file does not exist.
+    pub fn load_sudocode_config(&self) -> Result<SudoCodeConfig, ConfigError> {
+        let path = self.config_home.join("sudocode.json");
+        if !path.exists() {
+            return Ok(SudoCodeConfig::default());
+        }
+        parse_sudocode_json(&path)
     }
 }
 
@@ -455,11 +485,6 @@ impl RuntimeConfig {
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
-
-    #[must_use]
-    pub fn providers_config(&self) -> &ProvidersConfig {
-        &self.feature_config.providers_config
-    }
 }
 
 impl RuntimeFeatureConfig {
@@ -528,11 +553,6 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
-    }
-
-    #[must_use]
-    pub fn providers_config(&self) -> &ProvidersConfig {
-        &self.providers_config
     }
 }
 
@@ -962,77 +982,132 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
     )
 }
 
-fn parse_optional_providers_config(root: &JsonValue) -> Result<ProvidersConfig, ConfigError> {
-    let Some(object) = root.as_object() else {
-        return Ok(ProvidersConfig::default());
+// ---------------------------------------------------------------------------
+// sudocode.json parsing
+// ---------------------------------------------------------------------------
+
+/// Parse `sudocode.json` into `SudoCodeConfig`.
+fn parse_sudocode_json(path: &Path) -> Result<SudoCodeConfig, ConfigError> {
+    let content = fs::read_to_string(path).map_err(ConfigError::Io)?;
+    let root: JsonValue = JsonValue::parse(&content)
+        .map_err(|e| ConfigError::Parse(format!("{}: {e}", path.display())))?;
+    let Some(root_obj) = root.as_object() else {
+        return Err(ConfigError::Parse(format!(
+            "{}: expected JSON object at top level",
+            path.display()
+        )));
     };
 
-    let providers = parse_providers_section(object)?;
-    let models = parse_models_section(object)?;
-    Ok(ProvidersConfig { providers, models })
+    let auth_modes = parse_auth_modes_section(root_obj, path)?;
+    let models = parse_sudocode_models_section(root_obj, path)?;
+
+    Ok(SudoCodeConfig { auth_modes, models })
 }
 
-fn parse_providers_section(
+fn parse_auth_modes_section(
     root: &BTreeMap<String, JsonValue>,
-) -> Result<BTreeMap<String, ProviderConfigEntry>, ConfigError> {
-    let Some(value) = root.get("providers") else {
+    path: &Path,
+) -> Result<BTreeMap<String, BTreeMap<String, ProviderConnectionConfig>>, ConfigError> {
+    let Some(value) = root.get("auth_modes") else {
         return Ok(BTreeMap::new());
     };
-    let providers_obj = expect_object(value, "merged settings.providers")?;
+    let modes_obj = expect_object(value, &format!("{}.auth_modes", path.display()))?;
     let mut result = BTreeMap::new();
-    for (name, entry_value) in providers_obj {
-        let entry = expect_object(entry_value, &format!("merged settings.providers.{name}"))?;
-        let context = format!("merged settings.providers.{name}");
-        let kind = expect_string(entry, "kind", &context)?.to_string();
-        if kind != "anthropic" && kind != "openai-compat" {
-            return Err(ConfigError::Parse(format!(
-                "{context}: field kind must be \"anthropic\" or \"openai-compat\", got \"{kind}\""
-            )));
+    for (mode_name, mode_value) in modes_obj {
+        let providers_obj = expect_object(
+            mode_value,
+            &format!("{}.auth_modes.{mode_name}", path.display()),
+        )?;
+        let mut providers = BTreeMap::new();
+        for (provider_name, provider_value) in providers_obj {
+            let ctx = format!("{}.auth_modes.{mode_name}.{provider_name}", path.display());
+            let entry = expect_object(provider_value, &ctx)?;
+            let base_url = expect_string(entry, "baseUrl", &ctx)?.to_string();
+            let api_key = optional_string(entry, "apiKey", &ctx)?.map(str::to_string);
+            let api_key_env = optional_string(entry, "apiKeyEnv", &ctx)?.map(str::to_string);
+            let token = optional_json_string_or_null(entry, "token");
+            let token_env = optional_string(entry, "tokenEnv", &ctx)?.map(str::to_string);
+            let auth_file = optional_string(entry, "authFile", &ctx)?.map(str::to_string);
+            providers.insert(
+                provider_name.clone(),
+                ProviderConnectionConfig {
+                    base_url,
+                    api_key,
+                    api_key_env,
+                    token,
+                    token_env,
+                    auth_file,
+                },
+            );
         }
-        let api_key_env = optional_string(entry, "apiKeyEnv", &context)?.map(str::to_string);
-        let base_url = optional_string(entry, "baseUrl", &context)?.map(str::to_string);
-        let base_url_env = optional_string(entry, "baseUrlEnv", &context)?.map(str::to_string);
-        let display_name = optional_string(entry, "displayName", &context)?.map(str::to_string);
-        result.insert(
-            name.clone(),
-            ProviderConfigEntry {
-                kind,
-                api_key_env,
-                base_url,
-                base_url_env,
-                display_name,
-            },
-        );
+        result.insert(mode_name.clone(), providers);
     }
     Ok(result)
 }
 
-fn parse_models_section(
+fn parse_sudocode_models_section(
     root: &BTreeMap<String, JsonValue>,
+    path: &Path,
 ) -> Result<BTreeMap<String, ModelConfigEntry>, ConfigError> {
     let Some(value) = root.get("models") else {
         return Ok(BTreeMap::new());
     };
-    let models_obj = expect_object(value, "merged settings.models")?;
+    let models_obj = expect_object(value, &format!("{}.models", path.display()))?;
     let mut result = BTreeMap::new();
-    for (name, entry_value) in models_obj {
-        let entry = expect_object(entry_value, &format!("merged settings.models.{name}"))?;
-        let context = format!("merged settings.models.{name}");
-        let provider = expect_string(entry, "provider", &context)?.to_string();
-        let model_id = expect_string(entry, "modelId", &context)?.to_string();
-        let max_output_tokens = optional_u32(entry, "maxOutputTokens", &context)?;
-        let context_window = optional_u32(entry, "contextWindow", &context)?;
+    for (alias, model_value) in models_obj {
+        let ctx = format!("{}.models.{alias}", path.display());
+        let entry = expect_object(model_value, &ctx)?;
+        let name = optional_string(entry, "name", &ctx)?
+            .map(str::to_string)
+            .unwrap_or_else(|| alias.clone());
+        let input = optional_string_array(entry, "input", &ctx)?.unwrap_or_default();
+        let alias_field = optional_string(entry, "alias", &ctx)?
+            .map(str::to_string)
+            .unwrap_or_else(|| alias.clone());
+
+        // Parse the providers sub-object.
+        let providers = if let Some(providers_value) = entry.get("providers") {
+            let providers_obj = expect_object(providers_value, &format!("{ctx}.providers"))?;
+            let mut mappings = BTreeMap::new();
+            for (mode_name, mapping_value) in providers_obj {
+                let m_ctx = format!("{ctx}.providers.{mode_name}");
+                let m_entry = expect_object(mapping_value, &m_ctx)?;
+                let provider = expect_string(m_entry, "provider", &m_ctx)?.to_string();
+                let model = expect_string(m_entry, "model", &m_ctx)?.to_string();
+                let api = optional_string(m_entry, "api", &m_ctx)?.map(str::to_string);
+                mappings.insert(
+                    mode_name.clone(),
+                    ModelProviderMapping {
+                        provider,
+                        model,
+                        api,
+                    },
+                );
+            }
+            mappings
+        } else {
+            BTreeMap::new()
+        };
+
         result.insert(
-            name.to_ascii_lowercase(),
+            alias.to_ascii_lowercase(),
             ModelConfigEntry {
-                provider,
-                model_id,
-                max_output_tokens,
-                context_window,
+                alias: alias_field,
+                name,
+                input,
+                providers,
             },
         );
     }
     Ok(result)
+}
+
+/// Read a JSON string field that might be `null` (treat as `None`).
+fn optional_json_string_or_null(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<String> {
+    match object.get(key) {
+        Some(JsonValue::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
 }
 
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {

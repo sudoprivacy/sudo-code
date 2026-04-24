@@ -70,6 +70,9 @@ pub enum ApiError {
         max_bytes: usize,
         provider: &'static str,
     },
+    /// Config-driven provider resolution error (e.g. missing model alias,
+    /// unavailable auth mode, missing credential in sudocode.json).
+    Configuration(String),
 }
 
 impl ApiError {
@@ -137,7 +140,8 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::RequestBodySizeExceeded { .. } => false,
+            | Self::RequestBodySizeExceeded { .. }
+            | Self::Configuration(_) => false,
         }
     }
 
@@ -156,7 +160,8 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::RequestBodySizeExceeded { .. } => None,
+            | Self::RequestBodySizeExceeded { .. }
+            | Self::Configuration(_) => None,
         }
     }
 
@@ -168,9 +173,10 @@ impl ApiError {
                 "provider_retry_exhausted"
             }
             Self::RetriesExhausted { last_error, .. } => last_error.safe_failure_class(),
-            Self::MissingCredentials { .. } | Self::ExpiredOAuthToken | Self::Auth(_) => {
-                "provider_auth"
-            }
+            Self::MissingCredentials { .. }
+            | Self::ExpiredOAuthToken
+            | Self::Auth(_)
+            | Self::Configuration(_) => "provider_auth",
             Self::Api { status, .. } if matches!(status.as_u16(), 401 | 403) => "provider_auth",
             Self::ContextWindowExceeded { .. } => "context_window",
             Self::Api { .. } if self.is_context_window_failure() => "context_window",
@@ -205,7 +211,8 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::RequestBodySizeExceeded { .. } => false,
+            | Self::RequestBodySizeExceeded { .. }
+            | Self::Configuration(_) => false,
         }
     }
 
@@ -235,7 +242,8 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::RequestBodySizeExceeded { .. } => false,
+            | Self::RequestBodySizeExceeded { .. }
+            | Self::Configuration(_) => false,
         }
     }
 }
@@ -345,6 +353,7 @@ impl Display for ApiError {
                 f,
                 "request body size ({estimated_bytes} bytes) exceeds {provider} limit ({max_bytes} bytes); reduce prompt length or context before retrying"
             ),
+            Self::Configuration(msg) => write!(f, "provider configuration error: {msg}"),
         }
     }
 }

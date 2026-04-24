@@ -197,14 +197,6 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "trustedRoots",
         expected: FieldType::StringArray,
     },
-    FieldSpec {
-        name: "providers",
-        expected: FieldType::Object,
-    },
-    FieldSpec {
-        name: "models",
-        expected: FieldType::Object,
-    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
