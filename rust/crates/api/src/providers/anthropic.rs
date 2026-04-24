@@ -675,6 +675,11 @@ impl AuthSource {
             };
         }
         if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
+            if read_env_non_empty("ANTHROPIC_BASE_URL")?.is_none() {
+                return Err(ApiError::Auth(
+                    "ANTHROPIC_AUTH_TOKEN requires ANTHROPIC_BASE_URL to be set (it is a proxy bearer token).".to_string(),
+                ));
+            }
             return Ok(Self::BearerToken(bearer_token));
         }
         if let Some(bearer_token) = read_env_non_empty("CLAUDE_CODE_OAUTH_TOKEN")? {
