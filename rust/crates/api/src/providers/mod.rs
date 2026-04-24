@@ -396,7 +396,6 @@ pub(crate) fn anthropic_missing_credentials() -> ApiError {
     const ENV_VARS: &[&str] = &[
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_API_KEY",
-        "SCODE_TOKEN",
         "CLAUDE_CODE_OAUTH_TOKEN",
     ];
     match anthropic_missing_credentials_hint() {
@@ -1051,7 +1050,6 @@ NO_EQUALS_LINE
                     &[
                         "ANTHROPIC_AUTH_TOKEN",
                         "ANTHROPIC_API_KEY",
-                        "SCODE_TOKEN",
                         "CLAUDE_CODE_OAUTH_TOKEN"
                     ]
                 );
@@ -1093,7 +1091,6 @@ NO_EQUALS_LINE
                     &[
                         "ANTHROPIC_AUTH_TOKEN",
                         "ANTHROPIC_API_KEY",
-                        "SCODE_TOKEN",
                         "CLAUDE_CODE_OAUTH_TOKEN"
                     ]
                 );

@@ -258,20 +258,6 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
-        name: "login",
-        aliases: &[],
-        summary: "Log in with OAuth (browser-based)",
-        argument_hint: None,
-        resume_supported: false,
-    },
-    SlashCommandSpec {
-        name: "logout",
-        aliases: &[],
-        summary: "Clear saved OAuth credentials",
-        argument_hint: None,
-        resume_supported: false,
-    },
-    SlashCommandSpec {
         name: "plan",
         aliases: &[],
         summary: "Toggle or inspect planning mode",
@@ -1115,8 +1101,6 @@ pub enum SlashCommand {
         args: Option<String>,
     },
     Doctor,
-    Login,
-    Logout,
     Vim,
     Upgrade,
     Stats,
@@ -1253,8 +1237,6 @@ impl SlashCommand {
             Self::Permissions { .. } => "/permissions",
             Self::Session { .. } => "/session",
             Self::Plugins { .. } => "/plugins",
-            Self::Login => "/login",
-            Self::Logout => "/logout",
             Self::Vim => "/vim",
             Self::Upgrade => "/upgrade",
             Self::Share => "/share",
@@ -1400,14 +1382,6 @@ pub fn validate_slash_command_input(
         "doctor" | "providers" => {
             validate_no_args(command, &args)?;
             SlashCommand::Doctor
-        }
-        "login" => {
-            validate_no_args(command, &args)?;
-            SlashCommand::Login
-        }
-        "logout" => {
-            validate_no_args(command, &args)?;
-            SlashCommand::Logout
         }
         "vim" => {
             validate_no_args(command, &args)?;
@@ -4148,8 +4122,6 @@ pub fn handle_slash_command(
         | SlashCommand::Agents { .. }
         | SlashCommand::Skills { .. }
         | SlashCommand::Doctor
-        | SlashCommand::Login
-        | SlashCommand::Logout
         | SlashCommand::Vim
         | SlashCommand::Upgrade
         | SlashCommand::Stats
@@ -4675,18 +4647,6 @@ mod tests {
     }
 
     #[test]
-    fn login_and_logout_commands_parse_successfully() {
-        let login = SlashCommand::parse("/login")
-            .expect("login should parse")
-            .expect("login should be Some");
-        assert_eq!(login.slash_name(), "/login");
-        let logout = SlashCommand::parse("/logout")
-            .expect("logout should parse")
-            .expect("logout should be Some");
-        assert_eq!(logout.slash_name(), "/logout");
-    }
-
-    #[test]
     fn renders_help_from_shared_specs() {
         let help = render_slash_command_help();
         assert!(help.contains("Start here        /status, /diff, /agents, /skills, /commit"));
@@ -4727,9 +4687,7 @@ mod tests {
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
         assert!(help.contains("aliases: /skill"));
-        assert!(help.contains("/login"));
-        assert!(help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert_eq!(slash_command_specs().len(), 139);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

@@ -48,14 +48,13 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    check_base_commit, clear_oauth_credentials, format_stale_base_warning, format_usd,
-    load_oauth_credentials, load_system_prompt, pricing_for_model, resolve_expected_base,
-    resolve_sandbox_status, AcpError, AcpSessionUpdateObserver, ApiClient, ApiRequest,
-    AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool,
-    MessageRole, ModelPricing, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
-    UsageTracker,
+    check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
+    load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status, AcpError,
+    AcpSessionUpdateObserver, ApiClient, ApiRequest, AssistantEvent, CompactionConfig,
+    ConfigLoader, ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
+    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
+    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -481,8 +480,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             allow_broad_cwd,
         )?,
-        CliAction::Login { output_format } => run_login(output_format)?,
-        CliAction::Logout { output_format } => run_logout(output_format)?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -588,12 +585,6 @@ enum CliAction {
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
-    },
-    Login {
-        output_format: CliOutputFormat,
-    },
-    Logout {
-        output_format: CliOutputFormat,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -982,8 +973,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode_override,
             reasoning_effort,
         ),
-        "login" => Ok(CliAction::Login { output_format }),
-        "logout" => Ok(CliAction::Logout { output_format }),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
@@ -1103,7 +1092,7 @@ fn parse_single_word_command_alias(
     let verb = &rest[0];
     let is_diagnostic = matches!(
         verb.as_str(),
-        "help" | "version" | "status" | "sandbox" | "doctor" | "state" | "login" | "logout"
+        "help" | "version" | "status" | "sandbox" | "doctor" | "state"
     );
 
     if is_diagnostic && rest.len() > 1 {
@@ -1141,8 +1130,6 @@ fn parse_single_word_command_alias(
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
         "state" => Some(Ok(CliAction::State { output_format })),
-        "login" => Some(Ok(CliAction::Login { output_format })),
-        "logout" => Some(Ok(CliAction::Logout { output_format })),
         // #146: let `config` and `diff` fall through to parse_subcommand
         // where they are wired as pure-local introspection, instead of
         // producing the "is a slash command" guidance. Zero-arg cases
@@ -2042,85 +2029,6 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
     })
 }
 
-fn run_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let claude = find_claude_cli()?;
-    eprintln!("Delegating login to Claude Code...");
-    let status = Command::new(&claude)
-        .args(["auth", "login"])
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()?;
-    if !status.success() {
-        return Err("claude auth login failed".into());
-    }
-    match output_format {
-        CliOutputFormat::Text => {
-            eprintln!("Login successful via Claude Code.");
-        }
-        CliOutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "status": "ok",
-                    "message": "Login successful via Claude Code",
-                }))?
-            );
-        }
-    }
-    Ok(())
-}
-
-fn run_logout(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let claude = find_claude_cli()?;
-    let status = Command::new(&claude)
-        .args(["auth", "logout"])
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()?;
-    if !status.success() {
-        return Err("claude auth logout failed".into());
-    }
-    // Also clear any locally saved OAuth credentials.
-    let _ = clear_oauth_credentials();
-    match output_format {
-        CliOutputFormat::Text => {
-            eprintln!("Logged out via Claude Code.");
-        }
-        CliOutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "status": "ok",
-                    "message": "Logged out via Claude Code",
-                }))?
-            );
-        }
-    }
-    Ok(())
-}
-
-fn find_claude_cli() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    // Check CLAUDE_BIN env override first, then search PATH.
-    if let Some(bin) = env::var_os("CLAUDE_BIN") {
-        let path = PathBuf::from(bin);
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
-    which_command("claude").ok_or_else(|| {
-        "Claude Code CLI (`claude`) not found. Install it first: https://docs.anthropic.com/en/docs/claude-code".into()
-    })
-}
-
-fn which_command(name: &str) -> Option<PathBuf> {
-    let path_var = env::var_os("PATH")?;
-    env::split_paths(&path_var)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
-}
-
 fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     let report = render_doctor_report()?;
     let message = report.render();
@@ -2270,7 +2178,7 @@ fn check_auth_health() -> DiagnosticCheck {
                     token_set.scopes.join(",")
                 }
             ),
-            "Suggested action  set ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or SCODE_TOKEN; or run `scode login`"
+            "Suggested action  set ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or CLAUDE_CODE_OAUTH_TOKEN"
                 .to_string(),
         ])
         .with_data(Map::from_iter([
@@ -3584,8 +3492,6 @@ fn run_resume_command(
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
-        | SlashCommand::Login
-        | SlashCommand::Logout
         | SlashCommand::Vim
         | SlashCommand::Upgrade
         | SlashCommand::Share
@@ -4842,14 +4748,6 @@ impl LiveCli {
             SlashCommand::Stats => {
                 let usage = UsageTracker::from_session(self.runtime.session()).cumulative_usage();
                 println!("{}", format_cost_report(usage));
-                false
-            }
-            SlashCommand::Login => {
-                run_login(CliOutputFormat::Text)?;
-                false
-            }
-            SlashCommand::Logout => {
-                run_logout(CliOutputFormat::Text)?;
                 false
             }
             SlashCommand::Vim
@@ -8292,8 +8190,6 @@ fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json
 /// in this build. Used to filter both REPL completions and help output so the
 /// discovery surface only shows commands that actually work (ROADMAP #39).
 const STUB_COMMANDS: &[&str] = &[
-    "login",
-    "logout",
     "vim",
     "upgrade",
     "share",
@@ -10219,19 +10115,7 @@ mod tests {
     }
 
     #[test]
-    fn login_and_logout_subcommands_parse_successfully() {
-        assert_eq!(
-            parse_args(&["login".to_string()]).expect("login should parse"),
-            CliAction::Login {
-                output_format: CliOutputFormat::Text,
-            }
-        );
-        assert_eq!(
-            parse_args(&["logout".to_string()]).expect("logout should parse"),
-            CliAction::Logout {
-                output_format: CliOutputFormat::Text,
-            }
-        );
+    fn diagnostic_subcommands_parse_successfully() {
         assert_eq!(
             parse_args(&["doctor".to_string()]).expect("doctor should parse"),
             CliAction::Doctor {

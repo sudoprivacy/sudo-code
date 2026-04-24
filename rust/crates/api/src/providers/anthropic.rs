@@ -681,9 +681,6 @@ impl AuthSource {
         if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
             return Ok(Self::BearerToken(bearer_token));
         }
-        if let Some(bearer_token) = read_env_non_empty("SCODE_TOKEN")? {
-            return Ok(Self::BearerToken(bearer_token));
-        }
         if let Some(bearer_token) = read_env_non_empty("CLAUDE_CODE_OAUTH_TOKEN")? {
             return Ok(Self::BearerToken(bearer_token));
         }
@@ -697,8 +694,8 @@ impl AuthSource {
 }
 
 /// Returns `true` when the active auth source comes from `CLAUDE_CODE_OAUTH_TOKEN`
-/// and no higher-priority auth env var (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
-/// `SCODE_TOKEN`) takes precedence.
+/// and no higher-priority auth env var (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`)
+/// takes precedence.
 pub fn is_claude_code_oauth_token() -> bool {
     // Mirror the precedence in `from_env_or_saved`.
     if read_env_non_empty("ANTHROPIC_API_KEY")
@@ -709,7 +706,6 @@ pub fn is_claude_code_oauth_token() -> bool {
             .ok()
             .flatten()
             .is_some()
-        || read_env_non_empty("SCODE_TOKEN").ok().flatten().is_some()
     {
         return false;
     }
@@ -736,7 +732,6 @@ pub fn resolve_saved_oauth_token(config: &OAuthConfig) -> Result<Option<OAuthTok
 pub fn has_auth_from_env_or_saved() -> Result<bool, ApiError> {
     Ok(read_env_non_empty("ANTHROPIC_API_KEY")?.is_some()
         || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some()
-        || read_env_non_empty("SCODE_TOKEN")?.is_some()
         || read_env_non_empty("CLAUDE_CODE_OAUTH_TOKEN")?.is_some()
         || load_saved_oauth_token()?.is_some())
 }
@@ -755,9 +750,6 @@ where
         };
     }
     if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
-        return Ok(AuthSource::BearerToken(bearer_token));
-    }
-    if let Some(bearer_token) = read_env_non_empty("SCODE_TOKEN")? {
         return Ok(AuthSource::BearerToken(bearer_token));
     }
     if let Some(bearer_token) = read_env_non_empty("CLAUDE_CODE_OAUTH_TOKEN")? {
@@ -1262,7 +1254,7 @@ mod tests {
         std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
-        std::env::remove_var("SCODE_TOKEN");
+
         save_oauth_credentials(&runtime::OAuthTokenSet {
             access_token: "saved-access-token".to_string(),
             refresh_token: Some("refresh".to_string()),
@@ -1334,7 +1326,7 @@ mod tests {
         std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
-        std::env::remove_var("SCODE_TOKEN");
+
         save_oauth_credentials(&runtime::OAuthTokenSet {
             access_token: "saved-access-token".to_string(),
             refresh_token: Some("refresh".to_string()),
