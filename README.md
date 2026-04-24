@@ -46,7 +46,7 @@ When `--auth` is omitted, auto-detection applies: subscription > proxy > api-key
 | Mode | Env vars | Endpoint |
 |------|----------|----------|
 | `api-key` | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`, `DASHSCOPE_API_KEY` | Provider default |
-| `subscription` | `CLAUDE_CODE_OAUTH_TOKEN` | api.anthropic.com |
+| `subscription` | `CLAUDE_CODE_OAUTH_TOKEN` (run `claude setup-token` to get one) | api.anthropic.com |
 | `proxy` | `PROXY_AUTH_TOKEN` + `PROXY_BASE_URL` | `PROXY_BASE_URL` |
 
 ## Model Aliases
