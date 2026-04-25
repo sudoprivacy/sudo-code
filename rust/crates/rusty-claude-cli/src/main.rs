@@ -44,9 +44,9 @@ use cli::api_client::{
 use cli::args::{
     config_model_for_current_dir, default_permission_mode, format_unknown_slash_command,
     load_sudocode_config_for_current_dir, load_sudocode_config_for_cwd, parse_args,
-    permission_mode_from_label, resolve_model_alias, resolve_model_alias_with_config,
-    resolve_repl_model, try_resolve_bare_skill_prompt, AllowedToolSet, CliAction, CliOutputFormat,
-    LocalHelpTopic,
+    permission_mode_from_label, require_sudocode_config_for_cwd, resolve_model_alias,
+    resolve_model_alias_with_config, resolve_repl_model, try_resolve_bare_skill_prompt,
+    AllowedToolSet, CliAction, CliOutputFormat, LocalHelpTopic,
 };
 use cli::export::{
     collect_session_prompt_history, parse_history_count, render_export_text,
@@ -276,7 +276,9 @@ Run `scode --help` for usage."
 /// matching against the error messages produced throughout the CLI surface.
 fn classify_error_kind(message: &str) -> &'static str {
     // Check specific patterns first (more specific before generic)
-    if message.contains("missing Anthropic credentials") {
+    if message.contains("missing sudocode.json") {
+        "missing_config"
+    } else if message.contains("missing Anthropic credentials") {
         "missing_credentials"
     } else if message.contains("Manifest source files are missing") {
         "missing_manifests"
@@ -1501,7 +1503,8 @@ impl AcpCliAgent {
             session_state.with_persistence_path(handle.path.clone()),
             &handle.id,
             {
-                let sudocode_config = load_sudocode_config_for_cwd(&cwd);
+                let sudocode_config =
+                    require_sudocode_config_for_cwd(&cwd).map_err(AcpError::internal)?;
                 let auth_mode = resolve_auth_mode(&model, self.auth_mode, &sudocode_config)
                     .map_err(|e| AcpError::internal(format!("failed to resolve auth mode: {e}")))?;
                 RuntimeConfig {
@@ -1704,7 +1707,9 @@ impl LiveCli {
         let system_prompt = build_system_prompt()?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
-        let sudocode_config = load_sudocode_config_for_current_dir();
+        let cwd = env::current_dir()?;
+        let sudocode_config = require_sudocode_config_for_cwd(&cwd)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         let auth_mode = resolve_auth_mode(&model, auth_mode, &sudocode_config)?;
         let config = RuntimeConfig {
             model,
