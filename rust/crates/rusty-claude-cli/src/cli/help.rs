@@ -562,6 +562,16 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
+    writeln!(out, "  scode login")?;
+    writeln!(
+        out,
+        "      Import OAuth credentials from Claude Code's keychain"
+    )?;
+    writeln!(out, "  scode logout")?;
+    writeln!(
+        out,
+        "      Clear saved OAuth credentials from keychain and file"
+    )?;
     writeln!(out, "  scode acp [serve]")?;
     writeln!(
         out,

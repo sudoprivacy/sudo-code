@@ -15,6 +15,7 @@ pub struct OAuthTokenSet {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at: Option<u64>,
+    #[serde(default)]
     pub scopes: Vec<String>,
 }
 
@@ -267,6 +268,10 @@ pub fn credentials_path() -> io::Result<PathBuf> {
 }
 
 pub fn load_oauth_credentials() -> io::Result<Option<OAuthTokenSet>> {
+    // Try keyring first, fall back to file.
+    if let Some(token_set) = load_oauth_credentials_from_keyring() {
+        return Ok(Some(token_set));
+    }
     let path = credentials_path()?;
     let root = read_credentials_root(&path)?;
     let Some(oauth) = root.get("oauth") else {
@@ -281,6 +286,8 @@ pub fn load_oauth_credentials() -> io::Result<Option<OAuthTokenSet>> {
 }
 
 pub fn save_oauth_credentials(token_set: &OAuthTokenSet) -> io::Result<()> {
+    // Write to both keyring and file for redundancy.
+    save_oauth_credentials_to_keyring(token_set);
     let path = credentials_path()?;
     let mut root = read_credentials_root(&path)?;
     root.insert(
@@ -292,6 +299,7 @@ pub fn save_oauth_credentials(token_set: &OAuthTokenSet) -> io::Result<()> {
 }
 
 pub fn clear_oauth_credentials() -> io::Result<()> {
+    clear_oauth_credentials_from_keyring();
     let path = credentials_path()?;
     let mut root = read_credentials_root(&path)?;
     root.remove("oauth");
@@ -322,6 +330,124 @@ pub fn parse_oauth_callback_query(query: &str) -> Result<OAuthCallbackParams, St
         error: params.get("error").cloned(),
         error_description: params.get("error_description").cloned(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Keyring credential storage
+// ---------------------------------------------------------------------------
+
+const KEYRING_SERVICE: &str = "sudocode-credentials";
+const KEYRING_USER: &str = "oauth";
+
+fn save_oauth_credentials_to_keyring(token_set: &OAuthTokenSet) {
+    let Ok(json) = serde_json::to_string(&StoredOAuthCredentials::from(token_set.clone())) else {
+        return;
+    };
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER);
+    if let Ok(entry) = entry {
+        let _ = entry.set_password(&json);
+    }
+}
+
+fn load_oauth_credentials_from_keyring() -> Option<OAuthTokenSet> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).ok()?;
+    let json = entry.get_password().ok()?;
+    let stored: StoredOAuthCredentials = serde_json::from_str(&json).ok()?;
+    Some(stored.into())
+}
+
+pub fn clear_oauth_credentials_from_keyring() {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+        let _ = entry.delete_credential();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Import credentials from Claude Code's keychain
+// ---------------------------------------------------------------------------
+
+const CC_KEYRING_SERVICE: &str = "Claude Code-credentials";
+
+/// JSON shape stored by Claude Code in macOS Keychain.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CcKeychainPayload {
+    #[serde(default)]
+    claude_ai_oauth: Option<CcOAuthEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CcOAuthEntry {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_at: Option<u64>,
+    #[serde(default)]
+    scopes: Vec<String>,
+}
+
+/// Reads Claude Code's OAuth token from the OS keychain and copies it into
+/// scode's own credential storage (keyring + file).
+///
+/// Returns the imported token set, or a human-readable error string.
+pub fn import_claude_code_credentials() -> Result<OAuthTokenSet, String> {
+    let json = read_cc_keychain_password()?;
+    let payload: CcKeychainPayload = serde_json::from_str(&json)
+        .map_err(|e| format!("failed to parse Claude Code keychain data: {e}"))?;
+    let cc = payload.claude_ai_oauth.ok_or_else(|| {
+        "Claude Code keychain entry has no OAuth token. Run `claude` first to authenticate."
+            .to_string()
+    })?;
+
+    let token_set = OAuthTokenSet {
+        access_token: cc.access_token,
+        refresh_token: cc.refresh_token,
+        expires_at: cc.expires_at,
+        scopes: cc.scopes,
+    };
+
+    save_oauth_credentials(&token_set)
+        .map_err(|e| format!("failed to save imported credentials: {e}"))?;
+
+    Ok(token_set)
+}
+
+/// Reads the password from Claude Code's legacy keychain entry using the
+/// macOS `security` CLI.  The `keyring` crate cannot access legacy keychain
+/// entries (it uses the newer Data Protection Keychain API), so we shell out.
+fn read_cc_keychain_password() -> Result<String, String> {
+    let username = whoami();
+    let output = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            CC_KEYRING_SERVICE,
+            "-a",
+            &username,
+            "-w",
+        ])
+        .output()
+        .map_err(|e| format!("failed to run `security` command: {e}"))?;
+
+    if !output.status.success() {
+        return Err(
+            "no Claude Code credentials found in keychain. Run `claude` first to authenticate."
+                .to_string(),
+        );
+    }
+
+    String::from_utf8(output.stdout)
+        .map(|s| s.trim_end().to_string())
+        .map_err(|e| format!("keychain password is not valid UTF-8: {e}"))
+}
+
+/// Returns the current OS username for keychain account lookup.
+fn whoami() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 fn generate_random_token(bytes: usize) -> io::Result<String> {

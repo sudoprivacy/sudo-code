@@ -3,7 +3,8 @@
     "subscription": {
       "claude": {
         "baseUrl": "https://api.anthropic.com",
-        "token": "<YOUR_CLAUDE_OAUTH_TOKEN>"
+        "token": null,
+        "tokenEnv": "CLAUDE_CODE_OAUTH_TOKEN"
       },
       "codex": {
         "baseUrl": "https://chatgpt.com/backend-api/codex",
