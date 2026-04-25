@@ -359,38 +359,9 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
     format!("{prompt}\n\n{trimmed}")
 }
 
-/// Returns `true` for CLI actions that require a valid `sudocode.json`
-/// config file (model registry) to operate. Introspection-only commands
-/// (version, help, status, doctor, etc.) do not. ACP is excluded
-/// because its protocol handshake does not need model resolution;
-/// config is loaded lazily when actual API calls are made.
-fn action_requires_sudocode_config(action: &CliAction) -> bool {
-    matches!(action, CliAction::Prompt { .. } | CliAction::Repl { .. })
-}
-
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    let action = parse_args(&args)?;
-
-    // SSOT enforcement: fail fast if sudocode.json is missing for actions
-    // that need the model/provider registry.
-    if action_requires_sudocode_config(&action) {
-        if let Ok(cwd) = env::current_dir() {
-            require_sudocode_config_for_cwd(&cwd).map_err(|e| -> Box<dyn std::error::Error> {
-                format!(
-                    "missing sudocode.json configuration\n\
-                     {e}\n\
-                     \n\
-                     Hint: copy the sample config to get started:\n  \
-                     cp crates/runtime/src/sudocode.sample.json \
-                     ~/.nexus/sudocode/sudocode.json"
-                )
-                .into()
-            })?;
-        }
-    }
-
-    match action {
+    match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,
             manifests_dir,
@@ -1532,7 +1503,8 @@ impl AcpCliAgent {
             session_state.with_persistence_path(handle.path.clone()),
             &handle.id,
             {
-                let sudocode_config = load_sudocode_config_for_cwd(&cwd);
+                let sudocode_config =
+                    require_sudocode_config_for_cwd(&cwd).map_err(AcpError::internal)?;
                 let auth_mode = resolve_auth_mode(&model, self.auth_mode, &sudocode_config)
                     .map_err(|e| AcpError::internal(format!("failed to resolve auth mode: {e}")))?;
                 RuntimeConfig {
@@ -1735,7 +1707,9 @@ impl LiveCli {
         let system_prompt = build_system_prompt()?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
-        let sudocode_config = load_sudocode_config_for_current_dir();
+        let cwd = env::current_dir()?;
+        let sudocode_config = require_sudocode_config_for_cwd(&cwd)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         let auth_mode = resolve_auth_mode(&model, auth_mode, &sudocode_config)?;
         let config = RuntimeConfig {
             model,
