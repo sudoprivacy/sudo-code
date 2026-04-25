@@ -17,7 +17,7 @@ mod init;
 mod input;
 mod render;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -1852,7 +1852,9 @@ impl LiveCli {
         )
     }
 
-    fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    fn repl_completion_candidates(
+        &self,
+    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
         Ok(slash_command_completion_candidates_with_sessions(
             &self.config.model,
             Some(&self.session.id),
@@ -3464,17 +3466,17 @@ fn slash_command_completion_candidates_with_sessions(
     model: &str,
     active_session_id: Option<&str>,
     recent_session_ids: Vec<String>,
-) -> Vec<String> {
-    let mut completions = BTreeSet::new();
+) -> Vec<(String, String)> {
+    let mut completions = BTreeMap::new();
 
     for spec in slash_command_specs() {
         if STUB_COMMANDS.contains(&spec.name) {
             continue;
         }
-        completions.insert(format!("/{}", spec.name));
+        completions.insert(format!("/{}", spec.name), spec.summary.to_string());
         for alias in spec.aliases {
             if !STUB_COMMANDS.contains(alias) {
-                completions.insert(format!("/{alias}"));
+                completions.insert(format!("/{alias}"), spec.summary.to_string());
             }
         }
     }
@@ -3522,23 +3524,35 @@ fn slash_command_completion_candidates_with_sessions(
         "/mcp help",
         "/skills help",
     ] {
-        completions.insert(candidate.to_string());
+        completions
+            .entry(candidate.to_string())
+            .or_insert_with(String::new);
     }
 
     // Add config-driven model aliases to /model completions.
     let sudocode_config = load_sudocode_config_for_current_dir();
     for alias in sudocode_config.models.keys() {
-        completions.insert(format!("/model {alias}"));
+        completions
+            .entry(format!("/model {alias}"))
+            .or_insert_with(String::new);
     }
 
     if !model.trim().is_empty() {
-        completions.insert(format!("/model {}", resolve_model_alias_with_config(model)));
-        completions.insert(format!("/model {model}"));
+        completions
+            .entry(format!("/model {}", resolve_model_alias_with_config(model)))
+            .or_insert_with(String::new);
+        completions
+            .entry(format!("/model {model}"))
+            .or_insert_with(String::new);
     }
 
     if let Some(active_session_id) = active_session_id.filter(|value| !value.trim().is_empty()) {
-        completions.insert(format!("/resume {active_session_id}"));
-        completions.insert(format!("/session switch {active_session_id}"));
+        completions
+            .entry(format!("/resume {active_session_id}"))
+            .or_insert_with(String::new);
+        completions
+            .entry(format!("/session switch {active_session_id}"))
+            .or_insert_with(String::new);
     }
 
     for session_id in recent_session_ids
@@ -3546,8 +3560,12 @@ fn slash_command_completion_candidates_with_sessions(
         .filter(|value| !value.trim().is_empty())
         .take(10)
     {
-        completions.insert(format!("/resume {session_id}"));
-        completions.insert(format!("/session switch {session_id}"));
+        completions
+            .entry(format!("/resume {session_id}"))
+            .or_insert_with(String::new);
+        completions
+            .entry(format!("/session switch {session_id}"))
+            .or_insert_with(String::new);
     }
 
     completions.into_iter().collect()

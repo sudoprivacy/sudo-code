@@ -21,12 +21,13 @@ pub enum ReadOutcome {
 }
 
 struct SlashCommandHelper {
-    completions: Vec<String>,
+    /// Each entry is (command, description). Description may be empty.
+    completions: Vec<(String, String)>,
     current_line: RefCell<String>,
 }
 
 impl SlashCommandHelper {
-    fn new(completions: Vec<String>) -> Self {
+    fn new(completions: Vec<(String, String)>) -> Self {
         Self {
             completions: normalize_completions(completions),
             current_line: RefCell::new(String::new()),
@@ -47,7 +48,7 @@ impl SlashCommandHelper {
         current.push_str(line);
     }
 
-    fn set_completions(&mut self, completions: Vec<String>) {
+    fn set_completions(&mut self, completions: Vec<(String, String)>) {
         self.completions = normalize_completions(completions);
     }
 }
@@ -68,10 +69,14 @@ impl Completer for SlashCommandHelper {
         let matches = self
             .completions
             .iter()
-            .filter(|candidate| candidate.starts_with(prefix))
-            .map(|candidate| Pair {
-                display: candidate.clone(),
-                replacement: candidate.clone(),
+            .filter(|(cmd, _)| cmd.starts_with(prefix))
+            .map(|(cmd, desc)| Pair {
+                display: if desc.is_empty() {
+                    cmd.clone()
+                } else {
+                    format!("{cmd:<24} — {desc}")
+                },
+                replacement: cmd.clone(),
             })
             .collect();
 
@@ -107,7 +112,7 @@ pub struct LineEditor {
 
 impl LineEditor {
     #[must_use]
-    pub fn new(prompt: impl Into<String>, completions: Vec<String>) -> Self {
+    pub fn new(prompt: impl Into<String>, completions: Vec<(String, String)>) -> Self {
         let config = Config::builder()
             .completion_type(CompletionType::List)
             .edit_mode(EditMode::Emacs)
@@ -134,7 +139,7 @@ impl LineEditor {
         let _ = self.editor.add_history_entry(entry);
     }
 
-    pub fn set_completions(&mut self, completions: Vec<String>) {
+    pub fn set_completions(&mut self, completions: Vec<(String, String)>) {
         if let Some(helper) = self.editor.helper_mut() {
             helper.set_completions(completions);
         }
@@ -222,11 +227,11 @@ fn slash_command_prefix(line: &str, pos: usize) -> Option<&str> {
     Some(prefix)
 }
 
-fn normalize_completions(completions: Vec<String>) -> Vec<String> {
+fn normalize_completions(completions: Vec<(String, String)>) -> Vec<(String, String)> {
     let mut seen = BTreeSet::new();
     completions
         .into_iter()
-        .filter(|candidate| candidate.starts_with('/'))
-        .filter(|candidate| seen.insert(candidate.clone()))
+        .filter(|(cmd, _)| cmd.starts_with('/'))
+        .filter(|(cmd, _)| seen.insert(cmd.clone()))
         .collect()
 }
