@@ -439,6 +439,7 @@ pub(crate) fn render_thinking_block_summary(
 
 /// Apply response structure glyphs to rendered text output.
 /// Prefixes the first line with ⏺ (bold) and continuation lines with ⎿ (dim).
+/// Uses `\r\x1b[2K` before each glyph to clear any spinner remnants from the line.
 fn apply_response_glyphs(
     rendered: &str,
     response_started: &mut bool,
@@ -454,11 +455,12 @@ fn apply_response_glyphs(
             *pending_newline = true;
         } else {
             if !*response_started {
-                result.push_str("\x1b[1m⏺\x1b[0m ");
+                // Clear spinner remnants before the first response line.
+                result.push_str("\r\x1b[2K\x1b[1m⏺\x1b[0m ");
                 *response_started = true;
                 *pending_newline = false;
             } else if *pending_newline {
-                result.push_str("\x1b[2m⎿\x1b[0m ");
+                result.push_str("\r\x1b[2K\x1b[2m⎿\x1b[0m ");
                 *pending_newline = false;
             }
             result.push(ch);
