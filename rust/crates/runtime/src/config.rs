@@ -111,6 +111,17 @@ pub struct SudoCodeConfig {
     pub models: BTreeMap<String, ModelConfigEntry>,
 }
 
+impl SudoCodeConfig {
+    /// Return the built-in config parsed from the embedded `sudocode.sample.json`.
+    ///
+    /// This always succeeds because the sample JSON is compile-time validated.
+    #[must_use]
+    pub fn builtin() -> Self {
+        parse_sudocode_json_str(SAMPLE_SUDOCODE_JSON)
+            .expect("embedded sudocode.sample.json must be valid")
+    }
+}
+
 /// Structured feature configuration consumed by runtime subsystems.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeFeatureConfig {
@@ -388,15 +399,18 @@ impl ConfigLoader {
         })
     }
 
-    /// Load `sudocode.json` from the config home directory.
-    ///
-    /// Returns `SudoCodeConfig::default()` if the file does not exist.
+    /// Load `sudocode.json` from the config home directory, merged on top of
+    /// the built-in config so that standard aliases always resolve.
     pub fn load_sudocode_config(&self) -> Result<SudoCodeConfig, ConfigError> {
+        let mut config = SudoCodeConfig::builtin();
         let path = self.config_home.join("sudocode.json");
-        if !path.exists() {
-            return Ok(SudoCodeConfig::default());
+        if path.exists() {
+            let user = parse_sudocode_json(&path)?;
+            // User entries override builtins.
+            config.auth_modes.extend(user.auth_modes);
+            config.models.extend(user.models);
         }
-        parse_sudocode_json(&path)
+        Ok(config)
     }
 }
 
@@ -993,17 +1007,28 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
 /// Parse `sudocode.json` into `SudoCodeConfig`.
 fn parse_sudocode_json(path: &Path) -> Result<SudoCodeConfig, ConfigError> {
     let content = fs::read_to_string(path).map_err(ConfigError::Io)?;
-    let root: JsonValue = JsonValue::parse(&content)
-        .map_err(|e| ConfigError::Parse(format!("{}: {e}", path.display())))?;
+    parse_sudocode_json_str_with_label(&content, &path.display().to_string())
+}
+
+fn parse_sudocode_json_str(content: &str) -> Result<SudoCodeConfig, ConfigError> {
+    parse_sudocode_json_str_with_label(content, "<builtin>")
+}
+
+fn parse_sudocode_json_str_with_label(
+    content: &str,
+    label: &str,
+) -> Result<SudoCodeConfig, ConfigError> {
+    let root: JsonValue =
+        JsonValue::parse(content).map_err(|e| ConfigError::Parse(format!("{label}: {e}")))?;
     let Some(root_obj) = root.as_object() else {
         return Err(ConfigError::Parse(format!(
-            "{}: expected JSON object at top level",
-            path.display()
+            "{label}: expected JSON object at top level",
         )));
     };
+    let sentinel = Path::new(label);
 
-    let auth_modes = parse_auth_modes_section(root_obj, path)?;
-    let models = parse_sudocode_models_section(root_obj, path)?;
+    let auth_modes = parse_auth_modes_section(root_obj, sentinel)?;
+    let models = parse_sudocode_models_section(root_obj, sentinel)?;
 
     Ok(SudoCodeConfig { auth_modes, models })
 }
@@ -2396,8 +2421,8 @@ mod tests {
         assert_eq!(apikey.base_url, "https://api.anthropic.com");
         assert_eq!(apikey.api_key.as_deref(), Some("sk-test-anthropic-key"));
 
-        // models
-        assert_eq!(config.models.len(), 2);
+        // models — user-defined entries are merged on top of builtins.
+        assert!(config.models.len() >= 2);
         let opus = &config.models["opus"];
         assert_eq!(opus.name, "Claude Opus 4.6");
         assert_eq!(opus.providers.len(), 3);

@@ -16,9 +16,8 @@ use crate::error::ApiError;
 use crate::http_client::build_http_client_or_default;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
-use super::{
-    anthropic_missing_credentials, model_token_limit, resolve_model_alias, Provider, ProviderFuture,
-};
+use super::registry::{self, model_token_limit};
+use super::{anthropic_missing_credentials, Provider, ProviderFuture};
 use crate::sse::SseParser;
 use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
 
@@ -551,7 +550,7 @@ impl AnthropicClient {
         // Anthropic-compatible gateways). If byte estimation already flags
         // the request as oversized, reject immediately without a network
         // round trip.
-        super::preflight_message_request(request)?;
+        registry::preflight_message_request(request)?;
 
         let Some(limit) = model_token_limit(&request.model) else {
             return Ok(());
@@ -566,7 +565,7 @@ impl AnthropicClient {
         let estimated_total_tokens = counted_input_tokens.saturating_add(request.max_tokens);
         if estimated_total_tokens > limit.context_window_tokens {
             return Err(ApiError::ContextWindowExceeded {
-                model: resolve_model_alias(&request.model),
+                model: request.model.clone(),
                 estimated_input_tokens: counted_input_tokens,
                 requested_output_tokens: request.max_tokens,
                 estimated_total_tokens,
@@ -719,7 +718,7 @@ impl AuthSource {
             super::AuthMode::ApiKey => {
                 // Try ANTHROPIC_API_KEY first.  When it is absent, return
                 // AuthSource::None — non-Anthropic providers (xai, openai)
-                // load their own keys in from_model_and_mode, so the auth
+                // load their own keys via from_resolved, so the auth
                 // source from here is unused in those paths.
                 match read_env_non_empty("ANTHROPIC_API_KEY")? {
                     Some(api_key) => Ok(Self::ApiKey(api_key)),
@@ -777,16 +776,6 @@ pub fn resolve_saved_oauth_token(config: &OAuthConfig) -> Result<Option<OAuthTok
         return Ok(None);
     };
     resolve_saved_oauth_token_set(config, token_set).map(Some)
-}
-
-/// Returns `true` when `ANTHROPIC_API_KEY` is set in the environment.
-/// Used by `detect_provider_kind` to check Anthropic auth without
-/// sniffing proxy tokens.
-pub fn has_anthropic_api_key_env() -> bool {
-    read_env_non_empty("ANTHROPIC_API_KEY")
-        .ok()
-        .flatten()
-        .is_some()
 }
 
 pub fn resolve_startup_auth_source<F>(load_oauth_config: F) -> Result<AuthSource, ApiError>

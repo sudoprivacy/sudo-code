@@ -1,13 +1,16 @@
 //! Config-driven provider & model registry.
 //!
 //! Resolves model alias → auth mode → provider → connection details using the
-//! `sudocode.json` config file.  Falls back to hardcoded registry when config
-//! is absent.
+//! `sudocode.json` config file.  The config is the single source of truth for
+//! model metadata, token limits, and provider routing.
 
 use std::path::PathBuf;
 
+use serde::Serialize;
+
 use super::{AuthMode, ProviderKind};
 use crate::error::ApiError;
+use crate::types::MessageRequest;
 
 // Re-export the config types from the runtime crate so consumers can use them
 // via `api::providers::registry::*` without depending on runtime directly.
@@ -52,6 +55,217 @@ pub struct ResolvedProvider {
     pub credential: Credential,
     /// The wire model ID to send to the provider.
     pub model_id: String,
+}
+
+/// Token-limit metadata for a wire model ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelTokenLimit {
+    pub max_output_tokens: u32,
+    pub context_window_tokens: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Hardcoded model specs (keyed by wire model ID)
+// ---------------------------------------------------------------------------
+
+/// Canonical model capabilities table. Wire model IDs referenced in
+/// `sudocode.json` provider mappings should appear here so that token-limit
+/// preflight checks and max-output-token defaults work correctly.
+const MODEL_SPECS: &[(&str, ModelTokenLimit)] = &[
+    // Anthropic
+    (
+        "claude-opus-4-6",
+        ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 200_000,
+        },
+    ),
+    (
+        "claude-sonnet-4-6",
+        ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 200_000,
+        },
+    ),
+    (
+        "claude-haiku-4-5-20251213",
+        ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 200_000,
+        },
+    ),
+    // xAI
+    (
+        "grok-3",
+        ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 131_072,
+        },
+    ),
+    (
+        "grok-3-mini",
+        ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 131_072,
+        },
+    ),
+    (
+        "grok-2",
+        ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 131_072,
+        },
+    ),
+    // Moonshot / Kimi (via DashScope)
+    (
+        "kimi-k2.5",
+        ModelTokenLimit {
+            max_output_tokens: 16_384,
+            context_window_tokens: 256_000,
+        },
+    ),
+    (
+        "kimi-k1.5",
+        ModelTokenLimit {
+            max_output_tokens: 16_384,
+            context_window_tokens: 256_000,
+        },
+    ),
+    // OpenAI / Codex
+    (
+        "gpt-5.4",
+        ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 200_000,
+        },
+    ),
+    (
+        "gpt-5.4-mini",
+        ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 200_000,
+        },
+    ),
+    // Qwen (via DashScope)
+    (
+        "qwen-plus",
+        ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 131_072,
+        },
+    ),
+    // Gemini (via proxy)
+    (
+        "gemini-3.1-pro-preview",
+        ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 200_000,
+        },
+    ),
+    (
+        "gemini-3-flash-preview",
+        ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 200_000,
+        },
+    ),
+];
+
+// ---------------------------------------------------------------------------
+// Model spec lookups
+// ---------------------------------------------------------------------------
+
+/// Look up token limits for a wire model ID.
+#[must_use]
+pub fn model_token_limit(model_id: &str) -> Option<ModelTokenLimit> {
+    MODEL_SPECS
+        .iter()
+        .find(|(id, _)| id.eq_ignore_ascii_case(model_id))
+        .map(|(_, limit)| *limit)
+}
+
+/// Look up token limits by resolving an alias through config first, then
+/// looking up the wire model ID in the hardcoded specs.
+#[must_use]
+pub fn model_token_limit_from_config(
+    config: &SudoCodeConfig,
+    alias: &str,
+) -> Option<ModelTokenLimit> {
+    let wire_id = resolve_model_alias_from_config(config, alias);
+    model_token_limit(&wire_id)
+}
+
+/// Return the effective max output tokens for a wire model ID.
+/// Falls back to 64k when the model is not in the specs table.
+#[must_use]
+pub fn max_tokens_for_model(model_id: &str) -> u32 {
+    model_token_limit(model_id).map_or(64_000, |l| l.max_output_tokens)
+}
+
+/// Return the effective max output tokens by resolving an alias through
+/// config first.
+#[must_use]
+pub fn max_tokens_for_model_from_config(config: &SudoCodeConfig, alias: &str) -> u32 {
+    model_token_limit_from_config(config, alias).map_or(64_000, |l| l.max_output_tokens)
+}
+
+/// Returns the effective max output tokens for a model, preferring a plugin
+/// override when present. Falls back to spec defaults.
+#[must_use]
+pub fn max_tokens_for_model_with_override(model_id: &str, plugin_override: Option<u32>) -> u32 {
+    plugin_override.unwrap_or_else(|| max_tokens_for_model(model_id))
+}
+
+/// Resolve a model alias through config to the wire model ID.
+///
+/// Looks up the alias in `config.models`, returning the wire model ID from
+/// the first available provider mapping. If not found, returns the input
+/// unchanged.
+#[must_use]
+pub fn resolve_model_alias_from_config(config: &SudoCodeConfig, alias: &str) -> String {
+    let trimmed = alias.trim();
+    if let Some(entry) = resolve_model(config, trimmed) {
+        if let Some(mapping) = entry.providers.values().next() {
+            return mapping.model.clone();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Local preflight check: reject requests whose estimated token count
+/// exceeds the model's context window (looked up from hardcoded specs).
+pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiError> {
+    let Some(limit) = model_token_limit(&request.model) else {
+        return Ok(());
+    };
+
+    let estimated_input_tokens = estimate_message_request_input_tokens(request);
+    let estimated_total_tokens = estimated_input_tokens.saturating_add(request.max_tokens);
+    if estimated_total_tokens > limit.context_window_tokens {
+        return Err(ApiError::ContextWindowExceeded {
+            model: request.model.clone(),
+            estimated_input_tokens,
+            requested_output_tokens: request.max_tokens,
+            estimated_total_tokens,
+            context_window_tokens: limit.context_window_tokens,
+        });
+    }
+
+    Ok(())
+}
+
+fn estimate_message_request_input_tokens(request: &MessageRequest) -> u32 {
+    let mut estimate = estimate_serialized_tokens(&request.messages);
+    estimate = estimate.saturating_add(estimate_serialized_tokens(&request.system));
+    estimate = estimate.saturating_add(estimate_serialized_tokens(&request.tools));
+    estimate = estimate.saturating_add(estimate_serialized_tokens(&request.tool_choice));
+    estimate
+}
+
+fn estimate_serialized_tokens<T: Serialize>(value: &T) -> u32 {
+    serde_json::to_vec(value)
+        .ok()
+        .map_or(0, |bytes| (bytes.len() / 4 + 1) as u32)
 }
 
 // ---------------------------------------------------------------------------

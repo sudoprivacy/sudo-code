@@ -29,13 +29,13 @@ pub use providers::openai_compat::{
     model_rejects_is_error_field, translate_message, OpenAiCompatClient, OpenAiCompatConfig,
 };
 pub use providers::registry::{
-    resolve_model, resolve_provider_from_config, ApiFormat, Credential, ModelConfigEntry,
-    ModelProviderMapping, ProviderConnectionConfig, ResolvedProvider, SudoCodeConfig,
+    max_tokens_for_model, max_tokens_for_model_from_config, max_tokens_for_model_with_override,
+    model_token_limit, model_token_limit_from_config, preflight_message_request, resolve_model,
+    resolve_model_alias_from_config, resolve_provider_from_config, ApiFormat, Credential,
+    ModelConfigEntry, ModelProviderMapping, ModelTokenLimit, ProviderConnectionConfig,
+    ResolvedProvider, SudoCodeConfig,
 };
-pub use providers::{
-    detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
-    resolve_model_alias, AuthMode, ProviderKind,
-};
+pub use providers::{AuthMode, ProviderKind};
 pub use sse::{parse_frame, SseParser};
 pub use types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,

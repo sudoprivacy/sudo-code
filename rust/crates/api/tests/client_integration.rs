@@ -4,10 +4,10 @@ use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use api::{
-    AnthropicClient, ApiClient, ApiError, AuthSource, ContentBlockDelta, ContentBlockDeltaEvent,
-    ContentBlockStartEvent, InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest,
-    OutputContentBlock, PromptCache, PromptCacheConfig, ProviderClient, StreamEvent, ToolChoice,
-    ToolDefinition,
+    AnthropicClient, ApiClient, ApiError, ApiFormat, ContentBlockDelta, ContentBlockDeltaEvent,
+    ContentBlockStartEvent, Credential, InputContentBlock, InputMessage, MessageDeltaEvent,
+    MessageRequest, OutputContentBlock, PromptCache, PromptCacheConfig, ProviderClient,
+    ProviderKind, ResolvedProvider, StreamEvent, ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use telemetry::{ClientIdentity, MemoryTelemetrySink, SessionTracer, TelemetryEvent};
@@ -470,17 +470,15 @@ async fn provider_client_dispatches_anthropic_requests() {
     )
     .await;
 
-    let client = ProviderClient::from_model_with_anthropic_auth(
-        "claude-sonnet-4-6",
-        Some(AuthSource::ApiKey("test-key".to_string())),
-    )
-    .expect("anthropic provider client should be constructed");
-    let client = match client {
-        ProviderClient::Anthropic(client) => {
-            ProviderClient::Anthropic(client.with_base_url(server.base_url()))
-        }
-        other => panic!("expected anthropic provider, got {other:?}"),
+    let resolved = ResolvedProvider {
+        kind: ProviderKind::Anthropic,
+        api_format: ApiFormat::AnthropicMessages,
+        base_url: server.base_url(),
+        credential: Credential::ApiKey("test-key".to_string()),
+        model_id: "claude-sonnet-4-6".to_string(),
     };
+    let client = ProviderClient::from_resolved(&resolved, None)
+        .expect("anthropic provider client should be constructed");
 
     let response = client
         .send_message(&sample_request(false))

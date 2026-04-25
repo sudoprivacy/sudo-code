@@ -1,13 +1,11 @@
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::sync::Arc;
-use std::sync::{Mutex as StdMutex, OnceLock};
 
 use api::{
-    ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
-    ContentBlockStopEvent, InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest,
-    OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, ProviderClient, StreamEvent,
-    ToolChoice, ToolDefinition,
+    ApiError, ApiFormat, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
+    ContentBlockStopEvent, Credential, InputContentBlock, InputMessage, MessageDeltaEvent,
+    MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, ProviderClient,
+    ProviderKind, ResolvedProvider, StreamEvent, ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -309,12 +307,8 @@ async fn openai_streaming_requests_opt_into_usage_chunks() {
     assert_eq!(body["stream_options"], json!({"include_usage": true}));
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn provider_client_dispatches_xai_requests_from_env() {
-    let _lock = env_lock();
-    let _api_key = ScopedEnvVar::set("XAI_API_KEY", "xai-test-key");
-
+async fn provider_client_dispatches_xai_requests() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let server = spawn_server(
         state.clone(),
@@ -325,10 +319,15 @@ async fn provider_client_dispatches_xai_requests_from_env() {
         )],
     )
     .await;
-    let _base_url = ScopedEnvVar::set("XAI_BASE_URL", server.base_url());
-
-    let client =
-        ProviderClient::from_model("grok").expect("xAI provider client should be constructed");
+    let resolved = ResolvedProvider {
+        kind: ProviderKind::Xai,
+        api_format: ApiFormat::OpenAiCompletions,
+        base_url: server.base_url(),
+        credential: Credential::ApiKey("xai-test-key".to_string()),
+        model_id: "grok-3".to_string(),
+    };
+    let client = ProviderClient::from_resolved(&resolved, None)
+        .expect("xAI provider client should be constructed");
     assert!(matches!(client, ProviderClient::Xai(_)));
 
     let response = client
@@ -498,34 +497,5 @@ fn sample_request(stream: bool) -> MessageRequest {
         tool_choice: Some(ToolChoice::Auto),
         stream,
         ..Default::default()
-    }
-}
-
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| StdMutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-struct ScopedEnvVar {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl ScopedEnvVar {
-    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
-        Self { key, previous }
-    }
-}
-
-impl Drop for ScopedEnvVar {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(value) => std::env::set_var(self.key, value),
-            None => std::env::remove_var(self.key),
-        }
     }
 }

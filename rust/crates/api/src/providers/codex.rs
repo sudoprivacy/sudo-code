@@ -18,7 +18,7 @@ use crate::types::{
     ToolDefinition, ToolResultContentBlock, Usage,
 };
 
-use super::preflight_message_request;
+use super::registry::preflight_message_request;
 
 pub const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const AUTH_FILE_REL: &str = ".codex/auth.json";
