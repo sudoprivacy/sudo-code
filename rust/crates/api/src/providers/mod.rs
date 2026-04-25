@@ -2,12 +2,11 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use serde::Serialize;
-
 use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
+pub mod codex;
 pub mod openai_compat;
 pub mod registry;
 
@@ -56,75 +55,6 @@ impl AuthMode {
     }
 }
 
-/// Auto-detect the auth mode from the environment when `--auth` is not specified.
-/// Priority: subscription → proxy → api-key.
-pub fn resolve_auth_mode(explicit: Option<AuthMode>) -> Result<AuthMode, ApiError> {
-    if let Some(mode) = explicit {
-        validate_auth_env(mode)?;
-        return Ok(mode);
-    }
-    // Auto-detect: subscription → proxy → api-key
-    if env_present("CLAUDE_CODE_OAUTH_TOKEN") {
-        return Ok(AuthMode::Subscription);
-    }
-    if env_present("PROXY_AUTH_TOKEN") {
-        return Ok(AuthMode::Proxy);
-    }
-    if env_present("ANTHROPIC_API_KEY")
-        || env_present("OPENAI_API_KEY")
-        || env_present("XAI_API_KEY")
-        || env_present("DASHSCOPE_API_KEY")
-        || env_present("GOOGLE_API_KEY")
-    {
-        return Ok(AuthMode::ApiKey);
-    }
-    Err(anthropic_missing_credentials())
-}
-
-/// Validate that the required env vars for the given mode are present.
-pub fn validate_auth_env(mode: AuthMode) -> Result<(), ApiError> {
-    match mode {
-        AuthMode::Subscription => {
-            if !env_present("CLAUDE_CODE_OAUTH_TOKEN") {
-                return Err(ApiError::Auth(
-                    "--auth subscription requires CLAUDE_CODE_OAUTH_TOKEN to be set.".to_string(),
-                ));
-            }
-        }
-        AuthMode::Proxy => {
-            if !env_present("PROXY_AUTH_TOKEN") {
-                return Err(ApiError::Auth(
-                    "--auth proxy requires PROXY_AUTH_TOKEN to be set.".to_string(),
-                ));
-            }
-            if !env_present("PROXY_BASE_URL") {
-                return Err(ApiError::Auth(
-                    "--auth proxy requires PROXY_BASE_URL to be set.".to_string(),
-                ));
-            }
-        }
-        AuthMode::ApiKey => {
-            if !(env_present("ANTHROPIC_API_KEY")
-                || env_present("OPENAI_API_KEY")
-                || env_present("XAI_API_KEY")
-                || env_present("DASHSCOPE_API_KEY")
-                || env_present("GOOGLE_API_KEY"))
-            {
-                return Err(ApiError::Auth(
-                    "--auth api-key requires one of ANTHROPIC_API_KEY, OPENAI_API_KEY, XAI_API_KEY, DASHSCOPE_API_KEY, or GOOGLE_API_KEY to be set.".to_string(),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn env_present(key: &str) -> bool {
-    std::env::var(key)
-        .ok()
-        .is_some_and(|v| !v.trim().is_empty())
-}
-
 #[allow(dead_code)]
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ApiError>> + Send + 'a>>;
 
@@ -148,304 +78,7 @@ pub enum ProviderKind {
     Anthropic,
     Xai,
     OpenAi,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProviderMetadata {
-    pub provider: ProviderKind,
-    pub auth_env: &'static str,
-    pub base_url_env: &'static str,
-    pub default_base_url: &'static str,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ModelTokenLimit {
-    pub max_output_tokens: u32,
-    pub context_window_tokens: u32,
-}
-
-const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
-    (
-        "opus",
-        ProviderMetadata {
-            provider: ProviderKind::Anthropic,
-            auth_env: "ANTHROPIC_API_KEY",
-            base_url_env: "ANTHROPIC_BASE_URL",
-            default_base_url: anthropic::DEFAULT_BASE_URL,
-        },
-    ),
-    (
-        "sonnet",
-        ProviderMetadata {
-            provider: ProviderKind::Anthropic,
-            auth_env: "ANTHROPIC_API_KEY",
-            base_url_env: "ANTHROPIC_BASE_URL",
-            default_base_url: anthropic::DEFAULT_BASE_URL,
-        },
-    ),
-    (
-        "haiku",
-        ProviderMetadata {
-            provider: ProviderKind::Anthropic,
-            auth_env: "ANTHROPIC_API_KEY",
-            base_url_env: "ANTHROPIC_BASE_URL",
-            default_base_url: anthropic::DEFAULT_BASE_URL,
-        },
-    ),
-    (
-        "grok",
-        ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        },
-    ),
-    (
-        "grok-3",
-        ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        },
-    ),
-    (
-        "grok-mini",
-        ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        },
-    ),
-    (
-        "grok-3-mini",
-        ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        },
-    ),
-    (
-        "grok-2",
-        ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        },
-    ),
-    (
-        "kimi",
-        ProviderMetadata {
-            provider: ProviderKind::OpenAi,
-            auth_env: "DASHSCOPE_API_KEY",
-            base_url_env: "DASHSCOPE_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
-        },
-    ),
-];
-
-#[must_use]
-pub fn resolve_model_alias(model: &str) -> String {
-    let trimmed = model.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    MODEL_REGISTRY
-        .iter()
-        .find_map(|(alias, metadata)| {
-            (*alias == lower).then_some(match metadata.provider {
-                ProviderKind::Anthropic => match *alias {
-                    "opus" => "claude-opus-4-6",
-                    "sonnet" => "claude-sonnet-4-6",
-                    "haiku" => "claude-haiku-4-5-20251213",
-                    _ => trimmed,
-                },
-                ProviderKind::Xai => match *alias {
-                    "grok" | "grok-3" => "grok-3",
-                    "grok-mini" | "grok-3-mini" => "grok-3-mini",
-                    "grok-2" => "grok-2",
-                    _ => trimmed,
-                },
-                ProviderKind::OpenAi => match *alias {
-                    "kimi" => "kimi-k2.5",
-                    _ => trimmed,
-                },
-            })
-        })
-        .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
-}
-
-#[must_use]
-pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
-    let canonical = resolve_model_alias(model);
-    if canonical.starts_with("claude") {
-        return Some(ProviderMetadata {
-            provider: ProviderKind::Anthropic,
-            auth_env: "ANTHROPIC_API_KEY",
-            base_url_env: "ANTHROPIC_BASE_URL",
-            default_base_url: anthropic::DEFAULT_BASE_URL,
-        });
-    }
-    if canonical.starts_with("grok") {
-        return Some(ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        });
-    }
-    // Explicit provider-namespaced models (e.g. "openai/gpt-4.1-mini") must
-    // route to the correct provider regardless of which auth env vars are set.
-    // Without this, detect_provider_kind falls through to the auth-sniffer
-    // order and misroutes to Anthropic if ANTHROPIC_API_KEY is present.
-    if canonical.starts_with("openai/") || canonical.starts_with("gpt-") {
-        return Some(ProviderMetadata {
-            provider: ProviderKind::OpenAi,
-            auth_env: "OPENAI_API_KEY",
-            base_url_env: "OPENAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
-        });
-    }
-    // Alibaba DashScope compatible-mode endpoint. Routes qwen/* and bare
-    // qwen-* model names (qwen-max, qwen-plus, qwen-turbo, qwen-qwq, etc.)
-    // to the OpenAI-compat client pointed at DashScope's /compatible-mode/v1.
-    // Uses the OpenAi provider kind because DashScope speaks the OpenAI REST
-    // shape — only the base URL and auth env var differ.
-    if canonical.starts_with("qwen/") || canonical.starts_with("qwen-") {
-        return Some(ProviderMetadata {
-            provider: ProviderKind::OpenAi,
-            auth_env: "DASHSCOPE_API_KEY",
-            base_url_env: "DASHSCOPE_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
-        });
-    }
-    // Kimi models (kimi-k2.5, kimi-k1.5, etc.) via DashScope compatible-mode.
-    // Routes kimi/* and kimi-* model names to DashScope endpoint.
-    if canonical.starts_with("kimi/") || canonical.starts_with("kimi-") {
-        return Some(ProviderMetadata {
-            provider: ProviderKind::OpenAi,
-            auth_env: "DASHSCOPE_API_KEY",
-            base_url_env: "DASHSCOPE_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
-        });
-    }
-    None
-}
-
-#[must_use]
-pub fn detect_provider_kind(model: &str) -> ProviderKind {
-    if let Some(metadata) = metadata_for_model(model) {
-        return metadata.provider;
-    }
-    // When OPENAI_BASE_URL is set, the user explicitly configured an
-    // OpenAI-compatible endpoint. Prefer it over the Anthropic fallback
-    // even when the model name has no recognized prefix — this is the
-    // common case for local providers (Ollama, LM Studio, vLLM, etc.)
-    // where model names like "qwen2.5-coder:7b" don't match any prefix.
-    if std::env::var_os("OPENAI_BASE_URL").is_some() && openai_compat::has_api_key("OPENAI_API_KEY")
-    {
-        return ProviderKind::OpenAi;
-    }
-    if anthropic::has_anthropic_api_key_env() {
-        return ProviderKind::Anthropic;
-    }
-    if openai_compat::has_api_key("OPENAI_API_KEY") {
-        return ProviderKind::OpenAi;
-    }
-    if openai_compat::has_api_key("XAI_API_KEY") {
-        return ProviderKind::Xai;
-    }
-    // Last resort: if OPENAI_BASE_URL is set without OPENAI_API_KEY (some
-    // local providers like Ollama don't require auth), still route there.
-    if std::env::var_os("OPENAI_BASE_URL").is_some() {
-        return ProviderKind::OpenAi;
-    }
-    ProviderKind::Anthropic
-}
-
-#[must_use]
-pub fn max_tokens_for_model(model: &str) -> u32 {
-    model_token_limit(model).map_or_else(
-        || {
-            let canonical = resolve_model_alias(model);
-            if canonical.contains("opus") {
-                32_000
-            } else {
-                64_000
-            }
-        },
-        |limit| limit.max_output_tokens,
-    )
-}
-
-/// Returns the effective max output tokens for a model, preferring a plugin
-/// override when present. Falls back to [`max_tokens_for_model`] when the
-/// override is `None`.
-#[must_use]
-pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u32>) -> u32 {
-    plugin_override.unwrap_or_else(|| max_tokens_for_model(model))
-}
-
-#[must_use]
-pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
-    let canonical = resolve_model_alias(model);
-    match canonical.as_str() {
-        "claude-opus-4-6" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 200_000,
-        }),
-        "claude-sonnet-4-6" | "claude-haiku-4-5-20251213" => Some(ModelTokenLimit {
-            max_output_tokens: 64_000,
-            context_window_tokens: 200_000,
-        }),
-        "grok-3" | "grok-3-mini" => Some(ModelTokenLimit {
-            max_output_tokens: 64_000,
-            context_window_tokens: 131_072,
-        }),
-        // Kimi models via DashScope (Moonshot AI)
-        // Source: https://platform.moonshot.cn/docs/intro
-        "kimi-k2.5" | "kimi-k1.5" => Some(ModelTokenLimit {
-            max_output_tokens: 16_384,
-            context_window_tokens: 256_000,
-        }),
-        _ => None,
-    }
-}
-
-pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiError> {
-    let Some(limit) = model_token_limit(&request.model) else {
-        return Ok(());
-    };
-
-    let estimated_input_tokens = estimate_message_request_input_tokens(request);
-    let estimated_total_tokens = estimated_input_tokens.saturating_add(request.max_tokens);
-    if estimated_total_tokens > limit.context_window_tokens {
-        return Err(ApiError::ContextWindowExceeded {
-            model: resolve_model_alias(&request.model),
-            estimated_input_tokens,
-            requested_output_tokens: request.max_tokens,
-            estimated_total_tokens,
-            context_window_tokens: limit.context_window_tokens,
-        });
-    }
-
-    Ok(())
-}
-
-fn estimate_message_request_input_tokens(request: &MessageRequest) -> u32 {
-    let mut estimate = estimate_serialized_tokens(&request.messages);
-    estimate = estimate.saturating_add(estimate_serialized_tokens(&request.system));
-    estimate = estimate.saturating_add(estimate_serialized_tokens(&request.tools));
-    estimate = estimate.saturating_add(estimate_serialized_tokens(&request.tool_choice));
-    estimate
-}
-
-fn estimate_serialized_tokens<T: Serialize>(value: &T) -> u32 {
-    serde_json::to_vec(value)
-        .ok()
-        .map_or(0, |bytes| (bytes.len() / 4 + 1) as u32)
+    Codex,
 }
 
 /// Env var names used by other provider backends. When Anthropic auth
@@ -579,18 +212,11 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
 
-    use serde_json::json;
-
     use crate::error::ApiError;
-    use crate::types::{
-        InputContentBlock, InputMessage, MessageRequest, ToolChoice, ToolDefinition,
-    };
 
     use super::{
-        anthropic_missing_credentials, anthropic_missing_credentials_hint, detect_provider_kind,
-        load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
-        model_token_limit, parse_dotenv, preflight_message_request, resolve_model_alias,
-        ProviderKind,
+        anthropic_missing_credentials, anthropic_missing_credentials_hint, load_dotenv_file,
+        parse_dotenv,
     };
 
     /// Serializes every test in this module that mutates process-wide
@@ -634,307 +260,6 @@ mod tests {
     }
 
     #[test]
-    fn resolves_grok_aliases() {
-        assert_eq!(resolve_model_alias("grok"), "grok-3");
-        assert_eq!(resolve_model_alias("grok-mini"), "grok-3-mini");
-        assert_eq!(resolve_model_alias("grok-2"), "grok-2");
-    }
-
-    #[test]
-    fn detects_provider_from_model_name_first() {
-        assert_eq!(detect_provider_kind("grok"), ProviderKind::Xai);
-        assert_eq!(
-            detect_provider_kind("claude-sonnet-4-6"),
-            ProviderKind::Anthropic
-        );
-    }
-
-    #[test]
-    fn openai_namespaced_model_routes_to_openai_not_anthropic() {
-        // Regression: "openai/gpt-4.1-mini" was misrouted to Anthropic when
-        // ANTHROPIC_API_KEY was set because metadata_for_model returned None
-        // and detect_provider_kind fell through to auth-sniffer order.
-        // The model prefix must win over env-var presence.
-        let kind = super::metadata_for_model("openai/gpt-4.1-mini").map_or_else(
-            || detect_provider_kind("openai/gpt-4.1-mini"),
-            |m| m.provider,
-        );
-        assert_eq!(
-            kind,
-            ProviderKind::OpenAi,
-            "openai/ prefix must route to OpenAi regardless of ANTHROPIC_API_KEY"
-        );
-
-        // Also cover bare gpt- prefix
-        let kind2 = super::metadata_for_model("gpt-4o")
-            .map_or_else(|| detect_provider_kind("gpt-4o"), |m| m.provider);
-        assert_eq!(kind2, ProviderKind::OpenAi);
-    }
-
-    #[test]
-    fn qwen_prefix_routes_to_dashscope_not_anthropic() {
-        // User request from Discord #sudocode-get-help: web3g wants to use
-        // Qwen 3.6 Plus via native Alibaba DashScope API (not OpenRouter,
-        // which has lower rate limits). metadata_for_model must route
-        // qwen/* and bare qwen-* to the OpenAi provider kind pointed at
-        // the DashScope compatible-mode endpoint, regardless of whether
-        // ANTHROPIC_API_KEY is present in the environment.
-        let meta = super::metadata_for_model("qwen/qwen-max")
-            .expect("qwen/ prefix must resolve to DashScope metadata");
-        assert_eq!(meta.provider, ProviderKind::OpenAi);
-        assert_eq!(meta.auth_env, "DASHSCOPE_API_KEY");
-        assert_eq!(meta.base_url_env, "DASHSCOPE_BASE_URL");
-        assert!(meta.default_base_url.contains("dashscope.aliyuncs.com"));
-
-        // Bare qwen- prefix also routes
-        let meta2 = super::metadata_for_model("qwen-plus")
-            .expect("qwen- prefix must resolve to DashScope metadata");
-        assert_eq!(meta2.provider, ProviderKind::OpenAi);
-        assert_eq!(meta2.auth_env, "DASHSCOPE_API_KEY");
-
-        // detect_provider_kind must agree even if ANTHROPIC_API_KEY is set
-        let kind = detect_provider_kind("qwen/qwen3-coder");
-        assert_eq!(
-            kind,
-            ProviderKind::OpenAi,
-            "qwen/ prefix must win over auth-sniffer order"
-        );
-    }
-
-    #[test]
-    fn kimi_prefix_routes_to_dashscope() {
-        // Kimi models via DashScope (kimi-k2.5, kimi-k1.5, etc.)
-        let meta = super::metadata_for_model("kimi-k2.5")
-            .expect("kimi-k2.5 must resolve to DashScope metadata");
-        assert_eq!(meta.auth_env, "DASHSCOPE_API_KEY");
-        assert_eq!(meta.base_url_env, "DASHSCOPE_BASE_URL");
-        assert!(meta.default_base_url.contains("dashscope.aliyuncs.com"));
-        assert_eq!(meta.provider, ProviderKind::OpenAi);
-
-        // With provider prefix
-        let meta2 = super::metadata_for_model("kimi/kimi-k2.5")
-            .expect("kimi/kimi-k2.5 must resolve to DashScope metadata");
-        assert_eq!(meta2.auth_env, "DASHSCOPE_API_KEY");
-        assert_eq!(meta2.provider, ProviderKind::OpenAi);
-
-        // Different kimi variants
-        let meta3 = super::metadata_for_model("kimi-k1.5")
-            .expect("kimi-k1.5 must resolve to DashScope metadata");
-        assert_eq!(meta3.auth_env, "DASHSCOPE_API_KEY");
-    }
-
-    #[test]
-    fn kimi_alias_resolves_to_kimi_k2_5() {
-        assert_eq!(super::resolve_model_alias("kimi"), "kimi-k2.5");
-        assert_eq!(super::resolve_model_alias("KIMI"), "kimi-k2.5"); // case insensitive
-    }
-
-    #[test]
-    fn keeps_existing_max_token_heuristic() {
-        assert_eq!(max_tokens_for_model("opus"), 32_000);
-        assert_eq!(max_tokens_for_model("grok-3"), 64_000);
-    }
-
-    #[test]
-    fn plugin_config_max_output_tokens_overrides_model_default() {
-        // given
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time should be after epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("api-plugin-max-tokens-{nanos}"));
-        let cwd = root.join("project");
-        let home = root.join("home").join(".nexus").join("sudocode");
-        std::fs::create_dir_all(cwd.join(".nexus").join("sudocode")).expect("project config dir");
-        std::fs::create_dir_all(&home).expect("home config dir");
-        std::fs::write(
-            home.join("settings.json"),
-            r#"{
-              "plugins": {
-                "maxOutputTokens": 12345
-              }
-            }"#,
-        )
-        .expect("write plugin settings");
-
-        // when
-        let loaded = runtime::ConfigLoader::new(&cwd, &home)
-            .load()
-            .expect("config should load");
-        let plugin_override = loaded.plugins().max_output_tokens();
-        let effective = max_tokens_for_model_with_override("claude-opus-4-6", plugin_override);
-
-        // then
-        assert_eq!(plugin_override, Some(12345));
-        assert_eq!(effective, 12345);
-        assert_ne!(effective, max_tokens_for_model("claude-opus-4-6"));
-
-        std::fs::remove_dir_all(root).expect("cleanup temp dir");
-    }
-
-    #[test]
-    fn max_tokens_for_model_with_override_falls_back_when_plugin_unset() {
-        // given
-        let plugin_override: Option<u32> = None;
-
-        // when
-        let effective = max_tokens_for_model_with_override("claude-opus-4-6", plugin_override);
-
-        // then
-        assert_eq!(effective, max_tokens_for_model("claude-opus-4-6"));
-        assert_eq!(effective, 32_000);
-    }
-
-    #[test]
-    fn returns_context_window_metadata_for_supported_models() {
-        assert_eq!(
-            model_token_limit("claude-sonnet-4-6")
-                .expect("claude-sonnet-4-6 should be registered")
-                .context_window_tokens,
-            200_000
-        );
-        assert_eq!(
-            model_token_limit("grok-mini")
-                .expect("grok-mini should resolve to a registered model")
-                .context_window_tokens,
-            131_072
-        );
-    }
-
-    #[test]
-    fn preflight_blocks_requests_that_exceed_the_model_context_window() {
-        let request = MessageRequest {
-            model: "claude-sonnet-4-6".to_string(),
-            max_tokens: 64_000,
-            messages: vec![InputMessage {
-                role: "user".to_string(),
-                content: vec![InputContentBlock::Text {
-                    text: "x".repeat(600_000),
-                }],
-            }],
-            system: Some("Keep the answer short.".to_string()),
-            tools: Some(vec![ToolDefinition {
-                name: "weather".to_string(),
-                description: Some("Fetches weather".to_string()),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": { "city": { "type": "string" } },
-                }),
-            }]),
-            tool_choice: Some(ToolChoice::Auto),
-            stream: true,
-            ..Default::default()
-        };
-
-        let error = preflight_message_request(&request)
-            .expect_err("oversized request should be rejected before the provider call");
-
-        match error {
-            ApiError::ContextWindowExceeded {
-                model,
-                estimated_input_tokens,
-                requested_output_tokens,
-                estimated_total_tokens,
-                context_window_tokens,
-            } => {
-                assert_eq!(model, "claude-sonnet-4-6");
-                assert!(estimated_input_tokens > 136_000);
-                assert_eq!(requested_output_tokens, 64_000);
-                assert!(estimated_total_tokens > context_window_tokens);
-                assert_eq!(context_window_tokens, 200_000);
-            }
-            other => panic!("expected context-window preflight failure, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn preflight_skips_unknown_models() {
-        let request = MessageRequest {
-            model: "unknown-model".to_string(),
-            max_tokens: 64_000,
-            messages: vec![InputMessage {
-                role: "user".to_string(),
-                content: vec![InputContentBlock::Text {
-                    text: "x".repeat(600_000),
-                }],
-            }],
-            system: None,
-            tools: None,
-            tool_choice: None,
-            stream: false,
-            ..Default::default()
-        };
-
-        preflight_message_request(&request)
-            .expect("models without context metadata should skip the guarded preflight");
-    }
-
-    #[test]
-    fn returns_context_window_metadata_for_kimi_models() {
-        // kimi-k2.5
-        let k25_limit =
-            model_token_limit("kimi-k2.5").expect("kimi-k2.5 should have token limit metadata");
-        assert_eq!(k25_limit.max_output_tokens, 16_384);
-        assert_eq!(k25_limit.context_window_tokens, 256_000);
-
-        // kimi-k1.5
-        let k15_limit =
-            model_token_limit("kimi-k1.5").expect("kimi-k1.5 should have token limit metadata");
-        assert_eq!(k15_limit.max_output_tokens, 16_384);
-        assert_eq!(k15_limit.context_window_tokens, 256_000);
-    }
-
-    #[test]
-    fn kimi_alias_resolves_to_kimi_k25_token_limits() {
-        // The "kimi" alias resolves to "kimi-k2.5" via resolve_model_alias()
-        let alias_limit =
-            model_token_limit("kimi").expect("kimi alias should resolve to kimi-k2.5 limits");
-        let direct_limit = model_token_limit("kimi-k2.5").expect("kimi-k2.5 should have limits");
-        assert_eq!(
-            alias_limit.max_output_tokens,
-            direct_limit.max_output_tokens
-        );
-        assert_eq!(
-            alias_limit.context_window_tokens,
-            direct_limit.context_window_tokens
-        );
-    }
-
-    #[test]
-    fn preflight_blocks_oversized_requests_for_kimi_models() {
-        let request = MessageRequest {
-            model: "kimi-k2.5".to_string(),
-            max_tokens: 16_384,
-            messages: vec![InputMessage {
-                role: "user".to_string(),
-                content: vec![InputContentBlock::Text {
-                    text: "x".repeat(1_000_000), // Large input to exceed context window
-                }],
-            }],
-            system: Some("Keep the answer short.".to_string()),
-            tools: None,
-            tool_choice: None,
-            stream: true,
-            ..Default::default()
-        };
-
-        let error = preflight_message_request(&request)
-            .expect_err("oversized request should be rejected for kimi models");
-
-        match error {
-            ApiError::ContextWindowExceeded {
-                model,
-                context_window_tokens,
-                ..
-            } => {
-                assert_eq!(model, "kimi-k2.5");
-                assert_eq!(context_window_tokens, 256_000);
-            }
-            other => panic!("expected context-window preflight failure, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn parse_dotenv_extracts_keys_handles_comments_quotes_and_export_prefix() {
         // given
         let body = "\
@@ -944,7 +269,7 @@ ANTHROPIC_API_KEY=plain-value
 XAI_API_KEY=\"quoted-value\"
 OPENAI_API_KEY='single-quoted'
 export GROK_API_KEY=exported-value
-   PADDED_KEY  =  padded-value  
+   PADDED_KEY  =  padded-value
 EMPTY_VALUE=
 NO_EQUALS_LINE
 ";
@@ -1017,16 +342,13 @@ NO_EQUALS_LINE
 
     #[test]
     fn anthropic_missing_credentials_hint_is_none_when_no_foreign_creds_present() {
-        // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
-        // when
         let hint = anthropic_missing_credentials_hint();
 
-        // then
         assert!(
             hint.is_none(),
             "no hint should be produced when every foreign provider env var is absent, got {hint:?}"
@@ -1035,124 +357,73 @@ NO_EQUALS_LINE
 
     #[test]
     fn anthropic_missing_credentials_hint_detects_openai_api_key_and_recommends_openai_prefix() {
-        // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
-        // when
         let hint = anthropic_missing_credentials_hint()
             .expect("OPENAI_API_KEY presence should produce a hint");
 
-        // then
-        assert!(
-            hint.contains("OPENAI_API_KEY is set"),
-            "hint should name the detected env var so users recognize it: {hint}"
-        );
-        assert!(
-            hint.contains("OpenAI-compat"),
-            "hint should identify the target provider: {hint}"
-        );
-        assert!(
-            hint.contains("openai/"),
-            "hint should mention the `openai/` prefix routing fix: {hint}"
-        );
-        assert!(
-            hint.contains("OPENAI_BASE_URL"),
-            "hint should mention OPENAI_BASE_URL so OpenRouter users see the full picture: {hint}"
-        );
+        assert!(hint.contains("OPENAI_API_KEY is set"));
+        assert!(hint.contains("OpenAI-compat"));
+        assert!(hint.contains("openai/"));
+        assert!(hint.contains("OPENAI_BASE_URL"));
     }
 
     #[test]
     fn anthropic_missing_credentials_hint_detects_xai_api_key() {
-        // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", Some("xai-test-key"));
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
-        // when
         let hint = anthropic_missing_credentials_hint()
             .expect("XAI_API_KEY presence should produce a hint");
 
-        // then
-        assert!(
-            hint.contains("XAI_API_KEY is set"),
-            "hint should name XAI_API_KEY: {hint}"
-        );
-        assert!(
-            hint.contains("xAI"),
-            "hint should identify the xAI provider: {hint}"
-        );
-        assert!(
-            hint.contains("grok"),
-            "hint should suggest a grok-prefixed model alias: {hint}"
-        );
+        assert!(hint.contains("XAI_API_KEY is set"));
+        assert!(hint.contains("xAI"));
+        assert!(hint.contains("grok"));
     }
 
     #[test]
     fn anthropic_missing_credentials_hint_detects_dashscope_api_key() {
-        // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", Some("sk-dashscope-test"));
 
-        // when
         let hint = anthropic_missing_credentials_hint()
             .expect("DASHSCOPE_API_KEY presence should produce a hint");
 
-        // then
-        assert!(
-            hint.contains("DASHSCOPE_API_KEY is set"),
-            "hint should name DASHSCOPE_API_KEY: {hint}"
-        );
-        assert!(
-            hint.contains("DashScope"),
-            "hint should identify the DashScope provider: {hint}"
-        );
-        assert!(
-            hint.contains("qwen"),
-            "hint should suggest a qwen-prefixed model alias: {hint}"
-        );
+        assert!(hint.contains("DASHSCOPE_API_KEY is set"));
+        assert!(hint.contains("DashScope"));
+        assert!(hint.contains("qwen"));
     }
 
     #[test]
     fn anthropic_missing_credentials_hint_prefers_openai_when_multiple_foreign_creds_set() {
-        // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
         let _xai = EnvVarGuard::set("XAI_API_KEY", Some("xai-test-key"));
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", Some("sk-dashscope-test"));
 
-        // when
         let hint = anthropic_missing_credentials_hint()
             .expect("multiple foreign creds should still produce a hint");
 
-        // then
-        assert!(
-            hint.contains("OPENAI_API_KEY"),
-            "OpenAI should be prioritized because it is the most common misrouting pattern (OpenRouter users), got: {hint}"
-        );
-        assert!(
-            !hint.contains("XAI_API_KEY"),
-            "only the first detected provider should be named to keep the hint focused, got: {hint}"
-        );
+        assert!(hint.contains("OPENAI_API_KEY"));
+        assert!(!hint.contains("XAI_API_KEY"));
     }
 
     #[test]
     fn anthropic_missing_credentials_builds_error_with_canonical_env_vars_and_no_hint_when_clean() {
-        // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
-        // when
         let error = anthropic_missing_credentials();
 
-        // then
         match &error {
             ApiError::MissingCredentials {
                 provider,
@@ -1168,32 +439,23 @@ NO_EQUALS_LINE
                         "PROXY_AUTH_TOKEN"
                     ]
                 );
-                assert!(
-                    hint.is_none(),
-                    "clean environment should not generate a hint, got {hint:?}"
-                );
+                assert!(hint.is_none());
             }
             other => panic!("expected MissingCredentials variant, got {other:?}"),
         }
         let rendered = error.to_string();
-        assert!(
-            !rendered.contains(" — hint: "),
-            "rendered error should be a plain missing-creds message: {rendered}"
-        );
+        assert!(!rendered.contains(" — hint: "));
     }
 
     #[test]
     fn anthropic_missing_credentials_builds_error_with_hint_when_openai_key_is_set() {
-        // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
-        // when
         let error = anthropic_missing_credentials();
 
-        // then
         match &error {
             ApiError::MissingCredentials {
                 provider,
@@ -1210,70 +472,24 @@ NO_EQUALS_LINE
                     ]
                 );
                 let hint_value = hint.as_deref().expect("hint should be populated");
-                assert!(
-                    hint_value.contains("OPENAI_API_KEY is set"),
-                    "hint should name the detected env var: {hint_value}"
-                );
+                assert!(hint_value.contains("OPENAI_API_KEY is set"));
             }
             other => panic!("expected MissingCredentials variant, got {other:?}"),
         }
         let rendered = error.to_string();
-        assert!(
-            rendered.starts_with("missing Anthropic credentials;"),
-            "canonical base message should still lead the rendered error: {rendered}"
-        );
-        assert!(
-            rendered.contains(" — hint: I see OPENAI_API_KEY is set"),
-            "rendered error should carry the env-driven hint: {rendered}"
-        );
+        assert!(rendered.starts_with("missing Anthropic credentials;"));
+        assert!(rendered.contains(" — hint: I see OPENAI_API_KEY is set"));
     }
 
     #[test]
     fn anthropic_missing_credentials_hint_ignores_empty_string_values() {
-        // given
         let _lock = env_lock();
-        // An empty value is semantically equivalent to "not set" for the
-        // credential discovery path, so the sniffer must treat it that way
-        // to avoid false-positive hints for users who intentionally cleared
-        // a stale export with `OPENAI_API_KEY=`.
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some(""));
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
-        // when
         let hint = anthropic_missing_credentials_hint();
 
-        // then
-        assert!(
-            hint.is_none(),
-            "empty env var should not trigger the hint sniffer, got {hint:?}"
-        );
+        assert!(hint.is_none());
     }
-
-    #[test]
-    fn openai_base_url_overrides_anthropic_fallback_for_unknown_model() {
-        // given — user has OPENAI_BASE_URL + OPENAI_API_KEY but no Anthropic
-        // creds, and a model name with no recognized prefix.
-        let _lock = env_lock();
-        let _base_url = EnvVarGuard::set("OPENAI_BASE_URL", Some("http://127.0.0.1:11434/v1"));
-        let _api_key = EnvVarGuard::set("OPENAI_API_KEY", Some("dummy"));
-        let _anthropic_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
-        let _proxy_token = EnvVarGuard::set("PROXY_AUTH_TOKEN", None);
-
-        // when
-        let provider = detect_provider_kind("qwen2.5-coder:7b");
-
-        // then — should route to OpenAI, not Anthropic
-        assert_eq!(
-            provider,
-            ProviderKind::OpenAi,
-            "OPENAI_BASE_URL should win over Anthropic fallback for unknown models"
-        );
-    }
-
-    // NOTE: a "OPENAI_BASE_URL without OPENAI_API_KEY" test is omitted
-    // because workspace-parallel test binaries can race on process env
-    // (env_lock only protects within a single binary). The detection logic
-    // is covered: OPENAI_BASE_URL alone routes to OpenAi as a last-resort
-    // fallback in detect_provider_kind().
 }

@@ -4,6 +4,10 @@
       "claude": {
         "baseUrl": "https://api.anthropic.com",
         "token": "<YOUR_CLAUDE_OAUTH_TOKEN>"
+      },
+      "codex": {
+        "baseUrl": "https://chatgpt.com/backend-api/codex",
+        "authFile": "~/.codex/auth.json"
       }
     },
     "proxy": {
@@ -52,6 +56,58 @@
         "api-key":      { "provider": "anthropic", "model": "claude-sonnet-4-6" }
       }
     },
+    "haiku": {
+      "alias": "haiku",
+      "name": "Claude Haiku 4.5",
+      "input": ["text"],
+      "providers": {
+        "subscription": { "provider": "claude", "model": "claude-haiku-4-5-20251213" },
+        "proxy":        { "provider": "sudorouter", "model": "claude-haiku-4-5-20251213", "api": "openai-completions" },
+        "api-key":      { "provider": "anthropic", "model": "claude-haiku-4-5-20251213" }
+      }
+    },
+    "grok": {
+      "alias": "grok",
+      "name": "Grok 3",
+      "input": ["text"],
+      "providers": {
+        "proxy":   { "provider": "sudorouter", "model": "grok-3", "api": "openai-completions" },
+        "api-key": { "provider": "xai", "model": "grok-3" }
+      }
+    },
+    "grok-mini": {
+      "alias": "grok-mini",
+      "name": "Grok 3 Mini",
+      "input": ["text"],
+      "providers": {
+        "proxy":   { "provider": "sudorouter", "model": "grok-3-mini", "api": "openai-completions" },
+        "api-key": { "provider": "xai", "model": "grok-3-mini" }
+      }
+    },
+    "grok-2": {
+      "alias": "grok-2",
+      "name": "Grok 2",
+      "input": ["text"],
+      "providers": {
+        "api-key": { "provider": "xai", "model": "grok-2" }
+      }
+    },
+    "kimi": {
+      "alias": "kimi",
+      "name": "Kimi K2.5",
+      "input": ["text"],
+      "providers": {
+        "api-key": { "provider": "dashscope", "model": "kimi-k2.5" }
+      }
+    },
+    "qwen-plus": {
+      "alias": "qwen-plus",
+      "name": "Qwen Plus",
+      "input": ["text"],
+      "providers": {
+        "api-key": { "provider": "dashscope", "model": "qwen-plus" }
+      }
+    },
     "gemini-3-pro": {
       "alias": "gemini-3-pro",
       "name": "Gemini 3.1 Pro",
@@ -73,7 +129,9 @@
       "name": "GPT 5.4",
       "input": ["text"],
       "providers": {
-        "proxy": { "provider": "sudorouter", "model": "gpt-5.4", "api": "openai-completions" }
+        "subscription": { "provider": "codex", "model": "gpt-5.4" },
+        "proxy":        { "provider": "sudorouter", "model": "gpt-5.4", "api": "openai-completions" },
+        "api-key":      { "provider": "openai", "model": "gpt-5.4" }
       }
     },
     "gpt-5.4-mini": {
@@ -81,7 +139,9 @@
       "name": "GPT 5.4 Mini",
       "input": ["text"],
       "providers": {
-        "proxy": { "provider": "sudorouter", "model": "gpt-5.4-mini", "api": "openai-completions" }
+        "subscription": { "provider": "codex", "model": "gpt-5.4-mini" },
+        "proxy":        { "provider": "sudorouter", "model": "gpt-5.4-mini", "api": "openai-completions" },
+        "api-key":      { "provider": "openai", "model": "gpt-5.4-mini" }
       }
     }
   }

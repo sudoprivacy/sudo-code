@@ -30,11 +30,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    base_url_for_mode, detect_provider_kind, resolve_auth_mode, resolve_startup_auth_source,
-    validate_auth_env, AnthropicClient, AuthMode, AuthSource, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
-    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock,
+    base_url_for_mode, resolve_startup_auth_source, AnthropicClient, AuthMode, AuthSource,
+    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -155,11 +154,7 @@ impl ModelProvenance {
 }
 
 fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
-        32_000
-    } else {
-        64_000
-    }
+    api::max_tokens_for_model(model)
 }
 // Build-time constants injected by build.rs (fall back to static values when
 // build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
@@ -1501,33 +1496,22 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
     previous[right_chars.len()]
 }
 
-fn resolve_model_alias(model: &str) -> &str {
-    match model {
-        "opus" => "claude-opus-4-6",
-        "sonnet" => "claude-sonnet-4-6",
-        "haiku" => "claude-haiku-4-5-20251213",
-        _ => model,
-    }
-}
-
-/// Resolve a model name through user-defined config aliases first, then fall
-/// back to the built-in alias table. This is the entry point used wherever a
-/// user-supplied model string is about to be dispatched to a provider.
+/// Resolve a model alias to a wire model ID. Checks sudocode.json model
+/// registry first, then config aliases. The config is the single source
+/// of truth for alias → wire model ID mapping.
 fn resolve_model_alias_with_config(model: &str) -> String {
     let trimmed = model.trim();
     // Check sudocode.json model registry first.
     let config = load_sudocode_config_for_current_dir();
-    if let Some(entry) = config.models.get(&trimmed.to_ascii_lowercase()) {
-        // Return the wire model ID from the first available provider mapping.
-        if let Some(mapping) = entry.providers.values().next() {
-            return mapping.model.clone();
-        }
+    let resolved = api::resolve_model_alias_from_config(&config, trimmed);
+    if resolved != trimmed {
+        return resolved;
     }
-    // Then check config aliases.
-    if let Some(resolved) = config_alias_for_current_dir(trimmed) {
-        return resolve_model_alias(&resolved).to_string();
+    // Then check config aliases (from settings.json).
+    if let Some(alias_target) = config_alias_for_current_dir(trimmed) {
+        return api::resolve_model_alias_from_config(&config, &alias_target);
     }
-    resolve_model_alias(trimmed).to_string()
+    resolved
 }
 
 /// Validate model syntax at parse time.
@@ -1594,7 +1578,7 @@ fn config_alias_for_current_dir(alias: &str) -> Option<String> {
 /// Load `SudoCodeConfig` from the config home for the current directory.
 fn load_sudocode_config_for_current_dir() -> api::SudoCodeConfig {
     let Ok(cwd) = env::current_dir() else {
-        return api::SudoCodeConfig::default();
+        return api::SudoCodeConfig::builtin();
     };
     load_sudocode_config_for_cwd(&cwd)
 }
@@ -1604,8 +1588,40 @@ fn load_sudocode_config_for_cwd(cwd: &Path) -> api::SudoCodeConfig {
     let loader = ConfigLoader::default_for(cwd);
     loader.load_sudocode_config().unwrap_or_else(|e| {
         eprintln!("warning: failed to load sudocode.json: {e}");
-        api::SudoCodeConfig::default()
+        api::SudoCodeConfig::builtin()
     })
+}
+
+/// Resolve an optional auth mode to a concrete one using the sudocode config.
+///
+/// When `explicit` is `Some`, it is returned as-is. When `None`, the first
+/// available mode for the model is selected in priority order:
+/// subscription → proxy → api-key. If none is available, returns an error
+/// directing the user to configure their model.
+fn resolve_auth_mode(
+    model: &str,
+    explicit: Option<AuthMode>,
+    config: &api::SudoCodeConfig,
+) -> Result<AuthMode, String> {
+    const PRIORITY: &[&str] = &["subscription", "proxy", "api-key"];
+    if let Some(mode) = explicit {
+        return Ok(mode);
+    }
+    let entry = api::resolve_model(config, model).ok_or_else(|| {
+        format!(
+            "model '{model}' not found in config. Run /model to configure it, \
+             or pass --auth=<subscription|proxy|api-key> explicitly."
+        )
+    })?;
+    for mode_str in PRIORITY {
+        if entry.providers.contains_key(*mode_str) {
+            return AuthMode::parse(mode_str);
+        }
+    }
+    Err(format!(
+        "no auth mode available for model '{model}'. Run /model to configure it, \
+         or pass --auth=<subscription|proxy|api-key> explicitly."
+    ))
 }
 
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
@@ -1707,6 +1723,7 @@ fn provider_label(kind: ProviderKind) -> &'static str {
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::Xai => "xai",
         ProviderKind::OpenAi => "openai",
+        ProviderKind::Codex => "codex",
     }
 }
 
@@ -1715,7 +1732,7 @@ fn format_connected_line(model: &str) -> String {
 }
 
 fn format_connected_line_with_mode(model: &str, mode: Option<AuthMode>) -> String {
-    format_connected_line_with_config(model, mode, &api::SudoCodeConfig::default())
+    format_connected_line_with_config(model, mode, &api::SudoCodeConfig::builtin())
 }
 
 fn format_connected_line_with_config(
@@ -1723,15 +1740,30 @@ fn format_connected_line_with_config(
     mode: Option<AuthMode>,
     sudocode_config: &api::SudoCodeConfig,
 ) -> String {
-    // Try to get display name from sudocode.json config first.
-    let config_display = sudocode_config
-        .models
-        .get(&model.to_ascii_lowercase())
-        .map(|m| m.name.as_str());
-    let provider = config_display
-        .map(String::from)
-        .unwrap_or_else(|| provider_label(detect_provider_kind(model)).to_string());
-    let resolved_mode = mode.or_else(|| resolve_auth_mode(None).ok());
+    // Try to get provider label from sudocode.json config.
+    let resolved_mode = mode.or_else(|| {
+        // Auto-detect from model config: first available in priority order.
+        const PRIORITY: &[&str] = &["subscription", "proxy", "api-key"];
+        let entry = api::resolve_model(sudocode_config, model)?;
+        let mode_str = PRIORITY
+            .iter()
+            .find(|m| entry.providers.contains_key(**m))?;
+        AuthMode::parse(mode_str).ok()
+    });
+    let provider = {
+        // Look up provider name from config entry's mapping for the resolved mode.
+        let mode_key = resolved_mode.map(|m| m.label().to_string());
+        api::resolve_model(sudocode_config, model)
+            .and_then(|entry| {
+                let mapping = if let Some(key) = &mode_key {
+                    entry.providers.get(key.as_str())
+                } else {
+                    entry.providers.values().next()
+                };
+                mapping.map(|m| m.provider.clone())
+            })
+            .unwrap_or_else(|| model.to_string())
+    };
     let auth_hint = match resolved_mode {
         Some(m) => format!(" ({})", m.label()),
         None => String::new(),
@@ -1740,10 +1772,10 @@ fn format_connected_line_with_config(
         Some(m) => api::base_url_for_mode(m),
         None => api::read_base_url(),
     };
-    let endpoint_hint = if base_url != api::DEFAULT_BASE_URL {
-        format!("\nEndpoint:  {base_url}")
-    } else {
+    let endpoint_hint = if base_url == api::DEFAULT_BASE_URL {
         String::new()
+    } else {
+        format!("\nEndpoint:  {base_url}")
     };
     format!("Connected: {model} via {provider}{auth_hint}{endpoint_hint}")
 }
@@ -3050,6 +3082,7 @@ fn format_unknown_slash_command_message(name: &str) -> String {
 }
 
 fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
+    use std::fmt::Write;
     let config = load_sudocode_config_for_current_dir();
     let mut available_lines = String::new();
     for (alias, entry) in &config.models {
@@ -3058,13 +3091,14 @@ fn format_model_report(model: &str, message_count: usize, turns: u32) -> String 
         } else {
             ""
         };
-        let modes: Vec<&str> = entry.providers.keys().map(String::as_str).collect();
-        available_lines.push_str(&format!(
+        let auth_modes: Vec<&str> = entry.providers.keys().map(String::as_str).collect();
+        let _ = write!(
+            available_lines,
             "\n    {:<16} {} ({}){marker}",
             alias,
             entry.name,
-            modes.join(", ")
-        ));
+            auth_modes.join(", ")
+        );
     }
     let available = if available_lines.is_empty() {
         String::from("opus, sonnet, haiku")
@@ -3932,7 +3966,7 @@ struct RuntimeConfig {
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
-    auth_mode: Option<AuthMode>,
+    auth_mode: AuthMode,
     sudocode_config: api::SudoCodeConfig,
 }
 
@@ -4058,7 +4092,7 @@ impl AcpCliAgent {
         }
     }
 
-    fn build_session(&self, cwd: PathBuf) -> Result<AcpCliSession, AcpError> {
+    fn build_session(&self, cwd: &Path) -> Result<AcpCliSession, AcpError> {
         let cwd = canonical_session_cwd(cwd)?;
         let model = self.resolve_model_for_cwd(&cwd)?;
         let permission_mode = self.resolve_permission_mode_for_cwd(&cwd)?;
@@ -4074,16 +4108,21 @@ impl AcpCliAgent {
             &cwd,
             session_state.with_persistence_path(handle.path.clone()),
             &handle.id,
-            RuntimeConfig {
-                model,
-                system_prompt,
-                enable_tools: true,
-                emit_output: false,
-                allowed_tools: self.allowed_tools.clone(),
-                permission_mode,
-                progress_reporter: None,
-                auth_mode: self.auth_mode,
-                sudocode_config: load_sudocode_config_for_cwd(&cwd),
+            {
+                let sudocode_config = load_sudocode_config_for_cwd(&cwd);
+                let auth_mode = resolve_auth_mode(&model, self.auth_mode, &sudocode_config)
+                    .map_err(|e| AcpError::internal(format!("failed to resolve auth mode: {e}")))?;
+                RuntimeConfig {
+                    model,
+                    system_prompt,
+                    enable_tools: true,
+                    emit_output: false,
+                    allowed_tools: self.allowed_tools.clone(),
+                    permission_mode,
+                    progress_reporter: None,
+                    auth_mode,
+                    sudocode_config,
+                }
             },
         )
         .map_err(|error| AcpError::internal(format!("failed to build runtime: {error}")))?;
@@ -4126,10 +4165,9 @@ impl AcpCliAgent {
 impl runtime::AcpAgent for AcpCliAgent {
     fn new_session(&mut self, cwd: Option<PathBuf>) -> Result<String, AcpError> {
         let cwd = cwd
-            .map(Ok)
-            .unwrap_or_else(env::current_dir)
+            .map_or_else(env::current_dir, Ok)
             .map_err(|error| AcpError::internal(format!("failed to resolve cwd: {error}")))?;
-        let session = self.build_session(cwd)?;
+        let session = self.build_session(&cwd)?;
         let session_id = session.handle.id.clone();
         self.sessions.insert(session_id.clone(), session);
         Ok(session_id)
@@ -4178,8 +4216,8 @@ impl Drop for ScopedCurrentDir {
     }
 }
 
-fn canonical_session_cwd(cwd: PathBuf) -> Result<PathBuf, AcpError> {
-    let canonical = fs::canonicalize(&cwd).map_err(|error| {
+fn canonical_session_cwd(cwd: &Path) -> Result<PathBuf, AcpError> {
+    let canonical = fs::canonicalize(cwd).map_err(|error| {
         AcpError::invalid_params(format!("params.cwd is not accessible: {error}"))
     })?;
     if !canonical.is_dir() {
@@ -4597,6 +4635,8 @@ impl LiveCli {
         let system_prompt = build_system_prompt()?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
+        let sudocode_config = load_sudocode_config_for_current_dir();
+        let auth_mode = resolve_auth_mode(&model, auth_mode, &sudocode_config)?;
         let config = RuntimeConfig {
             model,
             system_prompt,
@@ -4606,7 +4646,7 @@ impl LiveCli {
             permission_mode,
             progress_reporter: None,
             auth_mode,
-            sudocode_config: load_sudocode_config_for_current_dir(),
+            sudocode_config,
         };
         let runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
@@ -4649,19 +4689,18 @@ impl LiveCli {
         );
 
         // Auth mode line.
-        let auth_mode_str = self
-            .config
-            .auth_mode
-            .map(|m| m.label().to_string())
-            .unwrap_or_else(|| "auto".to_string());
+        let auth_mode_str = self.config.auth_mode.label().to_string();
 
         // Endpoint from config-driven resolution.
         let config = &self.config.sudocode_config;
-        let endpoint =
-            api::resolve_provider_from_config(&self.config.model, self.config.auth_mode, config)
-                .ok()
-                .map(|r| r.base_url)
-                .unwrap_or_default();
+        let endpoint = api::resolve_provider_from_config(
+            &self.config.model,
+            Some(self.config.auth_mode),
+            config,
+        )
+        .ok()
+        .map(|r| r.base_url)
+        .unwrap_or_default();
 
         format!(
             "\x1b[38;5;117m\
@@ -5206,18 +5245,14 @@ impl LiveCli {
     }
 
     fn set_auth(&mut self, mode: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
-        let current_str = self
-            .config
-            .auth_mode
-            .map(|m| m.as_str().to_string())
-            .unwrap_or_else(|| "auto".to_string());
+        let current_str = self.config.auth_mode.as_str().to_string();
 
         let Some(mode) = mode else {
             println!("{}", format_auth_report(&current_str));
             return Ok(false);
         };
 
-        let parsed = AuthMode::parse(&mode).map_err(|e| e)?;
+        let parsed = AuthMode::parse(&mode)?;
 
         if parsed.as_str() == current_str {
             println!("{}", format_auth_report(&current_str));
@@ -5226,7 +5261,7 @@ impl LiveCli {
 
         let previous = current_str;
         let session = self.runtime.session().clone();
-        self.config.auth_mode = Some(parsed);
+        self.config.auth_mode = parsed;
         let runtime = build_runtime(session, &self.session.id, self.config.clone())?;
         self.replace_runtime(runtime)?;
         println!("{}", format_auth_switch_report(&previous, parsed.as_str()));
@@ -7824,10 +7859,9 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 // NOTE: Despite the historical name `AnthropicRuntimeClient`, this struct
 // now holds an `ApiProviderClient` which dispatches to Anthropic, xAI,
-// OpenAI, or DashScope at construction time based on
-// `detect_provider_kind(&model)`. The struct name is kept to avoid
-// churning `BuiltRuntime` and every Deref/DerefMut site that references
-// it. See ROADMAP #29 for the provider-dispatch routing fix.
+// OpenAI, Codex, or DashScope at construction time based on the resolved
+// provider from `sudocode.json` config. The struct name is kept to avoid
+// churning `BuiltRuntime` and every Deref/DerefMut site that references it.
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: ApiProviderClient,
@@ -7848,17 +7882,20 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let sudocode_config = &config.sudocode_config;
-        let effective_mode = config.auth_mode;
+        let effective_mode = Some(config.auth_mode);
 
         let resolved =
             api::resolve_provider_from_config(&config.model, effective_mode, sudocode_config)?;
         let client = ApiProviderClient::from_resolved(&resolved, effective_mode)?
             .with_prompt_cache(PromptCache::new(session_id));
+        // Use the wire model ID from config resolution (not the alias) for API
+        // requests, so that e.g. alias "codex" sends "gpt-5.4-mini" on the wire.
+        let wire_model = resolved.model_id;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
             session_id: session_id.to_string(),
-            model: config.model.clone(),
+            model: wire_model,
             enable_tools: config.enable_tools,
             emit_output: config.emit_output,
             allowed_tools: config.allowed_tools.clone(),
@@ -8462,7 +8499,7 @@ fn slash_command_completion_candidates_with_sessions(
     }
 
     if !model.trim().is_empty() {
-        completions.insert(format!("/model {}", resolve_model_alias(model)));
+        completions.insert(format!("/model {}", resolve_model_alias_with_config(model)));
         completions.insert(format!("/model {model}"));
     }
 
@@ -9410,15 +9447,14 @@ mod tests {
         parse_history_count, permission_policy, print_help_to, push_output_block,
         render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
         render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_repl_model, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command, short_tool_id,
-        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
-        summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, RuntimeConfig, SlashCommand, StatusUsage, DEFAULT_MODEL,
-        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        render_session_markdown, resolve_model_alias_with_config, resolve_repl_model,
+        resolve_session_reference, response_to_events, resume_supported_slash_commands,
+        run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
+        split_error_hint, status_context, summarize_tool_payload_for_markdown,
+        try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture, CliAction,
+        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, RuntimeConfig,
+        SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -10040,10 +10076,25 @@ mod tests {
 
     #[test]
     fn resolves_known_model_aliases() {
-        assert_eq!(resolve_model_alias("opus"), "claude-opus-4-6");
-        assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-4-6");
-        assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5-20251213");
-        assert_eq!(resolve_model_alias("claude-opus"), "claude-opus");
+        // Aliases are resolved via the builtin sudocode config.
+        let config = api::SudoCodeConfig::builtin();
+        assert_eq!(
+            api::resolve_model_alias_from_config(&config, "opus"),
+            "claude-opus-4-6"
+        );
+        assert_eq!(
+            api::resolve_model_alias_from_config(&config, "sonnet"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            api::resolve_model_alias_from_config(&config, "haiku"),
+            "claude-haiku-4-5-20251213"
+        );
+        // Unknown aliases pass through unchanged.
+        assert_eq!(
+            api::resolve_model_alias_from_config(&config, "claude-opus"),
+            "claude-opus"
+        );
     }
 
     #[test]
@@ -10864,11 +10915,11 @@ mod tests {
             "prompt".to_string(),
             "test".to_string(),
             "--model".to_string(),
-            "qwen-plus".to_string(),
+            "qwen-turbo".to_string(),
         ])
-        .expect_err("`--model qwen-plus` should fail with DashScope hint");
+        .expect_err("`--model qwen-turbo` should fail with DashScope hint");
         assert!(
-            err_qwen.contains("Did you mean `qwen/qwen-plus`?"),
+            err_qwen.contains("Did you mean `qwen/qwen-turbo`?"),
             "Qwen model error should hint qwen/ prefix: {err_qwen}"
         );
         assert!(
@@ -11800,21 +11851,30 @@ mod tests {
     }
 
     #[test]
-    fn format_connected_line_renders_anthropic_provider_for_claude_model() {
+    fn format_connected_line_renders_provider_for_claude_model() {
         let model = "claude-sonnet-4-6";
 
         let line = format_connected_line(model);
 
-        assert!(line.starts_with("Connected: claude-sonnet-4-6 via anthropic"));
+        // "claude" is the subscription provider name from built-in config.
+        assert!(
+            line.starts_with("Connected: claude-sonnet-4-6 via claude"),
+            "unexpected line: {line}"
+        );
     }
 
     #[test]
-    fn format_connected_line_renders_xai_provider_for_grok_model() {
+    fn format_connected_line_renders_provider_for_grok_model() {
         let model = "grok-3";
 
         let line = format_connected_line(model);
 
-        assert!(line.starts_with("Connected: grok-3 via xai"));
+        // "sudorouter" is the first provider for grok in built-in config (proxy mode).
+        assert!(
+            line.starts_with("Connected: grok-3 via sudorouter")
+                || line.starts_with("Connected: grok-3 via xai"),
+            "unexpected line: {line}"
+        );
     }
 
     #[test]
@@ -13301,7 +13361,7 @@ UU conflicted.rs",
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 progress_reporter: None,
-                auth_mode: Some(api::AuthMode::ApiKey),
+                auth_mode: api::AuthMode::ApiKey,
                 sudocode_config: loader
                     .load_sudocode_config()
                     .expect("sudocode config should load"),

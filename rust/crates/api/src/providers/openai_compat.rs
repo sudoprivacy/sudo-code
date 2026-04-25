@@ -14,7 +14,8 @@ use crate::types::{
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
-use super::{preflight_message_request, Provider, ProviderFuture};
+use super::registry::preflight_message_request;
+use super::{Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -1308,14 +1309,6 @@ fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
         Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::dotenv_value(key)),
         Err(error) => Err(ApiError::from(error)),
     }
-}
-
-#[must_use]
-pub fn has_api_key(key: &str) -> bool {
-    read_env_non_empty(key)
-        .ok()
-        .and_then(std::convert::identity)
-        .is_some()
 }
 
 #[must_use]

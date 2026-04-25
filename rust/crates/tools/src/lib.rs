@@ -4,9 +4,10 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, resolve_model_alias, ApiError, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    max_tokens_for_model, resolve_provider_from_config, ApiError, ContentBlockDelta,
+    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
+    ProviderClient, StreamEvent as ApiStreamEvent, SudoCodeConfig, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -4547,12 +4548,27 @@ impl ProviderRuntimeClient {
 }
 
 fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
-    let resolved = resolve_model_alias(model).clone();
-    let client = ProviderClient::from_model(&resolved).map_err(|error| error.to_string())?;
+    let sudocode_config = load_sudocode_config();
+    let resolved_provider =
+        resolve_provider_from_config(model, None, &sudocode_config).map_err(|e| e.to_string())?;
+    let wire_model = resolved_provider.model_id.clone();
+    let client =
+        ProviderClient::from_resolved(&resolved_provider, None).map_err(|e| e.to_string())?;
     Ok(ProviderEntry {
-        model: resolved,
+        model: wire_model,
         client,
     })
+}
+
+fn load_sudocode_config() -> SudoCodeConfig {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| {
+            runtime::config::ConfigLoader::default_for(cwd)
+                .load_sudocode_config()
+                .ok()
+        })
+        .unwrap_or_else(SudoCodeConfig::builtin)
 }
 
 fn load_provider_fallback_config() -> ProviderFallbackConfig {
@@ -9550,13 +9566,11 @@ printf 'pwsh:%s' "$1"
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-        let original_xai = std::env::var_os("XAI_API_KEY");
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-        std::env::remove_var("XAI_API_KEY");
         let fallback_config = ProviderFallbackConfig::new(
             None,
             vec![
-                "grok-3".to_string(),
+                "nonexistent-model-xyz".to_string(),
                 "claude-haiku-4-5-20251213".to_string(),
             ],
         );
@@ -9569,7 +9583,7 @@ printf 'pwsh:%s' "$1"
         )
         .expect("chain construction should not fail when only some fallbacks are unavailable");
 
-        // then
+        // then — nonexistent-model-xyz is skipped, haiku succeeds
         assert_eq!(client.chain.len(), 2);
         assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
         assert_eq!(client.chain[1].model, "claude-haiku-4-5-20251213");
@@ -9577,9 +9591,6 @@ printf 'pwsh:%s' "$1"
         match original_anthropic {
             Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
             None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
-        if let Some(value) = original_xai {
-            std::env::set_var("XAI_API_KEY", value);
         }
     }
 
