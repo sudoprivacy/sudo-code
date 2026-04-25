@@ -650,6 +650,7 @@ impl ToolCallState {
                 id,
                 name,
                 input: json!({}),
+                thought_signature: None,
             },
         }))
     }
@@ -953,7 +954,7 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
             for block in &message.content {
                 match block {
                     InputContentBlock::Text { text: value } => text.push_str(value),
-                    InputContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
+                    InputContentBlock::ToolUse { id, name, input, .. } => tool_calls.push(json!({
                         "id": id,
                         "type": "function",
                         "function": {
@@ -1191,6 +1192,7 @@ fn normalize_response(
             id: tool_call.id,
             name: tool_call.function.name,
             input: parse_tool_arguments(&tool_call.function.arguments),
+            thought_signature: None,
         });
     }
 
@@ -1832,6 +1834,7 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "read_file".to_string(),
                     input: serde_json::json!({"path": "/tmp/test"}),
+                    thought_signature: None,
                 }],
             }],
             stream: false,
@@ -2050,6 +2053,7 @@ mod tests {
                         id: "call_1".to_string(),
                         name: "read_file".to_string(),
                         input: serde_json::json!({"path": "/tmp/test"}),
+                        thought_signature: None,
                     }],
                 },
                 InputMessage {

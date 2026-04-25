@@ -70,7 +70,7 @@ pub(crate) fn render_session_markdown(
                         lines.push(String::new());
                     }
                 }
-                ContentBlock::ToolUse { id, name, input } => {
+                ContentBlock::ToolUse { id, name, input, .. } => {
                     lines.push(format!(
                         "**Tool call** `{name}` _(id `{}`)_",
                         short_tool_id(id)
@@ -254,7 +254,7 @@ pub(crate) fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
-                ContentBlock::ToolUse { id, name, input } => {
+                ContentBlock::ToolUse { id, name, input, .. } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
                 ContentBlock::ToolResult {

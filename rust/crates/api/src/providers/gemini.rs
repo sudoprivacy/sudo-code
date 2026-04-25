@@ -406,14 +406,18 @@ fn translate_input_message(message: &InputMessage, contents: &mut Vec<Value>) {
                 id: _,
                 name,
                 input: args,
-                ..
+                thought_signature,
             } => {
-                parts.push(json!({
+                let mut part = json!({
                     "functionCall": {
                         "name": name,
                         "args": args,
                     }
-                }));
+                });
+                if let Some(sig) = thought_signature {
+                    part["thoughtSignature"] = json!(sig);
+                }
+                parts.push(part);
             }
             InputContentBlock::ToolResult {
                 tool_use_id: _,
@@ -751,6 +755,11 @@ impl StreamState {
                                     .to_string();
                                 let args = fc.get("args").cloned().unwrap_or(json!({}));
                                 let call_id = format!("gemini_call_{}", self.next_block_index);
+                                // Capture thought_signature (sibling of functionCall in the part).
+                                let thought_sig = part
+                                    .get("thoughtSignature")
+                                    .and_then(Value::as_str)
+                                    .map(String::from);
 
                                 let block_index = self.next_block_index;
                                 self.next_block_index += 1;
@@ -762,6 +771,7 @@ impl StreamState {
                                             id: call_id,
                                             name,
                                             input: json!({}),
+                                            thought_signature: thought_sig,
                                         },
                                     },
                                 ));
@@ -985,6 +995,7 @@ mod tests {
                         id: "call_123".to_string(),
                         name: "get_weather".to_string(),
                         input: json!({"city": "SF"}),
+                        thought_signature: None,
                     }],
                 },
                 InputMessage::user_tool_result("call_123", "72F sunny", false),

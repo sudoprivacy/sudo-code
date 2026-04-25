@@ -156,7 +156,7 @@ impl AnthropicRuntimeClient {
         let renderer = TerminalRenderer::new();
         let mut markdown_stream = MarkdownStreamState::default();
         let mut events = Vec::new();
-        let mut pending_tool: Option<(String, String, String)> = None;
+        let mut pending_tool: Option<(String, String, String, Option<String>)> = None;
         let mut block_has_thinking_summary = false;
         let mut saw_stop = false;
         let mut received_any_event = false;
@@ -222,7 +222,7 @@ impl AnthropicRuntimeClient {
                         }
                     }
                     ContentBlockDelta::InputJsonDelta { partial_json } => {
-                        if let Some((_, _, input)) = &mut pending_tool {
+                        if let Some((_, _, input, _)) = &mut pending_tool {
                             input.push_str(&partial_json);
                         }
                     }
@@ -241,7 +241,7 @@ impl AnthropicRuntimeClient {
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                     }
-                    if let Some((id, name, input)) = pending_tool.take() {
+                    if let Some((id, name, input, thought_signature)) = pending_tool.take() {
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
@@ -249,7 +249,7 @@ impl AnthropicRuntimeClient {
                         writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        events.push(AssistantEvent::ToolUse { id, name, input });
+                        events.push(AssistantEvent::ToolUse { id, name, input, thought_signature });
                     }
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
@@ -334,7 +334,7 @@ pub(crate) fn collect_tool_uses(summary: &runtime::TurnSummary) -> Vec<serde_jso
         .iter()
         .flat_map(|message| message.blocks.iter())
         .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, name, input } => Some(serde_json::json!({
+            ContentBlock::ToolUse { id, name, input, .. } => Some(serde_json::json!({
                 "id": id,
                 "name": name,
                 "input": input,
@@ -413,7 +413,7 @@ pub(crate) fn push_output_block(
     block: OutputContentBlock,
     out: &mut (impl Write + ?Sized),
     events: &mut Vec<AssistantEvent>,
-    pending_tool: &mut Option<(String, String, String)>,
+    pending_tool: &mut Option<(String, String, String, Option<String>)>,
     streaming_tool_input: bool,
     block_has_thinking_summary: &mut bool,
 ) -> Result<(), RuntimeError> {
@@ -427,7 +427,7 @@ pub(crate) fn push_output_block(
                 events.push(AssistantEvent::TextDelta(text));
             }
         }
-        OutputContentBlock::ToolUse { id, name, input } => {
+        OutputContentBlock::ToolUse { id, name, input, thought_signature } => {
             // During streaming, the initial content_block_start has an empty input ({}).
             // The real input arrives via input_json_delta events. In
             // non-streaming responses, preserve a legitimate empty object.
@@ -439,7 +439,7 @@ pub(crate) fn push_output_block(
             } else {
                 input.to_string()
             };
-            *pending_tool = Some((id, name, initial_input));
+            *pending_tool = Some((id, name, initial_input, thought_signature));
         }
         OutputContentBlock::Thinking { thinking, .. } => {
             render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
@@ -470,8 +470,8 @@ pub(crate) fn response_to_events(
             false,
             &mut block_has_thinking_summary,
         )?;
-        if let Some((id, name, input)) = pending_tool.take() {
-            events.push(AssistantEvent::ToolUse { id, name, input });
+        if let Some((id, name, input, thought_signature)) = pending_tool.take() {
+            events.push(AssistantEvent::ToolUse { id, name, input, thought_signature });
         }
     }
 
@@ -522,11 +522,12 @@ pub(crate) fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMes
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                    ContentBlock::ToolUse { id, name, input, thought_signature } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+                        thought_signature: thought_signature.clone(),
                     },
                     ContentBlock::ToolResult {
                         tool_use_id,

@@ -746,6 +746,7 @@ fn tool_message_response_many(id: &str, tool_uses: &[ToolUseMessage<'_>]) -> Mes
                 id: tool_use.tool_id.to_string(),
                 name: tool_use.tool_name.to_string(),
                 input: tool_use.input.clone(),
+                thought_signature: None,
             })
             .collect(),
         model: DEFAULT_MODEL.to_string(),
