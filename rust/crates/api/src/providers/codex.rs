@@ -296,10 +296,17 @@ fn flatten_tool_result(content: &[ToolResultContentBlock]) -> String {
 }
 
 fn codex_tool_definition(tool: &ToolDefinition) -> Value {
+    let mut params = tool.input_schema.clone();
+    // Codex API requires "properties" on object schemas; add empty one if missing.
+    if params.get("type").and_then(|v| v.as_str()) == Some("object")
+        && params.get("properties").is_none()
+    {
+        params["properties"] = json!({});
+    }
     let mut def = json!({
         "type": "function",
         "name": tool.name,
-        "parameters": tool.input_schema,
+        "parameters": params,
     });
     if let Some(desc) = &tool.description {
         def["description"] = json!(desc);
