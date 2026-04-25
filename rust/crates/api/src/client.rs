@@ -2,6 +2,7 @@ use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
+use crate::providers::registry::{ApiFormat, Credential, ResolvedProvider};
 use crate::providers::{self, AuthMode, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 
@@ -86,6 +87,71 @@ impl ProviderClient {
                         };
                         Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
                     }
+                }
+            }
+        }
+    }
+
+    /// Build a `ProviderClient` from a fully resolved provider config.
+    ///
+    /// This is the primary entry point for config-driven provider construction.
+    /// The caller is responsible for calling `resolve_provider_from_config()`
+    /// first to obtain the `ResolvedProvider`.
+    pub fn from_resolved(
+        resolved: &ResolvedProvider,
+        mode: Option<AuthMode>,
+    ) -> Result<Self, ApiError> {
+        match resolved.api_format {
+            ApiFormat::AnthropicMessages => {
+                let auth = match &resolved.credential {
+                    Credential::ApiKey(key) => AuthSource::ApiKey(key.clone()),
+                    Credential::Token(token) => AuthSource::BearerToken(token.clone()),
+                    Credential::AuthFile(path) => {
+                        let content = std::fs::read_to_string(path).map_err(|e| {
+                            ApiError::Configuration(format!(
+                                "failed to read auth file {}: {e}",
+                                path.display()
+                            ))
+                        })?;
+                        let token = serde_json::from_str::<serde_json::Value>(&content)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("accessToken")
+                                    .or_else(|| v.get("token"))
+                                    .and_then(|t| t.as_str().map(String::from))
+                            })
+                            .unwrap_or_else(|| content.trim().to_string());
+                        AuthSource::BearerToken(token)
+                    }
+                    Credential::None => {
+                        return Err(ApiError::Configuration(
+                            "no credential available for Anthropic provider".to_string(),
+                        ));
+                    }
+                };
+                let client = AnthropicClient::from_auth_with_mode(auth, mode)
+                    .with_base_url(resolved.base_url.clone());
+                Ok(Self::Anthropic(client))
+            }
+            ApiFormat::OpenAiCompletions | ApiFormat::OpenAiResponses => {
+                // Build OpenAiCompatClient with the resolved credential + base URL.
+                let api_key = match &resolved.credential {
+                    Credential::ApiKey(key) => key.clone(),
+                    Credential::Token(token) => token.clone(),
+                    Credential::None => String::new(),
+                    Credential::AuthFile(_) => {
+                        return Err(ApiError::Configuration(
+                            "auth file credential not supported for OpenAI-compat providers"
+                                .to_string(),
+                        ));
+                    }
+                };
+                let config = OpenAiCompatConfig::openai();
+                let client = OpenAiCompatClient::new(api_key, config)
+                    .with_base_url(resolved.base_url.clone());
+                match resolved.kind {
+                    ProviderKind::Xai => Ok(Self::Xai(client)),
+                    _ => Ok(Self::OpenAi(client)),
                 }
             }
         }

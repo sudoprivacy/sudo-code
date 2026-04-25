@@ -190,17 +190,25 @@ fn run_scode(
     base_url: &str,
     args: &[&str],
 ) -> Output {
+    // Write the sample sudocode.json with the mock server's base URL
+    // substituted for the real Anthropic endpoint.
+    let sample = runtime::SAMPLE_SUDOCODE_JSON
+        .replace("https://api.anthropic.com", base_url)
+        .replace("<YOUR_ANTHROPIC_API_KEY>", "test-compact-key");
+    fs::write(config_home.join("sudocode.json"), sample).expect("sudocode.json should be written");
+
+    let mut full_args = vec!["--auth", "api-key"];
+    full_args.extend_from_slice(args);
+
     let mut command = Command::new(env!("CARGO_BIN_EXE_scode"));
     command
         .current_dir(cwd)
         .env_clear()
-        .env("ANTHROPIC_API_KEY", "test-compact-key")
-        .env("ANTHROPIC_BASE_URL", base_url)
         .env("SUDO_CODE_CONFIG_HOME", config_home)
         .env("HOME", home)
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
-        .args(args);
+        .args(&full_args);
     command.output().expect("scode should launch")
 }
 

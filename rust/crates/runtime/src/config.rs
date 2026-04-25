@@ -9,6 +9,10 @@ use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 /// Schema name advertised by generated settings files.
 pub const SUDOCODE_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
 
+/// The sample `sudocode.json` shipped with the repo, embedded at compile time.
+/// Tests can write this to a temp config home instead of hardcoding config JSON.
+pub const SAMPLE_SUDOCODE_JSON: &str = include_str!("sudocode.sample.json");
+
 /// Origin of a loaded settings file in the configuration precedence chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConfigSource {
@@ -49,6 +53,62 @@ pub struct RuntimePluginConfig {
     registry_path: Option<String>,
     bundled_root: Option<String>,
     max_output_tokens: Option<u32>,
+}
+
+/// Connection details for a provider under a specific auth mode.
+///
+/// Parsed from `auth_modes.<mode>.<provider>` in `sudocode.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderConnectionConfig {
+    /// Base URL for API requests.
+    pub base_url: String,
+    /// Inline API key (api-key / proxy mode).
+    pub api_key: Option<String>,
+    /// Env var name for API key.
+    pub api_key_env: Option<String>,
+    /// Inline token (subscription mode).
+    pub token: Option<String>,
+    /// Env var name for token.
+    pub token_env: Option<String>,
+    /// Path to auth/credentials file (subscription mode).
+    pub auth_file: Option<String>,
+}
+
+/// Which provider + wire model ID to use for a model under a given auth mode.
+///
+/// Parsed from `models.<alias>.providers.<mode>` in `sudocode.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProviderMapping {
+    /// Key into `auth_modes.<mode>`.
+    pub provider: String,
+    /// Provider-specific wire model ID.
+    pub model: String,
+    /// Wire format override (only needed for proxy providers).
+    pub api: Option<String>,
+}
+
+/// Model entry in the config registry.
+///
+/// Parsed from `models.<alias>` in `sudocode.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelConfigEntry {
+    /// Short alias (also the map key), e.g. `"opus"`.
+    pub alias: String,
+    /// Display name, e.g. `"Claude Opus 4.6"`.
+    pub name: String,
+    /// Input modalities (informational).
+    pub input: Vec<String>,
+    /// Auth mode → provider mapping.
+    pub providers: BTreeMap<String, ModelProviderMapping>,
+}
+
+/// Top-level config from `sudocode.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SudoCodeConfig {
+    /// `auth_modes.<mode>.<provider_name>` → connection details.
+    pub auth_modes: BTreeMap<String, BTreeMap<String, ProviderConnectionConfig>>,
+    /// `models.<alias>` → model config.
+    pub models: BTreeMap<String, ModelConfigEntry>,
 }
 
 /// Structured feature configuration consumed by runtime subsystems.
@@ -326,6 +386,17 @@ impl ConfigLoader {
             loaded_entries,
             feature_config,
         })
+    }
+
+    /// Load `sudocode.json` from the config home directory.
+    ///
+    /// Returns `SudoCodeConfig::default()` if the file does not exist.
+    pub fn load_sudocode_config(&self) -> Result<SudoCodeConfig, ConfigError> {
+        let path = self.config_home.join("sudocode.json");
+        if !path.exists() {
+            return Ok(SudoCodeConfig::default());
+        }
+        parse_sudocode_json(&path)
     }
 }
 
@@ -913,6 +984,134 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
         optional_string_array(object, "trustedRoots", "merged settings.trustedRoots")?
             .unwrap_or_default(),
     )
+}
+
+// ---------------------------------------------------------------------------
+// sudocode.json parsing
+// ---------------------------------------------------------------------------
+
+/// Parse `sudocode.json` into `SudoCodeConfig`.
+fn parse_sudocode_json(path: &Path) -> Result<SudoCodeConfig, ConfigError> {
+    let content = fs::read_to_string(path).map_err(ConfigError::Io)?;
+    let root: JsonValue = JsonValue::parse(&content)
+        .map_err(|e| ConfigError::Parse(format!("{}: {e}", path.display())))?;
+    let Some(root_obj) = root.as_object() else {
+        return Err(ConfigError::Parse(format!(
+            "{}: expected JSON object at top level",
+            path.display()
+        )));
+    };
+
+    let auth_modes = parse_auth_modes_section(root_obj, path)?;
+    let models = parse_sudocode_models_section(root_obj, path)?;
+
+    Ok(SudoCodeConfig { auth_modes, models })
+}
+
+fn parse_auth_modes_section(
+    root: &BTreeMap<String, JsonValue>,
+    path: &Path,
+) -> Result<BTreeMap<String, BTreeMap<String, ProviderConnectionConfig>>, ConfigError> {
+    let Some(value) = root.get("auth_modes") else {
+        return Ok(BTreeMap::new());
+    };
+    let modes_obj = expect_object(value, &format!("{}.auth_modes", path.display()))?;
+    let mut result = BTreeMap::new();
+    for (mode_name, mode_value) in modes_obj {
+        let providers_obj = expect_object(
+            mode_value,
+            &format!("{}.auth_modes.{mode_name}", path.display()),
+        )?;
+        let mut providers = BTreeMap::new();
+        for (provider_name, provider_value) in providers_obj {
+            let ctx = format!("{}.auth_modes.{mode_name}.{provider_name}", path.display());
+            let entry = expect_object(provider_value, &ctx)?;
+            let base_url = expect_string(entry, "baseUrl", &ctx)?.to_string();
+            let api_key = optional_string(entry, "apiKey", &ctx)?.map(str::to_string);
+            let api_key_env = optional_string(entry, "apiKeyEnv", &ctx)?.map(str::to_string);
+            let token = optional_json_string_or_null(entry, "token");
+            let token_env = optional_string(entry, "tokenEnv", &ctx)?.map(str::to_string);
+            let auth_file = optional_string(entry, "authFile", &ctx)?.map(str::to_string);
+            providers.insert(
+                provider_name.clone(),
+                ProviderConnectionConfig {
+                    base_url,
+                    api_key,
+                    api_key_env,
+                    token,
+                    token_env,
+                    auth_file,
+                },
+            );
+        }
+        result.insert(mode_name.clone(), providers);
+    }
+    Ok(result)
+}
+
+fn parse_sudocode_models_section(
+    root: &BTreeMap<String, JsonValue>,
+    path: &Path,
+) -> Result<BTreeMap<String, ModelConfigEntry>, ConfigError> {
+    let Some(value) = root.get("models") else {
+        return Ok(BTreeMap::new());
+    };
+    let models_obj = expect_object(value, &format!("{}.models", path.display()))?;
+    let mut result = BTreeMap::new();
+    for (alias, model_value) in models_obj {
+        let ctx = format!("{}.models.{alias}", path.display());
+        let entry = expect_object(model_value, &ctx)?;
+        let name = optional_string(entry, "name", &ctx)?
+            .map(str::to_string)
+            .unwrap_or_else(|| alias.clone());
+        let input = optional_string_array(entry, "input", &ctx)?.unwrap_or_default();
+        let alias_field = optional_string(entry, "alias", &ctx)?
+            .map(str::to_string)
+            .unwrap_or_else(|| alias.clone());
+
+        // Parse the providers sub-object.
+        let providers = if let Some(providers_value) = entry.get("providers") {
+            let providers_obj = expect_object(providers_value, &format!("{ctx}.providers"))?;
+            let mut mappings = BTreeMap::new();
+            for (mode_name, mapping_value) in providers_obj {
+                let m_ctx = format!("{ctx}.providers.{mode_name}");
+                let m_entry = expect_object(mapping_value, &m_ctx)?;
+                let provider = expect_string(m_entry, "provider", &m_ctx)?.to_string();
+                let model = expect_string(m_entry, "model", &m_ctx)?.to_string();
+                let api = optional_string(m_entry, "api", &m_ctx)?.map(str::to_string);
+                mappings.insert(
+                    mode_name.clone(),
+                    ModelProviderMapping {
+                        provider,
+                        model,
+                        api,
+                    },
+                );
+            }
+            mappings
+        } else {
+            BTreeMap::new()
+        };
+
+        result.insert(
+            alias.to_ascii_lowercase(),
+            ModelConfigEntry {
+                alias: alias_field,
+                name,
+                input,
+                providers,
+            },
+        );
+    }
+    Ok(result)
+}
+
+/// Read a JSON string field that might be `null` (treat as `None`).
+fn optional_json_string_or_null(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<String> {
+    match object.get(key) {
+        Some(JsonValue::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
 }
 
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
@@ -2126,5 +2325,98 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_sudocode_json_with_inline_credentials() {
+        let root = temp_dir();
+        let home = root.join("home").join(".nexus").join("sudocode");
+        fs::create_dir_all(&home).expect("config dir");
+
+        let json = r#"{
+          "auth_modes": {
+            "subscription": {
+              "claude": {
+                "baseUrl": "https://api.anthropic.com",
+                "token": "sk-test-oauth-token"
+              }
+            },
+            "proxy": {
+              "sudorouter": {
+                "baseUrl": "https://hk.sudorouter.ai/v1",
+                "apiKey": "sk-test-proxy-key"
+              }
+            },
+            "api-key": {
+              "anthropic": {
+                "baseUrl": "https://api.anthropic.com",
+                "apiKey": "sk-test-anthropic-key"
+              }
+            }
+          },
+          "models": {
+            "opus": {
+              "alias": "opus",
+              "name": "Claude Opus 4.6",
+              "input": ["text"],
+              "providers": {
+                "subscription": { "provider": "claude", "model": "claude-opus-4-6" },
+                "proxy":        { "provider": "sudorouter", "model": "claude-opus-4-6", "api": "openai-completions" },
+                "api-key":      { "provider": "anthropic", "model": "claude-opus-4-6" }
+              }
+            },
+            "deepseek": {
+              "alias": "deepseek",
+              "name": "DeepSeek V3",
+              "input": ["text"],
+              "providers": {
+                "proxy": { "provider": "sudorouter", "model": "deepseek-chat", "api": "openai-completions" }
+              }
+            }
+          }
+        }"#;
+
+        fs::write(home.join("sudocode.json"), json).expect("write sudocode.json");
+
+        let cwd = root.join("project");
+        fs::create_dir_all(&cwd).expect("project dir");
+        let loader = ConfigLoader::new(&cwd, &home);
+        let config = loader.load_sudocode_config().expect("should parse");
+
+        // auth_modes
+        assert_eq!(config.auth_modes.len(), 3);
+        let sub_claude = &config.auth_modes["subscription"]["claude"];
+        assert_eq!(sub_claude.base_url, "https://api.anthropic.com");
+        assert_eq!(sub_claude.token.as_deref(), Some("sk-test-oauth-token"));
+        assert!(sub_claude.token_env.is_none());
+
+        let proxy = &config.auth_modes["proxy"]["sudorouter"];
+        assert_eq!(proxy.base_url, "https://hk.sudorouter.ai/v1");
+        assert_eq!(proxy.api_key.as_deref(), Some("sk-test-proxy-key"));
+
+        let apikey = &config.auth_modes["api-key"]["anthropic"];
+        assert_eq!(apikey.base_url, "https://api.anthropic.com");
+        assert_eq!(apikey.api_key.as_deref(), Some("sk-test-anthropic-key"));
+
+        // models
+        assert_eq!(config.models.len(), 2);
+        let opus = &config.models["opus"];
+        assert_eq!(opus.name, "Claude Opus 4.6");
+        assert_eq!(opus.providers.len(), 3);
+        assert_eq!(opus.providers["subscription"].provider, "claude");
+        assert_eq!(opus.providers["subscription"].model, "claude-opus-4-6");
+        assert!(opus.providers["subscription"].api.is_none());
+        assert_eq!(opus.providers["proxy"].provider, "sudorouter");
+        assert_eq!(
+            opus.providers["proxy"].api.as_deref(),
+            Some("openai-completions")
+        );
+        assert_eq!(opus.providers["api-key"].provider, "anthropic");
+
+        let deepseek = &config.models["deepseek"];
+        assert_eq!(deepseek.providers.len(), 1);
+        assert_eq!(deepseek.providers["proxy"].model, "deepseek-chat");
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

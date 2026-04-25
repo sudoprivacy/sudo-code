@@ -9,6 +9,7 @@ use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
 pub mod openai_compat;
+pub mod registry;
 
 /// Explicit auth mode selected via `--auth` CLI flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

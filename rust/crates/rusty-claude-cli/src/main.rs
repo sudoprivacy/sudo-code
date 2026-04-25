@@ -1515,6 +1515,15 @@ fn resolve_model_alias(model: &str) -> &str {
 /// user-supplied model string is about to be dispatched to a provider.
 fn resolve_model_alias_with_config(model: &str) -> String {
     let trimmed = model.trim();
+    // Check sudocode.json model registry first.
+    let config = load_sudocode_config_for_current_dir();
+    if let Some(entry) = config.models.get(&trimmed.to_ascii_lowercase()) {
+        // Return the wire model ID from the first available provider mapping.
+        if let Some(mapping) = entry.providers.values().next() {
+            return mapping.model.clone();
+        }
+    }
+    // Then check config aliases.
     if let Some(resolved) = config_alias_for_current_dir(trimmed) {
         return resolve_model_alias(&resolved).to_string();
     }
@@ -1533,6 +1542,11 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
     match trimmed {
         "opus" | "sonnet" | "haiku" => return Ok(()),
         _ => {}
+    }
+    // Check sudocode.json config for additional model aliases.
+    let config = load_sudocode_config_for_current_dir();
+    if api::resolve_model(&config, trimmed).is_some() {
+        return Ok(());
     }
     // Check for spaces (malformed)
     if trimmed.contains(' ') {
@@ -1575,6 +1589,23 @@ fn config_alias_for_current_dir(alias: &str) -> Option<String> {
     let loader = ConfigLoader::default_for(&cwd);
     let config = loader.load().ok()?;
     config.aliases().get(alias).cloned()
+}
+
+/// Load `SudoCodeConfig` from the config home for the current directory.
+fn load_sudocode_config_for_current_dir() -> api::SudoCodeConfig {
+    let Ok(cwd) = env::current_dir() else {
+        return api::SudoCodeConfig::default();
+    };
+    load_sudocode_config_for_cwd(&cwd)
+}
+
+/// Load `SudoCodeConfig` from the config home for a given directory.
+fn load_sudocode_config_for_cwd(cwd: &Path) -> api::SudoCodeConfig {
+    let loader = ConfigLoader::default_for(cwd);
+    loader.load_sudocode_config().unwrap_or_else(|e| {
+        eprintln!("warning: failed to load sudocode.json: {e}");
+        api::SudoCodeConfig::default()
+    })
 }
 
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
@@ -1684,7 +1715,22 @@ fn format_connected_line(model: &str) -> String {
 }
 
 fn format_connected_line_with_mode(model: &str, mode: Option<AuthMode>) -> String {
-    let provider = provider_label(detect_provider_kind(model));
+    format_connected_line_with_config(model, mode, &api::SudoCodeConfig::default())
+}
+
+fn format_connected_line_with_config(
+    model: &str,
+    mode: Option<AuthMode>,
+    sudocode_config: &api::SudoCodeConfig,
+) -> String {
+    // Try to get display name from sudocode.json config first.
+    let config_display = sudocode_config
+        .models
+        .get(&model.to_ascii_lowercase())
+        .map(|m| m.name.as_str());
+    let provider = config_display
+        .map(String::from)
+        .unwrap_or_else(|| provider_label(detect_provider_kind(model)).to_string());
     let resolved_mode = mode.or_else(|| resolve_auth_mode(None).ok());
     let auth_hint = match resolved_mode {
         Some(m) => format!(" ({})", m.label()),
@@ -3004,14 +3050,35 @@ fn format_unknown_slash_command_message(name: &str) -> String {
 }
 
 fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
+    let config = load_sudocode_config_for_current_dir();
+    let mut available_lines = String::new();
+    for (alias, entry) in &config.models {
+        let marker = if alias == &model.to_ascii_lowercase() {
+            " *"
+        } else {
+            ""
+        };
+        let modes: Vec<&str> = entry.providers.keys().map(String::as_str).collect();
+        available_lines.push_str(&format!(
+            "\n    {:<16} {} ({}){marker}",
+            alias,
+            entry.name,
+            modes.join(", ")
+        ));
+    }
+    let available = if available_lines.is_empty() {
+        String::from("opus, sonnet, haiku")
+    } else {
+        available_lines
+    };
     format!(
         "Model
   Current model    {model}
+  Available models{available}
   Session messages {message_count}
   Session turns    {turns}
 
 Usage
-  Inspect current model with /model
   Switch models with /model <name>"
     )
 }
@@ -3757,10 +3824,6 @@ fn run_repl(
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
-    println!(
-        "{}",
-        format_connected_line_with_mode(&cli.config.model, auth_mode)
-    );
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
@@ -3776,14 +3839,22 @@ fn run_repl(
                 }
                 match SlashCommand::parse(&trimmed) {
                     Ok(Some(command)) => {
-                        if cli.handle_repl_command(command)? {
-                            cli.persist_session()?;
+                        match cli.handle_repl_command(command) {
+                            Ok(true) => {
+                                if let Err(e) = cli.persist_session() {
+                                    eprintln!("\x1b[31m{e}\x1b[0m");
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                eprintln!("\x1b[31m{e}\x1b[0m");
+                            }
                         }
                         continue;
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        eprintln!("{error}");
+                        eprintln!("\x1b[31m{error}\x1b[0m");
                         continue;
                     }
                 }
@@ -3862,6 +3933,7 @@ struct RuntimeConfig {
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
     auth_mode: Option<AuthMode>,
+    sudocode_config: api::SudoCodeConfig,
 }
 
 struct RuntimeMcpState {
@@ -4011,6 +4083,7 @@ impl AcpCliAgent {
                 permission_mode,
                 progress_reporter: None,
                 auth_mode: self.auth_mode,
+                sudocode_config: load_sudocode_config_for_cwd(&cwd),
             },
         )
         .map_err(|error| AcpError::internal(format!("failed to build runtime: {error}")))?;
@@ -4533,6 +4606,7 @@ impl LiveCli {
             permission_mode,
             progress_reporter: None,
             auth_mode,
+            sudocode_config: load_sudocode_config_for_current_dir(),
         };
         let runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
@@ -4573,6 +4647,22 @@ impl LiveCli {
             |_| self.session.path.display().to_string(),
             |path| path.display().to_string(),
         );
+
+        // Auth mode line.
+        let auth_mode_str = self
+            .config
+            .auth_mode
+            .map(|m| m.label().to_string())
+            .unwrap_or_else(|| "auto".to_string());
+
+        // Endpoint from config-driven resolution.
+        let config = &self.config.sudocode_config;
+        let endpoint =
+            api::resolve_provider_from_config(&self.config.model, self.config.auth_mode, config)
+                .ok()
+                .map(|r| r.base_url)
+                .unwrap_or_default();
+
         format!(
             "\x1b[38;5;117m\
 ███████╗██╗   ██╗██████╗  ██████╗ \n\
@@ -4582,6 +4672,8 @@ impl LiveCli {
 ███████║╚██████╔╝██████╔╝╚██████╔╝\n\
 ╚══════╝ ╚═════╝ ╚═════╝  ╚═════╝\x1b[0m \x1b[38;5;208mCode\x1b[0m\n\n\
   \x1b[2mModel\x1b[0m            {}\n\
+  \x1b[2mAuth mode\x1b[0m        {}\n\
+  \x1b[2mEndpoint\x1b[0m         {}\n\
   \x1b[2mPermissions\x1b[0m      {}\n\
   \x1b[2mBranch\x1b[0m           {}\n\
   \x1b[2mWorkspace\x1b[0m        {}\n\
@@ -4590,6 +4682,8 @@ impl LiveCli {
   \x1b[2mAuto-save\x1b[0m        {}\n\n\
   Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
             self.config.model,
+            auth_mode_str,
+            endpoint,
             self.config.permission_mode.as_str(),
             git_branch,
             workspace,
@@ -5112,10 +5206,11 @@ impl LiveCli {
     }
 
     fn set_auth(&mut self, mode: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
-        let current_str = self.config.auth_mode.map_or_else(
-            || resolve_auth_mode(None).map(|m| m.as_str().to_string()),
-            |m| Ok(m.as_str().to_string()),
-        )?;
+        let current_str = self
+            .config
+            .auth_mode
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_else(|| "auto".to_string());
 
         let Some(mode) = mode else {
             println!("{}", format_auth_report(&current_str));
@@ -5128,8 +5223,6 @@ impl LiveCli {
             println!("{}", format_auth_report(&current_str));
             return Ok(false);
         }
-
-        validate_auth_env(parsed)?;
 
         let previous = current_str;
         let session = self.runtime.session().clone();
@@ -7754,37 +7847,13 @@ impl AnthropicRuntimeClient {
         config: &RuntimeConfig,
         tool_registry: GlobalToolRegistry,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let resolved_model = api::resolve_model_alias(&config.model);
-        // Resolve the effective auth mode: use the explicit --auth flag if
-        // provided, otherwise auto-detect from env vars.  Once we have
-        // a mode, the same from_model_and_mode path handles all routing.
-        let effective_mode = match config.auth_mode {
-            Some(mode) => {
-                validate_auth_env(mode)?;
-                Some(mode)
-            }
-            None => resolve_auth_mode(None).ok(),
-        };
-        let client = if let Some(mode) = effective_mode {
-            let auth = AuthSource::for_mode(mode)?;
-            ApiProviderClient::from_model_and_mode(&resolved_model, mode, auth)?
-                .with_prompt_cache(PromptCache::new(session_id))
-        } else {
-            // No recognised auth env vars at all — fall back to the
-            // legacy provider-detection path for non-Anthropic models.
-            match detect_provider_kind(&resolved_model) {
-                ProviderKind::Anthropic => {
-                    let auth = resolve_cli_auth_source()?;
-                    let inner = AnthropicClient::from_auth(auth)
-                        .with_base_url(api::read_base_url())
-                        .with_prompt_cache(PromptCache::new(session_id));
-                    ApiProviderClient::Anthropic(inner)
-                }
-                ProviderKind::Xai | ProviderKind::OpenAi => {
-                    ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
-                }
-            }
-        };
+        let sudocode_config = &config.sudocode_config;
+        let effective_mode = config.auth_mode;
+
+        let resolved =
+            api::resolve_provider_from_config(&config.model, effective_mode, sudocode_config)?;
+        let client = ApiProviderClient::from_resolved(&resolved, effective_mode)?
+            .with_prompt_cache(PromptCache::new(session_id));
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
@@ -8384,6 +8453,12 @@ fn slash_command_completion_candidates_with_sessions(
         "/skills help",
     ] {
         completions.insert(candidate.to_string());
+    }
+
+    // Add config-driven model aliases to /model completions.
+    let sudocode_config = load_sudocode_config_for_current_dir();
+    for alias in sudocode_config.models.keys() {
+        completions.insert(format!("/model {alias}"));
     }
 
     if !model.trim().is_empty() {
@@ -11692,10 +11767,15 @@ mod tests {
     #[test]
     fn startup_banner_mentions_workflow_completions() {
         let _guard = env_lock();
-        // Inject dummy credentials so LiveCli can construct without real Anthropic key
-        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-banner-test");
         let root = temp_dir();
-        fs::create_dir_all(&root).expect("root dir");
+        let config_home = root.join("config-home");
+        fs::create_dir_all(&config_home).expect("config home");
+        // Write sample sudocode.json with a dummy API key.
+        let sample =
+            runtime::SAMPLE_SUDOCODE_JSON.replace("<YOUR_ANTHROPIC_API_KEY>", "test-dummy-key");
+        fs::write(config_home.join("sudocode.json"), &sample).expect("write sudocode.json");
+        let original_config_home = std::env::var("SUDO_CODE_CONFIG_HOME").ok();
+        std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
 
         let banner = with_current_dir(&root, || {
             LiveCli::new(
@@ -11703,7 +11783,7 @@ mod tests {
                 true,
                 None,
                 PermissionMode::DangerFullAccess,
-                None,
+                Some(api::AuthMode::ApiKey),
             )
             .expect("cli should initialize")
             .startup_banner()
@@ -11712,8 +11792,11 @@ mod tests {
         assert!(banner.contains("Tab"));
         assert!(banner.contains("workflow completions"));
 
+        match original_config_home {
+            Some(v) => std::env::set_var("SUDO_CODE_CONFIG_HOME", v),
+            None => std::env::remove_var("SUDO_CODE_CONFIG_HOME"),
+        }
         fs::remove_dir_all(root).expect("cleanup temp dir");
-        std::env::remove_var("ANTHROPIC_API_KEY");
     }
 
     #[test]
@@ -13185,14 +13268,16 @@ UU conflicted.rs",
         // set/remove ANTHROPIC_API_KEY do not race with this test.
         let _guard = env_lock();
         let config_home = temp_dir();
-        // Inject a dummy API key so runtime construction succeeds without real credentials.
-        // This test only exercises plugin lifecycle (init/shutdown), never calls the API.
-        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-plugin-lifecycle");
         let workspace = temp_dir();
         let source_root = temp_dir();
         fs::create_dir_all(&config_home).expect("config home");
         fs::create_dir_all(&workspace).expect("workspace");
         fs::create_dir_all(&source_root).expect("source root");
+        // Write the sample sudocode.json with a dummy API key so runtime
+        // construction succeeds. This test only exercises plugin lifecycle.
+        let sample =
+            runtime::SAMPLE_SUDOCODE_JSON.replace("<YOUR_ANTHROPIC_API_KEY>", "test-dummy-key");
+        fs::write(config_home.join("sudocode.json"), sample).expect("write sudocode.json");
         write_plugin_fixture(&source_root, "lifecycle-runtime-demo", false, true);
 
         let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
@@ -13216,7 +13301,10 @@ UU conflicted.rs",
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 progress_reporter: None,
-                auth_mode: None,
+                auth_mode: Some(api::AuthMode::ApiKey),
+                sudocode_config: loader
+                    .load_sudocode_config()
+                    .expect("sudocode config should load"),
             },
             runtime_plugin_state,
         )

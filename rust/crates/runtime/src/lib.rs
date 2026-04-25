@@ -10,7 +10,7 @@ pub mod bash_validation;
 mod bootstrap;
 pub mod branch_lock;
 mod compact;
-mod config;
+pub mod config;
 pub mod config_validate;
 mod conversation;
 mod file_ops;
@@ -65,10 +65,11 @@ pub use compact::{
 pub use config::{
     ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
-    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
+    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig,
+    ModelConfigEntry, ModelProviderMapping, OAuthConfig, ProviderConnectionConfig,
     ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
     RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
-    SUDOCODE_SETTINGS_SCHEMA_NAME,
+    SudoCodeConfig, SAMPLE_SUDOCODE_JSON, SUDOCODE_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,

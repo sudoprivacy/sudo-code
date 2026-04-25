@@ -27,6 +27,10 @@ pub use providers::openai_compat::{
     build_chat_completion_request, flatten_tool_result_content, is_reasoning_model,
     model_rejects_is_error_field, translate_message, OpenAiCompatClient, OpenAiCompatConfig,
 };
+pub use providers::registry::{
+    resolve_model, resolve_provider_from_config, ApiFormat, Credential, ModelConfigEntry,
+    ModelProviderMapping, ProviderConnectionConfig, ResolvedProvider, SudoCodeConfig,
+};
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
     resolve_model_alias, AuthMode, ProviderKind,
