@@ -1144,12 +1144,24 @@ pub(crate) fn load_sudocode_config_for_current_dir() -> api::SudoCodeConfig {
 }
 
 /// Load `SudoCodeConfig` from the config home for a given directory.
+///
+/// Falls back to `SudoCodeConfig::builtin()` if the config file is
+/// missing so that non-critical call-sites (model alias resolution,
+/// display helpers) keep working without a config file. Critical
+/// call-sites should call `require_sudocode_config_for_cwd` instead.
 pub(crate) fn load_sudocode_config_for_cwd(cwd: &Path) -> api::SudoCodeConfig {
     let loader = ConfigLoader::default_for(cwd);
-    loader.load_sudocode_config().unwrap_or_else(|e| {
-        eprintln!("warning: failed to load sudocode.json: {e}");
-        api::SudoCodeConfig::default()
-    })
+    loader
+        .load_sudocode_config()
+        .unwrap_or_else(|_| api::SudoCodeConfig::builtin())
+}
+
+/// Load `SudoCodeConfig` or return a fatal error. Used during startup
+/// to enforce SSOT — if `sudocode.json` is missing, the application
+/// must not silently fall back to built-in defaults.
+pub(crate) fn require_sudocode_config_for_cwd(cwd: &Path) -> Result<api::SudoCodeConfig, String> {
+    let loader = ConfigLoader::default_for(cwd);
+    loader.load_sudocode_config().map_err(|e| e.to_string())
 }
 
 pub(crate) fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {

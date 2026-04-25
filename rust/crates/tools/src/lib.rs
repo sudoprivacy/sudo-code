@@ -4568,7 +4568,7 @@ fn load_sudocode_config() -> SudoCodeConfig {
                 .load_sudocode_config()
                 .ok()
         })
-        .unwrap_or_else(SudoCodeConfig::builtin)
+        .unwrap_or_default()
 }
 
 fn load_provider_fallback_config() -> ProviderFallbackConfig {

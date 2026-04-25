@@ -44,9 +44,9 @@ use cli::api_client::{
 use cli::args::{
     config_model_for_current_dir, default_permission_mode, format_unknown_slash_command,
     load_sudocode_config_for_current_dir, load_sudocode_config_for_cwd, parse_args,
-    permission_mode_from_label, resolve_model_alias, resolve_model_alias_with_config,
-    resolve_repl_model, try_resolve_bare_skill_prompt, AllowedToolSet, CliAction, CliOutputFormat,
-    LocalHelpTopic,
+    permission_mode_from_label, require_sudocode_config_for_cwd, resolve_model_alias,
+    resolve_model_alias_with_config, resolve_repl_model, try_resolve_bare_skill_prompt,
+    AllowedToolSet, CliAction, CliOutputFormat, LocalHelpTopic,
 };
 use cli::export::{
     collect_session_prompt_history, parse_history_count, render_export_text,
@@ -276,7 +276,9 @@ Run `scode --help` for usage."
 /// matching against the error messages produced throughout the CLI surface.
 fn classify_error_kind(message: &str) -> &'static str {
     // Check specific patterns first (more specific before generic)
-    if message.contains("missing Anthropic credentials") {
+    if message.contains("missing sudocode.json") {
+        "missing_config"
+    } else if message.contains("missing Anthropic credentials") {
         "missing_credentials"
     } else if message.contains("Manifest source files are missing") {
         "missing_manifests"
@@ -357,9 +359,39 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
     format!("{prompt}\n\n{trimmed}")
 }
 
+/// Returns `true` for CLI actions that require a valid `sudocode.json`
+/// config file (model registry) to operate. Introspection-only commands
+/// (version, help, status, doctor, etc.) do not.
+fn action_requires_sudocode_config(action: &CliAction) -> bool {
+    matches!(
+        action,
+        CliAction::Prompt { .. } | CliAction::Repl { .. } | CliAction::Acp { .. }
+    )
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    match parse_args(&args)? {
+    let action = parse_args(&args)?;
+
+    // SSOT enforcement: fail fast if sudocode.json is missing for actions
+    // that need the model/provider registry.
+    if action_requires_sudocode_config(&action) {
+        if let Ok(cwd) = env::current_dir() {
+            require_sudocode_config_for_cwd(&cwd).map_err(|e| -> Box<dyn std::error::Error> {
+                format!(
+                    "missing sudocode.json configuration\n\
+                     {e}\n\
+                     \n\
+                     Hint: copy the sample config to get started:\n  \
+                     cp crates/runtime/src/sudocode.sample.json \
+                     ~/.nexus/sudocode/sudocode.json"
+                )
+                .into()
+            })?;
+        }
+    }
+
+    match action {
         CliAction::DumpManifests {
             output_format,
             manifests_dir,
