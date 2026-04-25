@@ -31,6 +31,8 @@ pub enum ApiFormat {
     OpenAiCompletions,
     /// `OpenAI` Responses API (`/v1/responses`).
     OpenAiResponses,
+    /// Google Gemini `GenerateContent` API.
+    GeminiGenerateContent,
 }
 
 /// Resolved credential for authenticating with a provider.
@@ -167,6 +169,21 @@ const MODEL_SPECS: &[(&str, ModelTokenLimit)] = &[
         ModelTokenLimit {
             max_output_tokens: 64_000,
             context_window_tokens: 200_000,
+        },
+    ),
+    // Gemini (native)
+    (
+        "gemini-2.5-flash",
+        ModelTokenLimit {
+            max_output_tokens: 65_536,
+            context_window_tokens: 1_048_576,
+        },
+    ),
+    (
+        "gemini-2.5-pro",
+        ModelTokenLimit {
+            max_output_tokens: 65_536,
+            context_window_tokens: 1_048_576,
         },
     ),
 ];
@@ -446,6 +463,7 @@ fn resolve_api_format(
     match provider_name {
         "anthropic" | "claude" => Ok(ApiFormat::AnthropicMessages),
         "codex" => Ok(ApiFormat::OpenAiResponses),
+        "gemini" => Ok(ApiFormat::GeminiGenerateContent),
         // Known and unknown providers default to OpenAI-compatible.
         _ => Ok(ApiFormat::OpenAiCompletions),
     }
@@ -534,6 +552,7 @@ fn resolve_credential(
 fn infer_provider_kind(provider_name: &str, api_format: ApiFormat) -> ProviderKind {
     match api_format {
         ApiFormat::AnthropicMessages => ProviderKind::Anthropic,
+        ApiFormat::GeminiGenerateContent => ProviderKind::Gemini,
         ApiFormat::OpenAiCompletions | ApiFormat::OpenAiResponses => match provider_name {
             "xai" => ProviderKind::Xai,
             "codex" => ProviderKind::Codex,

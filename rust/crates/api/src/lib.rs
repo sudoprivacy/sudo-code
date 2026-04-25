@@ -24,6 +24,7 @@ pub use providers::anthropic::{
     AnthropicClient as ApiClient, AuthSource, DEFAULT_BASE_URL,
 };
 pub use providers::codex::{CodexClient, DEFAULT_CODEX_BASE_URL};
+pub use providers::gemini::GeminiClient;
 pub use providers::openai_compat::{
     build_chat_completion_request, flatten_tool_result_content, is_reasoning_model,
     model_rejects_is_error_field, translate_message, OpenAiCompatClient, OpenAiCompatConfig,

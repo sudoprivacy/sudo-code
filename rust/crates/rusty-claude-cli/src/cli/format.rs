@@ -25,6 +25,7 @@ pub(crate) fn provider_label(kind: ProviderKind) -> &'static str {
         ProviderKind::Xai => "xai",
         ProviderKind::OpenAi => "openai",
         ProviderKind::Codex => "codex",
+        ProviderKind::Gemini => "gemini",
     }
 }
 
