@@ -1151,9 +1151,7 @@ pub(crate) fn load_sudocode_config_for_current_dir() -> api::SudoCodeConfig {
 /// `require_sudocode_config_for_cwd` instead.
 pub(crate) fn load_sudocode_config_for_cwd(cwd: &Path) -> api::SudoCodeConfig {
     let loader = ConfigLoader::default_for(cwd);
-    loader
-        .load_sudocode_config()
-        .unwrap_or_default()
+    loader.load_sudocode_config().unwrap_or_default()
 }
 
 /// Load `SudoCodeConfig` or return a fatal error. Used during startup
