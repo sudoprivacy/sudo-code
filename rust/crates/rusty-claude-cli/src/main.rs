@@ -4657,14 +4657,11 @@ impl LiveCli {
 
         // Endpoint from config-driven resolution.
         let config = &self.config.sudocode_config;
-        let endpoint = api::resolve_provider_from_config(
-            &self.config.model,
-            self.config.auth_mode,
-            config,
-        )
-        .ok()
-        .map(|r| r.base_url)
-        .unwrap_or_default();
+        let endpoint =
+            api::resolve_provider_from_config(&self.config.model, self.config.auth_mode, config)
+                .ok()
+                .map(|r| r.base_url)
+                .unwrap_or_default();
 
         format!(
             "\x1b[38;5;117m\
@@ -11770,10 +11767,15 @@ mod tests {
     #[test]
     fn startup_banner_mentions_workflow_completions() {
         let _guard = env_lock();
-        // Inject dummy credentials so LiveCli can construct without real Anthropic key
-        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-banner-test");
         let root = temp_dir();
-        fs::create_dir_all(&root).expect("root dir");
+        let config_home = root.join("config-home");
+        fs::create_dir_all(&config_home).expect("config home");
+        // Write sample sudocode.json with a dummy API key.
+        let sample =
+            runtime::SAMPLE_SUDOCODE_JSON.replace("<YOUR_ANTHROPIC_API_KEY>", "test-dummy-key");
+        fs::write(config_home.join("sudocode.json"), &sample).expect("write sudocode.json");
+        let original_config_home = std::env::var("SUDO_CODE_CONFIG_HOME").ok();
+        std::env::set_var("SUDO_CODE_CONFIG_HOME", &config_home);
 
         let banner = with_current_dir(&root, || {
             LiveCli::new(
@@ -11781,7 +11783,7 @@ mod tests {
                 true,
                 None,
                 PermissionMode::DangerFullAccess,
-                None,
+                Some(api::AuthMode::ApiKey),
             )
             .expect("cli should initialize")
             .startup_banner()
@@ -11790,8 +11792,11 @@ mod tests {
         assert!(banner.contains("Tab"));
         assert!(banner.contains("workflow completions"));
 
+        match original_config_home {
+            Some(v) => std::env::set_var("SUDO_CODE_CONFIG_HOME", v),
+            None => std::env::remove_var("SUDO_CODE_CONFIG_HOME"),
+        }
         fs::remove_dir_all(root).expect("cleanup temp dir");
-        std::env::remove_var("ANTHROPIC_API_KEY");
     }
 
     #[test]
@@ -13263,14 +13268,16 @@ UU conflicted.rs",
         // set/remove ANTHROPIC_API_KEY do not race with this test.
         let _guard = env_lock();
         let config_home = temp_dir();
-        // Inject a dummy API key so runtime construction succeeds without real credentials.
-        // This test only exercises plugin lifecycle (init/shutdown), never calls the API.
-        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-plugin-lifecycle");
         let workspace = temp_dir();
         let source_root = temp_dir();
         fs::create_dir_all(&config_home).expect("config home");
         fs::create_dir_all(&workspace).expect("workspace");
         fs::create_dir_all(&source_root).expect("source root");
+        // Write the sample sudocode.json with a dummy API key so runtime
+        // construction succeeds. This test only exercises plugin lifecycle.
+        let sample =
+            runtime::SAMPLE_SUDOCODE_JSON.replace("<YOUR_ANTHROPIC_API_KEY>", "test-dummy-key");
+        fs::write(config_home.join("sudocode.json"), sample).expect("write sudocode.json");
         write_plugin_fixture(&source_root, "lifecycle-runtime-demo", false, true);
 
         let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
@@ -13294,8 +13301,10 @@ UU conflicted.rs",
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 progress_reporter: None,
-                auth_mode: None,
-                sudocode_config: api::SudoCodeConfig::default(),
+                auth_mode: Some(api::AuthMode::ApiKey),
+                sudocode_config: loader
+                    .load_sudocode_config()
+                    .expect("sudocode config should load"),
             },
             runtime_plugin_state,
         )

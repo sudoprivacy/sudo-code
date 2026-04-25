@@ -279,6 +279,16 @@ impl HarnessWorkspace {
         fs::create_dir_all(&self.home)?;
         Ok(())
     }
+
+    /// Write the sample sudocode.json with the mock server's base URL
+    /// substituted for the real Anthropic endpoint.
+    fn write_sudocode_json(&self, base_url: &str) {
+        let sample = runtime::SAMPLE_SUDOCODE_JSON
+            .replace("https://api.anthropic.com", base_url)
+            .replace("<YOUR_ANTHROPIC_API_KEY>", "test-parity-key");
+        fs::write(self.config_home.join("sudocode.json"), sample)
+            .expect("test sudocode.json should be written");
+    }
 }
 
 struct ScenarioRun {
@@ -308,17 +318,20 @@ struct ScenarioReport {
 }
 
 fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) -> ScenarioRun {
+    // Write a test sudocode.json pointing at the mock server.
+    workspace.write_sudocode_json(base_url);
+
     let mut command = Command::new(env!("CARGO_BIN_EXE_scode"));
     command
         .current_dir(&workspace.root)
         .env_clear()
-        .env("ANTHROPIC_API_KEY", "test-parity-key")
-        .env("ANTHROPIC_BASE_URL", base_url)
         .env("SUDO_CODE_CONFIG_HOME", &workspace.config_home)
         .env("HOME", &workspace.home)
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
         .args([
+            "--auth",
+            "api-key",
             "--model",
             "sonnet",
             "--permission-mode",

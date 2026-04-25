@@ -9,6 +9,10 @@ use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 /// Schema name advertised by generated settings files.
 pub const SUDOCODE_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
 
+/// The sample `sudocode.json` shipped with the repo, embedded at compile time.
+/// Tests can write this to a temp config home instead of hardcoding config JSON.
+pub const SAMPLE_SUDOCODE_JSON: &str = include_str!("sudocode.sample.json");
+
 /// Origin of a loaded settings file in the configuration precedence chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConfigSource {

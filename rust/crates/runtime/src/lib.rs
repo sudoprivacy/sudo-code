@@ -69,7 +69,7 @@ pub use config::{
     ModelConfigEntry, ModelProviderMapping, OAuthConfig, ProviderConnectionConfig,
     ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
     RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
-    SudoCodeConfig, SUDOCODE_SETTINGS_SCHEMA_NAME,
+    SudoCodeConfig, SAMPLE_SUDOCODE_JSON, SUDOCODE_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
