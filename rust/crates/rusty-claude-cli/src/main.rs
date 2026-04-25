@@ -1592,6 +1592,38 @@ fn load_sudocode_config_for_cwd(cwd: &Path) -> api::SudoCodeConfig {
     })
 }
 
+/// Resolve an optional auth mode to a concrete one using the sudocode config.
+///
+/// When `explicit` is `Some`, it is returned as-is. When `None`, the first
+/// available mode for the model is selected in priority order:
+/// subscription → proxy → api-key. If none is available, returns an error
+/// directing the user to configure their model.
+fn resolve_auth_mode(
+    model: &str,
+    explicit: Option<AuthMode>,
+    config: &api::SudoCodeConfig,
+) -> Result<AuthMode, String> {
+    const PRIORITY: &[&str] = &["subscription", "proxy", "api-key"];
+    if let Some(mode) = explicit {
+        return Ok(mode);
+    }
+    let entry = api::resolve_model(config, model).ok_or_else(|| {
+        format!(
+            "model '{model}' not found in config. Run /model to configure it, \
+             or pass --auth=<subscription|proxy|api-key> explicitly."
+        )
+    })?;
+    for mode_str in PRIORITY {
+        if entry.providers.contains_key(*mode_str) {
+            return AuthMode::parse(mode_str);
+        }
+    }
+    Err(format!(
+        "no auth mode available for model '{model}'. Run /model to configure it, \
+         or pass --auth=<subscription|proxy|api-key> explicitly."
+    ))
+}
+
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
     if values.is_empty() {
         return Ok(None);
@@ -3934,7 +3966,7 @@ struct RuntimeConfig {
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
-    auth_mode: Option<AuthMode>,
+    auth_mode: AuthMode,
     sudocode_config: api::SudoCodeConfig,
 }
 
@@ -4076,16 +4108,21 @@ impl AcpCliAgent {
             &cwd,
             session_state.with_persistence_path(handle.path.clone()),
             &handle.id,
-            RuntimeConfig {
-                model,
-                system_prompt,
-                enable_tools: true,
-                emit_output: false,
-                allowed_tools: self.allowed_tools.clone(),
-                permission_mode,
-                progress_reporter: None,
-                auth_mode: self.auth_mode,
-                sudocode_config: load_sudocode_config_for_cwd(&cwd),
+            {
+                let sudocode_config = load_sudocode_config_for_cwd(&cwd);
+                let auth_mode = resolve_auth_mode(&model, self.auth_mode, &sudocode_config)
+                    .map_err(|e| AcpError::internal(format!("failed to resolve auth mode: {e}")))?;
+                RuntimeConfig {
+                    model,
+                    system_prompt,
+                    enable_tools: true,
+                    emit_output: false,
+                    allowed_tools: self.allowed_tools.clone(),
+                    permission_mode,
+                    progress_reporter: None,
+                    auth_mode,
+                    sudocode_config,
+                }
             },
         )
         .map_err(|error| AcpError::internal(format!("failed to build runtime: {error}")))?;
@@ -4598,6 +4635,8 @@ impl LiveCli {
         let system_prompt = build_system_prompt()?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
+        let sudocode_config = load_sudocode_config_for_current_dir();
+        let auth_mode = resolve_auth_mode(&model, auth_mode, &sudocode_config)?;
         let config = RuntimeConfig {
             model,
             system_prompt,
@@ -4607,7 +4646,7 @@ impl LiveCli {
             permission_mode,
             progress_reporter: None,
             auth_mode,
-            sudocode_config: load_sudocode_config_for_current_dir(),
+            sudocode_config,
         };
         let runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
@@ -4650,18 +4689,18 @@ impl LiveCli {
         );
 
         // Auth mode line.
-        let auth_mode_str = self
-            .config
-            .auth_mode
-            .map_or_else(|| "auto".to_string(), |m| m.label().to_string());
+        let auth_mode_str = self.config.auth_mode.label().to_string();
 
         // Endpoint from config-driven resolution.
         let config = &self.config.sudocode_config;
-        let endpoint =
-            api::resolve_provider_from_config(&self.config.model, self.config.auth_mode, config)
-                .ok()
-                .map(|r| r.base_url)
-                .unwrap_or_default();
+        let endpoint = api::resolve_provider_from_config(
+            &self.config.model,
+            Some(self.config.auth_mode),
+            config,
+        )
+        .ok()
+        .map(|r| r.base_url)
+        .unwrap_or_default();
 
         format!(
             "\x1b[38;5;117m\
@@ -5206,10 +5245,7 @@ impl LiveCli {
     }
 
     fn set_auth(&mut self, mode: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
-        let current_str = self
-            .config
-            .auth_mode
-            .map_or_else(|| "auto".to_string(), |m| m.as_str().to_string());
+        let current_str = self.config.auth_mode.as_str().to_string();
 
         let Some(mode) = mode else {
             println!("{}", format_auth_report(&current_str));
@@ -5225,7 +5261,7 @@ impl LiveCli {
 
         let previous = current_str;
         let session = self.runtime.session().clone();
-        self.config.auth_mode = Some(parsed);
+        self.config.auth_mode = parsed;
         let runtime = build_runtime(session, &self.session.id, self.config.clone())?;
         self.replace_runtime(runtime)?;
         println!("{}", format_auth_switch_report(&previous, parsed.as_str()));
@@ -7846,7 +7882,7 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let sudocode_config = &config.sudocode_config;
-        let effective_mode = config.auth_mode;
+        let effective_mode = Some(config.auth_mode);
 
         let resolved =
             api::resolve_provider_from_config(&config.model, effective_mode, sudocode_config)?;
@@ -13325,7 +13361,7 @@ UU conflicted.rs",
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 progress_reporter: None,
-                auth_mode: Some(api::AuthMode::ApiKey),
+                auth_mode: api::AuthMode::ApiKey,
                 sudocode_config: loader
                     .load_sudocode_config()
                     .expect("sudocode config should load"),
