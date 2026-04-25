@@ -2,12 +2,32 @@ use std::cmp::Reverse;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use glob::Pattern;
+use nexus_vfs_client::NexusVfsClient;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
+
+// ---------------------------------------------------------------------------
+// Nexus VFS bridge — activated by NEXUS_VFS_SOCK env var.
+// When set, read_file / write_file / edit_file route raw bytes through the
+// nexus VFS gRPC server instead of the local filesystem.
+// ---------------------------------------------------------------------------
+
+static VFS: OnceLock<Option<(NexusVfsClient, String)>> = OnceLock::new();
+
+fn vfs() -> Option<(&'static NexusVfsClient, &'static str)> {
+    VFS.get_or_init(|| {
+        let sock = std::env::var("NEXUS_VFS_SOCK").ok()?;
+        let token = std::env::var("NEXUS_AUTH_TOKEN").unwrap_or_default();
+        NexusVfsClient::connect(&sock).ok().map(|c| (c, token))
+    })
+    .as_ref()
+    .map(|(c, t)| (c, t.as_str()))
+}
 
 /// Maximum file size that can be read (10 MB).
 const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
@@ -179,28 +199,51 @@ pub fn read_file(
 ) -> io::Result<ReadFileOutput> {
     let absolute_path = normalize_path(path)?;
 
-    // Check file size before reading
-    let metadata = fs::metadata(&absolute_path)?;
-    if metadata.len() > MAX_READ_SIZE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "file is too large ({} bytes, max {} bytes)",
-                metadata.len(),
-                MAX_READ_SIZE
-            ),
-        ));
-    }
+    let content = if let Some((client, token)) = vfs() {
+        let bytes = client.read(&absolute_path.to_string_lossy(), token)?;
+        if bytes.len() as u64 > MAX_READ_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "file is too large ({} bytes, max {} bytes)",
+                    bytes.len(),
+                    MAX_READ_SIZE
+                ),
+            ));
+        }
+        if bytes.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file appears to be binary",
+            ));
+        }
+        String::from_utf8(bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file is not valid UTF-8"))?
+    } else {
+        // Check file size before reading
+        let metadata = fs::metadata(&absolute_path)?;
+        if metadata.len() > MAX_READ_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "file is too large ({} bytes, max {} bytes)",
+                    metadata.len(),
+                    MAX_READ_SIZE
+                ),
+            ));
+        }
 
-    // Detect binary files
-    if is_binary_file(&absolute_path)? {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "file appears to be binary",
-        ));
-    }
+        // Detect binary files
+        if is_binary_file(&absolute_path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file appears to be binary",
+            ));
+        }
 
-    let content = fs::read_to_string(&absolute_path)?;
+        fs::read_to_string(&absolute_path)?
+    };
+
     let lines: Vec<&str> = content.lines().collect();
     let start_index = offset.unwrap_or(0).min(lines.len());
     let end_index = limit.map_or(lines.len(), |limit| {
@@ -234,24 +277,45 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     }
 
     let absolute_path = normalize_path_allow_missing(path)?;
-    let original_file = fs::read_to_string(&absolute_path).ok();
-    if let Some(parent) = absolute_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&absolute_path, content)?;
+    let vfs_path = absolute_path.to_string_lossy().into_owned();
 
-    Ok(WriteFileOutput {
-        kind: if original_file.is_some() {
-            String::from("update")
-        } else {
-            String::from("create")
-        },
-        file_path: absolute_path.to_string_lossy().into_owned(),
-        content: content.to_owned(),
-        structured_patch: make_patch(original_file.as_deref().unwrap_or(""), content),
-        original_file,
-        git_diff: None,
-    })
+    if let Some((client, token)) = vfs() {
+        let original_file = client
+            .read(&vfs_path, token)
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok());
+        client.write(&vfs_path, content.as_bytes().to_vec(), token)?;
+        Ok(WriteFileOutput {
+            kind: if original_file.is_some() {
+                String::from("update")
+            } else {
+                String::from("create")
+            },
+            file_path: vfs_path,
+            content: content.to_owned(),
+            structured_patch: make_patch(original_file.as_deref().unwrap_or(""), content),
+            original_file,
+            git_diff: None,
+        })
+    } else {
+        let original_file = fs::read_to_string(&absolute_path).ok();
+        if let Some(parent) = absolute_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&absolute_path, content)?;
+        Ok(WriteFileOutput {
+            kind: if original_file.is_some() {
+                String::from("update")
+            } else {
+                String::from("create")
+            },
+            file_path: vfs_path,
+            content: content.to_owned(),
+            structured_patch: make_patch(original_file.as_deref().unwrap_or(""), content),
+            original_file,
+            git_diff: None,
+        })
+    }
 }
 
 /// Performs an in-file string replacement and returns patch metadata.
@@ -262,7 +326,16 @@ pub fn edit_file(
     replace_all: bool,
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
-    let original_file = fs::read_to_string(&absolute_path)?;
+    let vfs_path = absolute_path.to_string_lossy().into_owned();
+
+    let original_file = if let Some((client, token)) = vfs() {
+        let bytes = client.read(&vfs_path, token)?;
+        String::from_utf8(bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file is not valid UTF-8"))?
+    } else {
+        fs::read_to_string(&absolute_path)?
+    };
+
     if old_string == new_string {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -281,10 +354,15 @@ pub fn edit_file(
     } else {
         original_file.replacen(old_string, new_string, 1)
     };
-    fs::write(&absolute_path, &updated)?;
+
+    if let Some((client, token)) = vfs() {
+        client.write(&vfs_path, updated.as_bytes().to_vec(), token)?;
+    } else {
+        fs::write(&absolute_path, &updated)?;
+    }
 
     Ok(EditFileOutput {
-        file_path: absolute_path.to_string_lossy().into_owned(),
+        file_path: vfs_path,
         old_string: old_string.to_owned(),
         new_string: new_string.to_owned(),
         original_file: original_file.clone(),

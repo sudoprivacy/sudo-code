@@ -9,6 +9,7 @@ publish.workspace = true
 sha2 = "0.10"
 glob = "0.3"
 keyring = "3"
+nexus-vfs-client = { path = "../nexus-vfs-client" }
 plugins = { path = "../plugins" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
