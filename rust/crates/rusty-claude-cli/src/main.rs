@@ -1846,11 +1846,11 @@ impl LiveCli {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
-        spinner.tick(
+        spinner.start(
             "🦀 Thinking...",
+            Some(self.config.model.as_str()),
             TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
+        );
         let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
         hook_abort_monitor.stop();

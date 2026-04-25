@@ -1,5 +1,8 @@
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 
 use crossterm::cursor::{MoveToColumn, RestorePosition, SavePosition};
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
@@ -44,9 +47,9 @@ impl Default for ColorTheme {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Spinner {
-    frame_index: usize,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Spinner {
@@ -54,28 +57,54 @@ impl Spinner {
 
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            handle: None,
+        }
     }
 
-    pub fn tick(
-        &mut self,
-        label: &str,
-        theme: &ColorTheme,
-        out: &mut impl Write,
-    ) -> io::Result<()> {
-        let frame = Self::FRAMES[self.frame_index % Self::FRAMES.len()];
-        self.frame_index += 1;
-        queue!(
-            out,
-            SavePosition,
-            MoveToColumn(0),
-            Clear(ClearType::CurrentLine),
-            SetForegroundColor(theme.spinner_active),
-            Print(format!("{frame} {label}")),
-            ResetColor,
-            RestorePosition
-        )?;
-        out.flush()
+    /// Start the spinner animation in a background thread.
+    pub fn start(&mut self, label: &str, model: Option<&str>, theme: &ColorTheme) {
+        self.stop.store(false, Ordering::SeqCst);
+        let stop = Arc::clone(&self.stop);
+        let label = label.to_string();
+        let model = model.map(ToString::to_string);
+        let theme = *theme;
+        let start_time = Instant::now();
+
+        self.handle = Some(std::thread::spawn(move || {
+            let mut frame_index: usize = 0;
+            let mut stdout = io::stdout();
+            while !stop.load(Ordering::SeqCst) {
+                let frame = Self::FRAMES[frame_index % Self::FRAMES.len()];
+                frame_index += 1;
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let mut line = format!("{frame} {label}");
+                if let Some(ref m) = model {
+                    let _ = write!(line, " [{m}]");
+                }
+                let _ = write!(line, " ({elapsed:.1}s)");
+                let _ = queue!(
+                    stdout,
+                    SavePosition,
+                    MoveToColumn(0),
+                    Clear(ClearType::CurrentLine),
+                    SetForegroundColor(theme.spinner_active),
+                    Print(line),
+                    ResetColor,
+                    RestorePosition
+                );
+                let _ = stdout.flush();
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+        }));
+    }
+
+    fn stop_thread(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 
     pub fn finish(
@@ -84,7 +113,7 @@ impl Spinner {
         theme: &ColorTheme,
         out: &mut impl Write,
     ) -> io::Result<()> {
-        self.frame_index = 0;
+        self.stop_thread();
         execute!(
             out,
             MoveToColumn(0),
@@ -102,7 +131,7 @@ impl Spinner {
         theme: &ColorTheme,
         out: &mut impl Write,
     ) -> io::Result<()> {
-        self.frame_index = 0;
+        self.stop_thread();
         execute!(
             out,
             MoveToColumn(0),
