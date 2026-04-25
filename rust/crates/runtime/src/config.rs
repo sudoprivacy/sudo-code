@@ -417,25 +417,7 @@ impl ConfigLoader {
                 path.display()
             )));
         }
-        let mut config = SudoCodeConfig::default();
-        let user = parse_sudocode_json(&path)?;
-        for (mode, providers) in user.auth_modes {
-            config.auth_modes.entry(mode).or_default().extend(providers);
-        }
-        for (alias, user_model) in user.models {
-            match config.models.get_mut(&alias) {
-                Some(existing) => {
-                    existing.providers.extend(user_model.providers);
-                    if user_model.name != alias {
-                        existing.name = user_model.name;
-                    }
-                }
-                None => {
-                    config.models.insert(alias, user_model);
-                }
-            }
-        }
-        Ok(config)
+        parse_sudocode_json(&path)
     }
 }
 
