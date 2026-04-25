@@ -445,6 +445,61 @@ Commands like `/help`, `/status`, `/config`, `/model`, `/theme`, `/permissions` 
 
 ---
 
+## 12. Interactive Command Display
+
+### What TS does
+
+**Commands render as interactive React components with keyboard navigation.**
+
+- `src/components/CustomSelect/select.tsx` — Core interactive picker used across many commands. Supports Up/Down/Home/End navigation, numeric shortcuts (1-9), scrolling through long lists.
+- `/model` — Renders an interactive list of available models. User navigates with arrow keys, presses Enter to select.
+- `/resume` — Uses a fuzzy picker to search and select from saved sessions.
+- `/theme` — Interactive theme picker with live preview — selecting a theme applies it immediately, changing colors in real-time.
+- `/permissions` — Select menu with multiple granularity options (allow once, allow for session, always allow).
+- `/help` — Formatted pane with category headers, dividers, and scrollable content.
+- `/config` — Interactive settings editor with nested sections.
+- `src/components/Pane.tsx` — Shared `Pane` component providing bordered, titled containers for command output with `Divider` separators between sections.
+- `src/hooks/useSelectableList.ts` — Reusable keyboard navigation hook for any list-based command output.
+- Commands that produce output render it inside the Ink component tree, so they participate in the layout system (scrollable, positioned within FullscreenLayout).
+
+### What Rust does
+
+**Every command uses `println!()` — zero interactive UI.**
+
+- `main.rs:4776-4893` — All 31 implemented commands in `handle_repl_command()` output via `println!()` or `format!()` → `println!()`.
+- `/help` (`main.rs:4776-4790`) — Prints a flat text list of commands with descriptions. No categories, no navigation.
+- `/model` (`main.rs:4810-4828`) — If argument given, sets model. Otherwise prints current model name. No picker.
+- `/status` (`main.rs:5986-6017`) — Prints key-value pairs. No formatting beyond raw text.
+- `/config` (`main.rs:4844-4860`) — Prints raw config text. No section navigation.
+- `/resume` (`main.rs:4831-4842`) — Requires exact file path argument. No fuzzy search, no session list.
+- No crate in `Cargo.toml` provides interactive selection (no `dialoguer`, no `inquire`, no `console`). The only interactive library is `rustyline` (line editor).
+- `crossterm` is a dependency and provides raw terminal mode, cursor control, and event reading — but is only used for color output via `crossterm::style::Stylize`, never for interactive UI.
+
+### Gap
+
+| Aspect | TS | Rust |
+|--------|:--:|:----:|
+| Command output rendering | Interactive React panes | `println!()` flat text |
+| Keyboard navigation in output | ✅ Arrow keys, Home/End, numeric | ❌ |
+| Selection/picker UI | ✅ `CustomSelect` component | ❌ |
+| Live preview | ✅ Theme preview, model details | ❌ |
+| Scrollable command output | ✅ Via FullscreenLayout ScrollBox | ❌ Terminal scrollback only |
+| Bordered/titled containers | ✅ `Pane` + `Divider` | ❌ |
+
+### Recommended approach
+
+`dialoguer` crate (2.6M downloads/month) provides interactive prompts without requiring a full TUI framework:
+- `Select` — arrow-key navigable list (for `/model`, `/theme`, `/permissions`)
+- `FuzzySelect` — fuzzy-searchable picker (for `/resume`)
+- `Confirm` — styled yes/no (for permission prompts)
+- `MultiSelect` — multi-item picker
+- Works inline (no alternate screen required), integrates with existing scrollback model
+- Minimal dependency footprint; no layout engine needed
+
+Alternative: `inquire` crate offers similar capabilities with built-in validation and custom rendering.
+
+---
+
 ## Summary: Gaps Ranked by Functional Impact
 
 Ranked by how much they affect usability — animation/visual polish gaps excluded per decision.
@@ -454,11 +509,12 @@ Ranked by how much they affect usability — animation/visual polish gaps exclud
 | 1 | **Tool output not collapsible** | `CtrlOToExpand.tsx:29-50` | `main.rs:8553-8585` (full dump) | **Critical** — floods screen, kills readability |
 | 2 | **No fixed footer** — input/spinner scroll away during long output | `FullscreenLayout.tsx:413` (bottom slot) | `main.rs:3737` (inline loop) | **Critical** — lose context mid-turn |
 | 3 | **Y/N permission prompt** — no select menu, no "allow for session", raw JSON context | `PermissionPrompt.tsx` + `CustomSelect` | `main.rs:7693-7730` (stdin readline) | **High** — friction on every permission check |
-| 4 | **No status line** — model/tokens/cost not visible during session | `StatusLine.tsx` | Not implemented | **High** — users must run /status manually |
-| 5 | **Spinner shows no useful info** — frozen frame, no mode, no elapsed time | `SpinnerAnimationRow.tsx` (modes + time) | `render.rs:60` (single tick) | **Medium** — user doesn't know what's happening |
-| 6 | **No response structure** — no bullet prefix, no visual hierarchy between assistant text and tool output | `ToolUseLoader.tsx:19` + `MessageResponse.tsx:22` | `main.rs:7948` (raw write) | **Medium** — harder to scan conversation |
-| 7 | **Plain startup banner** — no bordered layout, no tips/activity feeds | `LogoV2.tsx:331-436` (2-col layout) | `main.rs:4558-4600` (key-value) | **Low** — cosmetic, seen once |
-| 8 | **Inline autocomplete** — no descriptions next to command names | `PromptInputFooterSuggestions.tsx` | `input.rs:23-99` (rustyline) | **Low** — functional, just less informative |
+| 4 | **No interactive command display** — all commands use `println!()`, no pickers/menus/panes | `CustomSelect`, `Pane`, `useSelectableList` | `main.rs:4776-4893` (all `println!()`) | **High** — commands feel like a debug dump |
+| 5 | **No status line** — model/tokens/cost not visible during session | `StatusLine.tsx` | Not implemented | **High** — users must run /status manually |
+| 6 | **Spinner shows no useful info** — frozen frame, no mode, no elapsed time | `SpinnerAnimationRow.tsx` (modes + time) | `render.rs:60` (single tick) | **Medium** — user doesn't know what's happening |
+| 7 | **No response structure** — no bullet prefix, no visual hierarchy between assistant text and tool output | `ToolUseLoader.tsx:19` + `MessageResponse.tsx:22` | `main.rs:7948` (raw write) | **Medium** — harder to scan conversation |
+| 8 | **Plain startup banner** — no bordered layout, no tips/activity feeds | `LogoV2.tsx:331-436` (2-col layout) | `main.rs:4558-4600` (key-value) | **Low** — cosmetic, seen once |
+| 9 | **Inline autocomplete** — no descriptions next to command names | `PromptInputFooterSuggestions.tsx` | `input.rs:23-99` (rustyline) | **Low** — functional, just less informative |
 
 **Explicitly excluded** (not worth bridging):
 - Shimmer/glimmer text effects
