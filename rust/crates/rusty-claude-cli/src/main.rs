@@ -7808,7 +7808,6 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let sudocode_config = &config.sudocode_config;
-        let resolved_model = resolve_model_alias(&config.model);
 
         // Check whether config-driven resolution applies for this model.
         let has_config_model = !sudocode_config.auth_modes.is_empty()
@@ -7829,30 +7828,30 @@ impl AnthropicRuntimeClient {
 
         // Try config-driven resolution first (sudocode.json).
         let client = if has_config_model {
-            let resolved = api::resolve_provider_from_config(
-                &config.model,
-                effective_mode.or(config.auth_mode),
-                sudocode_config,
-            )?;
-            ApiProviderClient::from_resolved(&resolved)?
-                .with_prompt_cache(PromptCache::new(session_id))
-        } else if let Some(mode) = effective_mode {
-            let auth = AuthSource::for_mode(mode)?;
-            ApiProviderClient::from_model_and_mode(&resolved_model, mode, auth)?
+            let resolved =
+                api::resolve_provider_from_config(&config.model, effective_mode, sudocode_config)?;
+            ApiProviderClient::from_resolved(&resolved, effective_mode)?
                 .with_prompt_cache(PromptCache::new(session_id))
         } else {
-            // No recognised auth env vars at all — fall back to the
-            // legacy provider-detection path for non-Anthropic models.
-            match detect_provider_kind(&resolved_model) {
-                ProviderKind::Anthropic => {
-                    let auth = resolve_cli_auth_source()?;
-                    let inner = AnthropicClient::from_auth(auth)
-                        .with_base_url(api::read_base_url())
-                        .with_prompt_cache(PromptCache::new(session_id));
-                    ApiProviderClient::Anthropic(inner)
-                }
-                ProviderKind::Xai | ProviderKind::OpenAi => {
-                    ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+            let resolved_model = resolve_model_alias(&config.model);
+            if let Some(mode) = effective_mode {
+                let auth = AuthSource::for_mode(mode)?;
+                ApiProviderClient::from_model_and_mode(&resolved_model, mode, auth)?
+                    .with_prompt_cache(PromptCache::new(session_id))
+            } else {
+                // No recognised auth env vars at all — fall back to the
+                // legacy provider-detection path for non-Anthropic models.
+                match detect_provider_kind(&resolved_model) {
+                    ProviderKind::Anthropic => {
+                        let auth = resolve_cli_auth_source()?;
+                        let inner = AnthropicClient::from_auth(auth)
+                            .with_base_url(api::read_base_url())
+                            .with_prompt_cache(PromptCache::new(session_id));
+                        ApiProviderClient::Anthropic(inner)
+                    }
+                    ProviderKind::Xai | ProviderKind::OpenAi => {
+                        ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+                    }
                 }
             }
         };

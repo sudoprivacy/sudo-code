@@ -97,23 +97,22 @@ impl ProviderClient {
     /// This is the primary entry point for config-driven provider construction.
     /// The caller is responsible for calling `resolve_provider_from_config()`
     /// first to obtain the `ResolvedProvider`.
-    pub fn from_resolved(resolved: &ResolvedProvider) -> Result<Self, ApiError> {
+    pub fn from_resolved(
+        resolved: &ResolvedProvider,
+        mode: Option<AuthMode>,
+    ) -> Result<Self, ApiError> {
         match resolved.api_format {
             ApiFormat::AnthropicMessages => {
-                // Build AnthropicClient with the resolved credential + base URL.
                 let auth = match &resolved.credential {
                     Credential::ApiKey(key) => AuthSource::ApiKey(key.clone()),
                     Credential::Token(token) => AuthSource::BearerToken(token.clone()),
                     Credential::AuthFile(path) => {
-                        // Load token from auth file (e.g. ~/.claude/credentials.json).
                         let content = std::fs::read_to_string(path).map_err(|e| {
                             ApiError::Configuration(format!(
                                 "failed to read auth file {}: {e}",
                                 path.display()
                             ))
                         })?;
-                        // Try to parse as JSON and extract an accessToken field,
-                        // falling back to the raw file content as a token.
                         let token = serde_json::from_str::<serde_json::Value>(&content)
                             .ok()
                             .and_then(|v| {
@@ -130,8 +129,8 @@ impl ProviderClient {
                         ));
                     }
                 };
-                let client =
-                    AnthropicClient::from_auth(auth).with_base_url(resolved.base_url.clone());
+                let client = AnthropicClient::from_auth_with_mode(auth, mode)
+                    .with_base_url(resolved.base_url.clone());
                 Ok(Self::Anthropic(client))
             }
             ApiFormat::OpenAiCompletions | ApiFormat::OpenAiResponses => {

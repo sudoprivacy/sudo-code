@@ -2333,7 +2333,7 @@ mod tests {
           "auth_modes": {
             "subscription": {
               "claude": {
-                "baseUrl": "https://api.anthropic.com/v1/messages",
+                "baseUrl": "https://api.anthropic.com",
                 "token": "sk-test-oauth-token"
               }
             },
@@ -2382,7 +2382,7 @@ mod tests {
         // auth_modes
         assert_eq!(config.auth_modes.len(), 3);
         let sub_claude = &config.auth_modes["subscription"]["claude"];
-        assert_eq!(sub_claude.base_url, "https://api.anthropic.com/v1/messages");
+        assert_eq!(sub_claude.base_url, "https://api.anthropic.com");
         assert_eq!(sub_claude.token.as_deref(), Some("sk-test-oauth-token"));
         assert!(sub_claude.token_env.is_none());
 

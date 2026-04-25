@@ -2,7 +2,7 @@
   "auth_modes": {
     "subscription": {
       "claude": {
-        "baseUrl": "https://api.anthropic.com/v1/messages",
+        "baseUrl": "https://api.anthropic.com",
         "token": "<YOUR_CLAUDE_OAUTH_TOKEN>"
       }
     },
@@ -52,7 +52,7 @@
         "api-key":      { "provider": "anthropic", "model": "claude-sonnet-4-6" }
       }
     },
-"gemini-3-pro": {
+    "gemini-3-pro": {
       "alias": "gemini-3-pro",
       "name": "Gemini 3.1 Pro",
       "input": ["text"],
@@ -74,14 +74,6 @@
       "input": ["text"],
       "providers": {
         "proxy": { "provider": "sudorouter", "model": "gpt-5.4", "api": "openai-completions" }
-      }
-    },
-    "gpt-5.4-mini": {
-      "alias": "gpt-5.4-mini",
-      "name": "GPT 5.4 Mini",
-      "input": ["text"],
-      "providers": {
-        "proxy": { "provider": "sudorouter", "model": "gpt-5.4-mini", "api": "openai-completions" }
       }
     },
     "gpt-5.4-mini": {

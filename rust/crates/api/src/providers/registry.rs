@@ -52,8 +52,6 @@ pub struct ResolvedProvider {
     pub credential: Credential,
     /// The wire model ID to send to the provider.
     pub model_id: String,
-    /// Human-friendly display name for UI banners.
-    pub display_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -77,17 +75,9 @@ pub fn resolve_model<'a>(config: &'a SudoCodeConfig, alias: &str) -> Option<&'a 
     })
 }
 
-/// List available auth modes for a model alias, in config order.
-#[must_use]
-pub fn available_auth_modes<'a>(config: &'a SudoCodeConfig, alias: &str) -> Vec<&'a str> {
-    resolve_model(config, alias)
-        .map(|m| m.providers.keys().map(String::as_str).collect())
-        .unwrap_or_default()
-}
-
 /// Look up connection config for a provider under a given auth mode.
 #[must_use]
-pub fn connection_for<'a>(
+fn connection_for<'a>(
     config: &'a SudoCodeConfig,
     auth_mode: &str,
     provider_name: &str,
@@ -143,7 +133,7 @@ pub fn resolve_provider_from_config(
             s.to_string()
         }
         None => {
-            // Pick first available (BTreeMap is ordered, config order = priority).
+            // Pick first available (BTreeMap is lexicographically sorted).
             model_config
                 .providers
                 .keys()
@@ -189,7 +179,6 @@ pub fn resolve_provider_from_config(
         base_url: connection.base_url.clone(),
         credential,
         model_id: mapping.model.clone(),
-        display_name: Some(model_config.name.clone()),
     })
 }
 
@@ -338,6 +327,13 @@ mod tests {
 
     use super::*;
 
+    /// List available auth modes for a model alias, in lexicographic order.
+    fn available_auth_modes<'a>(config: &'a SudoCodeConfig, alias: &str) -> Vec<&'a str> {
+        resolve_model(config, alias)
+            .map(|m| m.providers.keys().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
     fn sample_config() -> SudoCodeConfig {
         let mut auth_modes = BTreeMap::new();
 
@@ -346,7 +342,7 @@ mod tests {
         subscription.insert(
             "claude".to_string(),
             ProviderConnectionConfig {
-                base_url: "https://api.anthropic.com/v1/messages".to_string(),
+                base_url: "https://api.anthropic.com".to_string(),
                 api_key: None,
                 api_key_env: None,
                 token: None,
@@ -596,7 +592,7 @@ mod tests {
             .expect("should resolve with inline token");
         assert_eq!(resolved.kind, ProviderKind::Anthropic);
         assert_eq!(resolved.api_format, ApiFormat::AnthropicMessages);
-        assert_eq!(resolved.base_url, "https://api.anthropic.com/v1/messages");
+        assert_eq!(resolved.base_url, "https://api.anthropic.com");
         assert_eq!(
             resolved.credential,
             Credential::Token("sk-inline-oauth-token".to_string())
