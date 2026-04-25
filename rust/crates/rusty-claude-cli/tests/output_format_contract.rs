@@ -55,7 +55,7 @@ fn acp_server_responds_to_framed_initialize() {
     let acp = assert_framed_acp_command(
         &root,
         &["--output-format", "json", "acp"],
-        json!({
+        &json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
@@ -421,8 +421,8 @@ fn run_scode(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output
     command.output().expect("scode should launch")
 }
 
-fn assert_framed_acp_command(current_dir: &Path, args: &[&str], request: Value) -> Value {
-    let request = serde_json::to_vec(&request).expect("request should serialize");
+fn assert_framed_acp_command(current_dir: &Path, args: &[&str], request: &Value) -> Value {
+    let request = serde_json::to_vec(request).expect("request should serialize");
     let frame = format!("Content-Length: {}\r\n\r\n", request.len());
     let mut child = Command::new(env!("CARGO_BIN_EXE_scode"))
         .current_dir(current_dir)

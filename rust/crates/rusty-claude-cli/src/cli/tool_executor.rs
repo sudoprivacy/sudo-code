@@ -5,7 +5,7 @@ use runtime::{PermissionMode, PermissionPolicy, ToolError, ToolExecutor};
 use serde::Deserialize;
 use tools::GlobalToolRegistry;
 
-use super::format::*;
+use super::format::format_tool_result;
 use crate::render::TerminalRenderer;
 use crate::{AllowedToolSet, RuntimeMcpState};
 

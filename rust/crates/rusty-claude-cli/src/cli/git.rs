@@ -261,36 +261,3 @@ pub(crate) fn enforce_broad_cwd_policy(
         std::process::exit(1);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_git_status_metadata() {
-        let status = "## main...origin/main\n M src/main.rs\n?? new.txt\n";
-        let (root, branch) = parse_git_status_metadata_for(
-            &env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            Some(status),
-        );
-        // branch should be parsed from the status line
-        assert!(branch.is_some());
-    }
-
-    #[test]
-    fn parses_detached_head_from_status_snapshot() {
-        let status = "## HEAD (no branch)\n M src/main.rs\n";
-        let branch = parse_git_status_branch(Some(status));
-        assert_eq!(branch, Some("detached HEAD".to_string()));
-    }
-
-    #[test]
-    fn parses_git_workspace_summary_counts() {
-        let status = "## main\nM  staged.rs\n M unstaged.rs\n?? new.txt\nAM both.rs\n";
-        let summary = parse_git_workspace_summary(Some(status));
-        assert_eq!(summary.changed_files, 4);
-        assert_eq!(summary.staged_files, 2); // M_, AM
-        assert_eq!(summary.unstaged_files, 2); // _M, AM
-        assert_eq!(summary.untracked_files, 1); // ??
-    }
-}

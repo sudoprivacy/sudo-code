@@ -26,7 +26,7 @@ pub enum ApiFormat {
     AnthropicMessages,
     /// OpenAI-compatible chat completions API (`/v1/chat/completions`).
     OpenAiCompletions,
-    /// OpenAI Responses API (`/v1/responses`).
+    /// `OpenAI` Responses API (`/v1/responses`).
     OpenAiResponses,
 }
 
@@ -141,8 +141,7 @@ pub fn resolve_provider_from_config(
                 .cloned()
                 .ok_or_else(|| {
                     ApiError::Configuration(format!(
-                        "model '{}' has no provider mappings in sudocode.json",
-                        model_alias
+                        "model '{model_alias}' has no provider mappings in sudocode.json"
                     ))
                 })?
         }
@@ -274,10 +273,11 @@ fn resolve_credential(
                     return Ok(Credential::AuthFile(expanded));
                 }
             }
-            Err(ApiError::Configuration(format!(
+            Err(ApiError::Configuration(
                 "no token available for subscription provider. \
                  Set token, tokenEnv, or authFile in sudocode.json."
-            )))
+                    .to_string(),
+            ))
         }
         _ => {
             // Unknown auth mode — try apiKey then token.
@@ -334,6 +334,7 @@ mod tests {
             .unwrap_or_default()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn sample_config() -> SudoCodeConfig {
         let mut auth_modes = BTreeMap::new();
 

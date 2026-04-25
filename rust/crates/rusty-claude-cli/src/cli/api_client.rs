@@ -12,7 +12,7 @@ use runtime::{
 };
 use tools::GlobalToolRegistry;
 
-use super::format::*;
+use super::format::{format_tool_call_start, format_user_visible_api_error};
 use crate::render::{MarkdownStreamState, TerminalRenderer};
 use crate::{
     AllowedToolSet, InternalPromptProgressReporter, RuntimeConfig, POST_TOOL_STALL_TIMEOUT,

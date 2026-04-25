@@ -1061,13 +1061,11 @@ fn parse_sudocode_models_section(
     for (alias, model_value) in models_obj {
         let ctx = format!("{}.models.{alias}", path.display());
         let entry = expect_object(model_value, &ctx)?;
-        let name = optional_string(entry, "name", &ctx)?
-            .map(str::to_string)
-            .unwrap_or_else(|| alias.clone());
+        let name =
+            optional_string(entry, "name", &ctx)?.map_or_else(|| alias.clone(), str::to_string);
         let input = optional_string_array(entry, "input", &ctx)?.unwrap_or_default();
-        let alias_field = optional_string(entry, "alias", &ctx)?
-            .map(str::to_string)
-            .unwrap_or_else(|| alias.clone());
+        let alias_field =
+            optional_string(entry, "alias", &ctx)?.map_or_else(|| alias.clone(), str::to_string);
 
         // Parse the providers sub-object.
         let providers = if let Some(providers_value) = entry.get("providers") {

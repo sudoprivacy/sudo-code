@@ -732,6 +732,7 @@ impl AuthSource {
 
 /// Returns `true` when the active auth source comes from `CLAUDE_CODE_OAUTH_TOKEN`
 /// and no higher-priority auth env var (`ANTHROPIC_API_KEY`) takes precedence.
+#[must_use]
 pub fn is_claude_code_oauth_token() -> bool {
     if read_env_non_empty("ANTHROPIC_API_KEY")
         .ok()
@@ -747,6 +748,7 @@ pub fn is_claude_code_oauth_token() -> bool {
 }
 
 /// Returns `true` when `ANTHROPIC_API_KEY` is set and non-empty.
+#[must_use]
 pub fn is_anthropic_api_key() -> bool {
     read_env_non_empty("ANTHROPIC_API_KEY")
         .ok()
@@ -755,6 +757,7 @@ pub fn is_anthropic_api_key() -> bool {
 }
 
 /// Returns `true` when `PROXY_AUTH_TOKEN` is set and non-empty.
+#[must_use]
 pub fn is_proxy_auth_token() -> bool {
     read_env_non_empty("PROXY_AUTH_TOKEN")
         .ok()
