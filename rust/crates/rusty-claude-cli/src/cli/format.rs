@@ -14,10 +14,10 @@ use crate::{
 
 pub(crate) const DISPLAY_TRUNCATION_NOTICE: &str =
     "\x1b[2m… output truncated for display; full result preserved in session.\x1b[0m";
-pub(crate) const READ_DISPLAY_MAX_LINES: usize = 80;
-pub(crate) const READ_DISPLAY_MAX_CHARS: usize = 6_000;
-pub(crate) const TOOL_OUTPUT_DISPLAY_MAX_LINES: usize = 60;
-pub(crate) const TOOL_OUTPUT_DISPLAY_MAX_CHARS: usize = 4_000;
+pub(crate) const READ_DISPLAY_MAX_LINES: usize = 10;
+pub(crate) const READ_DISPLAY_MAX_CHARS: usize = 2_000;
+pub(crate) const TOOL_OUTPUT_DISPLAY_MAX_LINES: usize = 8;
+pub(crate) const TOOL_OUTPUT_DISPLAY_MAX_CHARS: usize = 1_500;
 
 pub(crate) fn provider_label(kind: ProviderKind) -> &'static str {
     match kind {
@@ -765,26 +765,36 @@ pub(crate) fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> Stri
         write!(&mut lines[0], " {status}").expect("write to string");
     }
 
-    if let Some(stdout) = parsed.get("stdout").and_then(|value| value.as_str()) {
-        if !stdout.trim().is_empty() {
-            lines.push(truncate_output_for_display(
-                stdout,
+    // Count total output lines for the summary suffix.
+    let stdout_text = parsed
+        .get("stdout")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let stderr_text = parsed
+        .get("stderr")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let total_lines = stdout_text.lines().count() + stderr_text.lines().count();
+    if total_lines > 0 {
+        write!(&mut lines[0], " \x1b[2m— {total_lines} lines\x1b[0m").expect("write to string");
+    }
+
+    if !stdout_text.trim().is_empty() {
+        lines.push(truncate_output_for_display(
+            stdout_text,
+            TOOL_OUTPUT_DISPLAY_MAX_LINES,
+            TOOL_OUTPUT_DISPLAY_MAX_CHARS,
+        ));
+    }
+    if !stderr_text.trim().is_empty() {
+        lines.push(format!(
+            "\x1b[38;5;203m{}\x1b[0m",
+            truncate_output_for_display(
+                stderr_text,
                 TOOL_OUTPUT_DISPLAY_MAX_LINES,
                 TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-            ));
-        }
-    }
-    if let Some(stderr) = parsed.get("stderr").and_then(|value| value.as_str()) {
-        if !stderr.trim().is_empty() {
-            lines.push(format!(
-                "\x1b[38;5;203m{}\x1b[0m",
-                truncate_output_for_display(
-                    stderr,
-                    TOOL_OUTPUT_DISPLAY_MAX_LINES,
-                    TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-                )
-            ));
-        }
+            )
+        ));
     }
 
     lines.join("\n\n")
