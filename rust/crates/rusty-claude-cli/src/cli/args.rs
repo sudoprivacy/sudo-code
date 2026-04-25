@@ -1248,13 +1248,6 @@ pub(crate) fn resolve_repl_model(cli_model: String) -> String {
     cli_model
 }
 
-pub(crate) fn filter_tool_specs(
-    tool_registry: &GlobalToolRegistry,
-    allowed_tools: Option<&AllowedToolSet>,
-) -> Vec<api::ToolDefinition> {
-    tool_registry.definitions(allowed_tools)
-}
-
 pub(crate) fn parse_system_prompt_args(
     args: &[String],
     output_format: CliOutputFormat,
