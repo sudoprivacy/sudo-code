@@ -160,6 +160,8 @@ impl AnthropicRuntimeClient {
         let mut block_has_thinking_summary = false;
         let mut saw_stop = false;
         let mut received_any_event = false;
+        let mut response_started = false;
+        let mut pending_newline = false;
 
         loop {
             let next = if apply_stall_timeout && !received_any_event {
@@ -194,6 +196,8 @@ impl AnthropicRuntimeClient {
                             &mut pending_tool,
                             true,
                             &mut block_has_thinking_summary,
+                            &mut response_started,
+                            &mut pending_newline,
                         )?;
                     }
                 }
@@ -205,6 +209,8 @@ impl AnthropicRuntimeClient {
                         &mut pending_tool,
                         true,
                         &mut block_has_thinking_summary,
+                        &mut response_started,
+                        &mut pending_newline,
                     )?;
                 }
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
@@ -214,7 +220,12 @@ impl AnthropicRuntimeClient {
                                 progress_reporter.mark_text_phase(&text);
                             }
                             if let Some(rendered) = markdown_stream.push(&renderer, &text) {
-                                write!(out, "{rendered}")
+                                let prefixed = apply_response_glyphs(
+                                    &rendered,
+                                    &mut response_started,
+                                    &mut pending_newline,
+                                );
+                                write!(out, "{prefixed}")
                                     .and_then(|()| out.flush())
                                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                             }
@@ -237,7 +248,12 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        write!(out, "{rendered}")
+                        let prefixed = apply_response_glyphs(
+                            &rendered,
+                            &mut response_started,
+                            &mut pending_newline,
+                        );
+                        write!(out, "{prefixed}")
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                     }
@@ -258,7 +274,12 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        write!(out, "{rendered}")
+                        let prefixed = apply_response_glyphs(
+                            &rendered,
+                            &mut response_started,
+                            &mut pending_newline,
+                        );
+                        write!(out, "{prefixed}")
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                     }
@@ -409,6 +430,37 @@ pub(crate) fn render_thinking_block_summary(
         .map_err(|error| RuntimeError::new(error.to_string()))
 }
 
+/// Apply response structure glyphs to rendered text output.
+/// Prefixes the first line with ⏺ (bold) and continuation lines with ⎿ (dim).
+fn apply_response_glyphs(
+    rendered: &str,
+    response_started: &mut bool,
+    pending_newline: &mut bool,
+) -> String {
+    if rendered.is_empty() {
+        return String::new();
+    }
+    let mut result = String::with_capacity(rendered.len() + 64);
+    for ch in rendered.chars() {
+        if ch == '\n' {
+            result.push('\n');
+            *pending_newline = true;
+        } else {
+            if !*response_started {
+                result.push_str("\x1b[1m⏺\x1b[0m ");
+                *response_started = true;
+                *pending_newline = false;
+            } else if *pending_newline {
+                result.push_str("\x1b[2m⎿\x1b[0m ");
+                *pending_newline = false;
+            }
+            result.push(ch);
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn push_output_block(
     block: OutputContentBlock,
     out: &mut (impl Write + ?Sized),
@@ -416,12 +468,15 @@ pub(crate) fn push_output_block(
     pending_tool: &mut Option<(String, String, String)>,
     streaming_tool_input: bool,
     block_has_thinking_summary: &mut bool,
+    response_started: &mut bool,
+    pending_newline: &mut bool,
 ) -> Result<(), RuntimeError> {
     match block {
         OutputContentBlock::Text { text } => {
             if !text.is_empty() {
                 let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
-                write!(out, "{rendered}")
+                let prefixed = apply_response_glyphs(&rendered, response_started, pending_newline);
+                write!(out, "{prefixed}")
                     .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 events.push(AssistantEvent::TextDelta(text));
@@ -459,6 +514,8 @@ pub(crate) fn response_to_events(
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
+    let mut response_started = false;
+    let mut pending_newline = false;
 
     for block in response.content {
         let mut block_has_thinking_summary = false;
@@ -469,6 +526,8 @@ pub(crate) fn response_to_events(
             &mut pending_tool,
             false,
             &mut block_has_thinking_summary,
+            &mut response_started,
+            &mut pending_newline,
         )?;
         if let Some((id, name, input)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse { id, name, input });
