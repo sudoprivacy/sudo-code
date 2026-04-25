@@ -4131,7 +4131,7 @@ fn run_acp_server(
         reasoning_effort,
         auth_mode,
     );
-    runtime::run_acp_stdio_server(agent, runtime::AcpServerOptions::new(VERSION))?;
+    runtime::run_acp_stdio_server(agent, &runtime::AcpServerOptions::new(VERSION))?;
     Ok(())
 }
 
