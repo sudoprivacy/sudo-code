@@ -3050,14 +3050,35 @@ fn format_unknown_slash_command_message(name: &str) -> String {
 }
 
 fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
+    let config = load_sudocode_config_for_current_dir();
+    let mut available_lines = String::new();
+    for (alias, entry) in &config.models {
+        let marker = if alias == &model.to_ascii_lowercase() {
+            " *"
+        } else {
+            ""
+        };
+        let modes: Vec<&str> = entry.providers.keys().map(String::as_str).collect();
+        available_lines.push_str(&format!(
+            "\n    {:<16} {} ({}){marker}",
+            alias,
+            entry.name,
+            modes.join(", ")
+        ));
+    }
+    let available = if available_lines.is_empty() {
+        String::from("opus, sonnet, haiku")
+    } else {
+        available_lines
+    };
     format!(
         "Model
   Current model    {model}
+  Available models{available}
   Session messages {message_count}
   Session turns    {turns}
 
 Usage
-  Inspect current model with /model
   Switch models with /model <name>"
     )
 }
@@ -3803,14 +3824,6 @@ fn run_repl(
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
-    println!(
-        "{}",
-        format_connected_line_with_config(
-            &cli.config.model,
-            auth_mode,
-            &cli.config.sudocode_config
-        )
-    );
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
@@ -3826,14 +3839,22 @@ fn run_repl(
                 }
                 match SlashCommand::parse(&trimmed) {
                     Ok(Some(command)) => {
-                        if cli.handle_repl_command(command)? {
-                            cli.persist_session()?;
+                        match cli.handle_repl_command(command) {
+                            Ok(true) => {
+                                if let Err(e) = cli.persist_session() {
+                                    eprintln!("\x1b[31m{e}\x1b[0m");
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                eprintln!("\x1b[31m{e}\x1b[0m");
+                            }
                         }
                         continue;
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        eprintln!("{error}");
+                        eprintln!("\x1b[31m{error}\x1b[0m");
                         continue;
                     }
                 }
@@ -4626,6 +4647,25 @@ impl LiveCli {
             |_| self.session.path.display().to_string(),
             |path| path.display().to_string(),
         );
+
+        // Auth mode line.
+        let auth_mode_str = self
+            .config
+            .auth_mode
+            .map(|m| m.label().to_string())
+            .unwrap_or_else(|| "auto".to_string());
+
+        // Endpoint from config-driven resolution.
+        let config = &self.config.sudocode_config;
+        let endpoint = api::resolve_provider_from_config(
+            &self.config.model,
+            self.config.auth_mode,
+            config,
+        )
+        .ok()
+        .map(|r| r.base_url)
+        .unwrap_or_default();
+
         format!(
             "\x1b[38;5;117m\
 ███████╗██╗   ██╗██████╗  ██████╗ \n\
@@ -4635,6 +4675,8 @@ impl LiveCli {
 ███████║╚██████╔╝██████╔╝╚██████╔╝\n\
 ╚══════╝ ╚═════╝ ╚═════╝  ╚═════╝\x1b[0m \x1b[38;5;208mCode\x1b[0m\n\n\
   \x1b[2mModel\x1b[0m            {}\n\
+  \x1b[2mAuth mode\x1b[0m        {}\n\
+  \x1b[2mEndpoint\x1b[0m         {}\n\
   \x1b[2mPermissions\x1b[0m      {}\n\
   \x1b[2mBranch\x1b[0m           {}\n\
   \x1b[2mWorkspace\x1b[0m        {}\n\
@@ -4643,6 +4685,8 @@ impl LiveCli {
   \x1b[2mAuto-save\x1b[0m        {}\n\n\
   Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
             self.config.model,
+            auth_mode_str,
+            endpoint,
             self.config.permission_mode.as_str(),
             git_branch,
             workspace,
@@ -5165,10 +5209,11 @@ impl LiveCli {
     }
 
     fn set_auth(&mut self, mode: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
-        let current_str = self.config.auth_mode.map_or_else(
-            || resolve_auth_mode(None).map(|m| m.as_str().to_string()),
-            |m| Ok(m.as_str().to_string()),
-        )?;
+        let current_str = self
+            .config
+            .auth_mode
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_else(|| "auto".to_string());
 
         let Some(mode) = mode else {
             println!("{}", format_auth_report(&current_str));
@@ -5181,8 +5226,6 @@ impl LiveCli {
             println!("{}", format_auth_report(&current_str));
             return Ok(false);
         }
-
-        validate_auth_env(parsed)?;
 
         let previous = current_str;
         let session = self.runtime.session().clone();
@@ -7808,53 +7851,12 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let sudocode_config = &config.sudocode_config;
+        let effective_mode = config.auth_mode;
 
-        // Check whether config-driven resolution applies for this model.
-        let has_config_model = !sudocode_config.auth_modes.is_empty()
-            && api::resolve_model(sudocode_config, &config.model).is_some();
-
-        // Resolve the effective auth mode: use the explicit --auth flag if
-        // provided, otherwise auto-detect from env vars.  Skip env-var
-        // validation when sudocode.json provides credentials for this model.
-        let effective_mode = match config.auth_mode {
-            Some(mode) => {
-                if !has_config_model {
-                    validate_auth_env(mode)?;
-                }
-                Some(mode)
-            }
-            None => resolve_auth_mode(None).ok(),
-        };
-
-        // Try config-driven resolution first (sudocode.json).
-        let client = if has_config_model {
-            let resolved =
-                api::resolve_provider_from_config(&config.model, effective_mode, sudocode_config)?;
-            ApiProviderClient::from_resolved(&resolved, effective_mode)?
-                .with_prompt_cache(PromptCache::new(session_id))
-        } else {
-            let resolved_model = resolve_model_alias(&config.model);
-            if let Some(mode) = effective_mode {
-                let auth = AuthSource::for_mode(mode)?;
-                ApiProviderClient::from_model_and_mode(&resolved_model, mode, auth)?
-                    .with_prompt_cache(PromptCache::new(session_id))
-            } else {
-                // No recognised auth env vars at all — fall back to the
-                // legacy provider-detection path for non-Anthropic models.
-                match detect_provider_kind(&resolved_model) {
-                    ProviderKind::Anthropic => {
-                        let auth = resolve_cli_auth_source()?;
-                        let inner = AnthropicClient::from_auth(auth)
-                            .with_base_url(api::read_base_url())
-                            .with_prompt_cache(PromptCache::new(session_id));
-                        ApiProviderClient::Anthropic(inner)
-                    }
-                    ProviderKind::Xai | ProviderKind::OpenAi => {
-                        ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
-                    }
-                }
-            }
-        };
+        let resolved =
+            api::resolve_provider_from_config(&config.model, effective_mode, sudocode_config)?;
+        let client = ApiProviderClient::from_resolved(&resolved, effective_mode)?
+            .with_prompt_cache(PromptCache::new(session_id));
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
@@ -8454,6 +8456,12 @@ fn slash_command_completion_candidates_with_sessions(
         "/skills help",
     ] {
         completions.insert(candidate.to_string());
+    }
+
+    // Add config-driven model aliases to /model completions.
+    let sudocode_config = load_sudocode_config_for_current_dir();
+    for alias in sudocode_config.models.keys() {
+        completions.insert(format!("/model {alias}"));
     }
 
     if !model.trim().is_empty() {
