@@ -196,7 +196,6 @@ fn resolve_api_format(
         return match api {
             "openai-completions" => Ok(ApiFormat::OpenAiCompletions),
             "openai-responses" => Ok(ApiFormat::OpenAiResponses),
-            "anthropic-messages" => Ok(ApiFormat::AnthropicMessages),
             other => Err(ApiError::Configuration(format!(
                 "unknown api format '{other}' for provider '{provider_name}' under mode '{auth_mode}'"
             ))),
