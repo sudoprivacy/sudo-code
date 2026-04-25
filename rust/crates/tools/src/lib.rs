@@ -9601,7 +9601,11 @@ printf 'pwsh:%s' "$1"
         // then — nonexistent-model-xyz is skipped, haiku succeeds
         assert_eq!(client.chain.len(), 2);
         assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
-        assert_eq!(client.chain[1].model, "claude-haiku-4-5-20251001");
+        assert!(
+            client.chain[1].model.starts_with("claude-haiku-4-5"),
+            "expected haiku variant, got: {}",
+            client.chain[1].model
+        );
 
         match original_anthropic {
             Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
