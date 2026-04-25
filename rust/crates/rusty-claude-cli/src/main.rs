@@ -12,6 +12,7 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod cli;
 mod init;
 mod input;
 mod render;
@@ -37,6 +38,7 @@ use api::{
     ToolDefinition, ToolResultContentBlock,
 };
 
+use cli::session::*;
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
@@ -178,8 +180,6 @@ const LEGACY_SESSION_EXTENSION: &str = "json";
 const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/sudo-code";
 const OFFICIAL_REPO_SLUG: &str = "ultraworkers/sudo-code";
 const DEPRECATED_INSTALL_COMMAND: &str = "cargo install sudo-code";
-const LATEST_SESSION_REFERENCE: &str = "latest";
-const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
 const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--help",
     "-h",
@@ -3883,23 +3883,6 @@ fn run_repl(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct SessionHandle {
-    id: String,
-    path: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-struct ManagedSessionSummary {
-    id: String,
-    path: PathBuf,
-    updated_at_ms: u64,
-    modified_epoch_millis: u128,
-    message_count: usize,
-    parent_session_id: Option<String>,
-    branch_name: Option<String>,
-}
-
 struct LiveCli {
     config: RuntimeConfig,
     runtime: BuiltRuntime,
@@ -5647,202 +5630,6 @@ impl LiveCli {
         println!("{}", format_issue_report(context));
         Ok(())
     }
-}
-
-fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Ok(current_session_store()?.sessions_dir().to_path_buf())
-}
-
-fn current_session_store() -> Result<runtime::SessionStore, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    runtime::SessionStore::from_cwd(&cwd).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
-}
-
-fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
-    new_cli_session_for(&env::current_dir()?)
-}
-
-fn new_cli_session_for(cwd: &Path) -> Result<Session, Box<dyn std::error::Error>> {
-    Ok(Session::new().with_workspace_root(cwd.to_path_buf()))
-}
-
-fn create_managed_session_handle(
-    session_id: &str,
-) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    create_managed_session_handle_for(&cwd, session_id)
-}
-
-fn create_managed_session_handle_for(
-    cwd: &Path,
-    session_id: &str,
-) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let handle = runtime::SessionStore::from_cwd(cwd)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
-        .create_handle(session_id);
-    Ok(SessionHandle {
-        id: handle.id,
-        path: handle.path,
-    })
-}
-
-fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let handle = current_session_store()?
-        .resolve_reference(reference)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-    Ok(SessionHandle {
-        id: handle.id,
-        path: handle.path,
-    })
-}
-
-fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    current_session_store()?
-        .resolve_managed_path(session_id)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
-}
-
-fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
-    Ok(current_session_store()?
-        .list_sessions()
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
-        .into_iter()
-        .map(|session| ManagedSessionSummary {
-            id: session.id,
-            path: session.path,
-            updated_at_ms: session.updated_at_ms,
-            modified_epoch_millis: session.modified_epoch_millis,
-            message_count: session.message_count,
-            parent_session_id: session.parent_session_id,
-            branch_name: session.branch_name,
-        })
-        .collect())
-}
-
-fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error::Error>> {
-    let session = current_session_store()?
-        .latest_session()
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-    Ok(ManagedSessionSummary {
-        id: session.id,
-        path: session.path,
-        updated_at_ms: session.updated_at_ms,
-        modified_epoch_millis: session.modified_epoch_millis,
-        message_count: session.message_count,
-        parent_session_id: session.parent_session_id,
-        branch_name: session.branch_name,
-    })
-}
-
-fn load_session_reference(
-    reference: &str,
-) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
-    let loaded = current_session_store()?
-        .load_session(reference)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-    Ok((
-        SessionHandle {
-            id: loaded.handle.id,
-            path: loaded.handle.path,
-        },
-        loaded.session,
-    ))
-}
-
-fn delete_managed_session(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if !path.exists() {
-        return Err(format!("session file does not exist: {}", path.display()).into());
-    }
-    fs::remove_file(path)?;
-    Ok(())
-}
-
-fn confirm_session_deletion(session_id: &str) -> bool {
-    print!("Delete session '{session_id}'? This cannot be undone. [y/N]: ");
-    io::stdout().flush().unwrap_or(());
-    let mut answer = String::new();
-    if io::stdin().read_line(&mut answer).is_err() {
-        return false;
-    }
-    matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
-}
-
-fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let sessions = list_managed_sessions()?;
-    let mut lines = vec![
-        "Sessions".to_string(),
-        format!("  Directory         {}", sessions_dir()?.display()),
-    ];
-    if sessions.is_empty() {
-        lines.push("  No managed sessions saved yet.".to_string());
-        return Ok(lines.join("\n"));
-    }
-    for session in sessions {
-        let marker = if session.id == active_session_id {
-            "● current"
-        } else {
-            "○ saved"
-        };
-        let lineage = match (
-            session.branch_name.as_deref(),
-            session.parent_session_id.as_deref(),
-        ) {
-            (Some(branch_name), Some(parent_session_id)) => {
-                format!(" branch={branch_name} from={parent_session_id}")
-            }
-            (None, Some(parent_session_id)) => format!(" from={parent_session_id}"),
-            (Some(branch_name), None) => format!(" branch={branch_name}"),
-            (None, None) => String::new(),
-        };
-        lines.push(format!(
-            "  {id:<20} {marker:<10} msgs={msgs:<4} modified={modified}{lineage} path={path}",
-            id = session.id,
-            msgs = session.message_count,
-            modified = format_session_modified_age(session.modified_epoch_millis),
-            lineage = lineage,
-            path = session.path.display(),
-        ));
-    }
-    Ok(lines.join("\n"))
-}
-
-fn format_session_modified_age(modified_epoch_millis: u128) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map_or(modified_epoch_millis, |duration| duration.as_millis());
-    let delta_seconds = now
-        .saturating_sub(modified_epoch_millis)
-        .checked_div(1_000)
-        .unwrap_or_default();
-    match delta_seconds {
-        0..=4 => "just-now".to_string(),
-        5..=59 => format!("{delta_seconds}s-ago"),
-        60..=3_599 => format!("{}m-ago", delta_seconds / 60),
-        3_600..=86_399 => format!("{}h-ago", delta_seconds / 3_600),
-        _ => format!("{}d-ago", delta_seconds / 86_400),
-    }
-}
-
-fn write_session_clear_backup(
-    session: &Session,
-    session_path: &Path,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let backup_path = session_clear_backup_path(session_path);
-    session.save_to_path(&backup_path)?;
-    Ok(backup_path)
-}
-
-fn session_clear_backup_path(session_path: &Path) -> PathBuf {
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map_or(0, |duration| duration.as_millis());
-    let file_name = session_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("session.jsonl");
-    session_path.with_file_name(format!("{file_name}.before-clear-{timestamp}.bak"))
 }
 
 fn render_repl_help() -> String {
