@@ -449,9 +449,9 @@ pub(crate) fn render_last_tool_debug_report(
         .rev()
         .find_map(|message| {
             message.blocks.iter().rev().find_map(|block| match block {
-                ContentBlock::ToolUse { id, name, input, .. } => {
-                    Some((id.clone(), name.clone(), input.clone()))
-                }
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => Some((id.clone(), name.clone(), input.clone())),
                 _ => None,
             })
         })

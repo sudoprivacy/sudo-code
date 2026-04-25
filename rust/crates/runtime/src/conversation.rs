@@ -394,9 +394,9 @@ where
                 .blocks
                 .iter()
                 .filter_map(|block| match block {
-                    ContentBlock::ToolUse { id, name, input, .. } => {
-                        Some((id.clone(), name.clone(), input.clone()))
-                    }
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => Some((id.clone(), name.clone(), input.clone())),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -747,12 +747,22 @@ fn build_assistant_message(
                 }
                 text.push_str(&delta);
             }
-            AssistantEvent::ToolUse { id, name, input, thought_signature } => {
+            AssistantEvent::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature,
+            } => {
                 if let Some(observer) = observer.as_mut() {
                     observer.on_tool_use(&id, &name, &input);
                 }
                 flush_text_block(&mut text, &mut blocks);
-                blocks.push(ContentBlock::ToolUse { id, name, input, thought_signature });
+                blocks.push(ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input,
+                    thought_signature,
+                });
             }
             AssistantEvent::Usage(value) => usage = Some(value),
             AssistantEvent::PromptCache(event) => prompt_cache_events.push(event),

@@ -4638,7 +4638,8 @@ async fn stream_with_provider(
 ) -> Result<Vec<AssistantEvent>, ApiError> {
     let mut stream = client.stream_message(message_request).await?;
     let mut events = Vec::new();
-    let mut pending_tools: BTreeMap<u32, (String, String, String, Option<String>)> = BTreeMap::new();
+    let mut pending_tools: BTreeMap<u32, (String, String, String, Option<String>)> =
+        BTreeMap::new();
     let mut saw_stop = false;
 
     while let Some(event) = stream.next_event().await? {
@@ -4672,8 +4673,15 @@ async fn stream_with_provider(
                 | ContentBlockDelta::SignatureDelta { .. } => {}
             },
             ApiStreamEvent::ContentBlockStop(stop) => {
-                if let Some((id, name, input, thought_signature)) = pending_tools.remove(&stop.index) {
-                    events.push(AssistantEvent::ToolUse { id, name, input, thought_signature });
+                if let Some((id, name, input, thought_signature)) =
+                    pending_tools.remove(&stop.index)
+                {
+                    events.push(AssistantEvent::ToolUse {
+                        id,
+                        name,
+                        input,
+                        thought_signature,
+                    });
                 }
             }
             ApiStreamEvent::MessageDelta(delta) => {
@@ -4768,7 +4776,12 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input, thought_signature } => InputContentBlock::ToolUse {
+                    ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        thought_signature,
+                    } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
@@ -4810,7 +4823,12 @@ fn push_output_block(
                 events.push(AssistantEvent::TextDelta(text));
             }
         }
-        OutputContentBlock::ToolUse { id, name, input, thought_signature } => {
+        OutputContentBlock::ToolUse {
+            id,
+            name,
+            input,
+            thought_signature,
+        } => {
             let initial_input = if streaming_tool_input
                 && input.is_object()
                 && input.as_object().is_some_and(serde_json::Map::is_empty)
@@ -4833,7 +4851,12 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
         let index = u32::try_from(index).expect("response block index overflow");
         push_output_block(block, index, &mut events, &mut pending_tools, false);
         if let Some((id, name, input, thought_signature)) = pending_tools.remove(&index) {
-            events.push(AssistantEvent::ToolUse { id, name, input, thought_signature });
+            events.push(AssistantEvent::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature,
+            });
         }
     }
 

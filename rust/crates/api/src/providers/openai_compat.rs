@@ -954,7 +954,9 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
             for block in &message.content {
                 match block {
                     InputContentBlock::Text { text: value } => text.push_str(value),
-                    InputContentBlock::ToolUse { id, name, input, .. } => tool_calls.push(json!({
+                    InputContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => tool_calls.push(json!({
                         "id": id,
                         "type": "function",
                         "function": {
