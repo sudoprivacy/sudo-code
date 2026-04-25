@@ -403,9 +403,9 @@ impl ConfigLoader {
     ///
     /// Returns an error if the file does not exist. Built-in defaults from
     /// `SudoCodeConfig::builtin()` are intentionally **not** merged here so
-    /// that the on-disk file is the single source of truth. Tests and display
-    /// helpers that need the built-in model catalog should call
-    /// `SudoCodeConfig::builtin()` directly.
+    /// that the on-disk file is the single source of truth. Callers that
+    /// can tolerate a missing file (display helpers, alias resolution) are
+    /// responsible for their own fallback.
     pub fn load_sudocode_config(&self) -> Result<SudoCodeConfig, ConfigError> {
         let path = self.config_home.join("sudocode.json");
         if !path.exists() {
