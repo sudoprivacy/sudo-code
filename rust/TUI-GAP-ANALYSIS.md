@@ -8,6 +8,110 @@ This document catalogs every significant feature delta and proposes a concrete t
 
 ---
 
+## 0. Visual Comparison (Screenshots)
+
+### Claude Code TS (v2.1.62)
+
+The TS CLI runs in **alternate screen mode** — the entire terminal is its canvas:
+
+```
+┌─ Claude Code v2.1.62 ─────────────────────────┬─ Tips for getting started ─────┐
+│                                                │ Run /init to create a ...      │
+│         Welcome back Jinjing!                  ├─ Recent activity ──────────────┤
+│            [pixel avatar]                      │ No recent activity             │
+│  Opus 4.6 · Claude Max · org                   │                                │
+│              ~/code                            │                                │
+└────────────────────────────────────────────────┴────────────────────────────────┘
+
+› hi                          ← user prompt: chevron + bold + highlighted background
+
+● Hi! How can I help you?     ← response: bullet prefix, clean spacing
+
+› list the files              ← second turn
+
+● Read 1 file (ctrl+o to expand)   ← COLLAPSIBLE tool result
+● Here are the files...
+
+› /k█                         ← slash command autocomplete dropdown visible
+  /keybindings    Open or create your keybindings...
+  /git-clean...   Discard all local changes...
+                                    [scrollbar visible on right edge]
+```
+
+**Key visual traits:**
+- Orange/amber dashed borders on welcome panel (two-column flexbox layout)
+- `›` chevron prompt with bold text on a subtle background highlight
+- `●` green bullet for assistant messages (green = completed tool, changes color)
+- Tool results are **collapsible** — "Read 1 file (ctrl+o to expand)"
+- Slash command autocomplete is an **inline dropdown** overlaying the UI
+- Scrollbar indicator on the right edge (red/blue segments)
+- Fixed input area at bottom — always visible regardless of output length
+
+### Rust `scode` CLI
+
+The Rust CLI runs in **inline scrollback mode** — output appends to the terminal:
+
+```
+jinjingzhou@... % cargo run --bin scode --
+Endpoint        https://api.anthropic.com
+Permissions     danger-full-access
+Branch          main
+Workspace       dirty · 1 files · 1 unstaged
+Directory       /Users/.../sudo-code/rust
+Session         session-1777093886431-0
+Auto-save       .scode/sessions/.../session-....jsonl
+
+Type /help for commands · /status for live context · ...
+> hi
+Hi there! 👋 How can I help you today? ...
+
+> what's in the dir
+🦀 Thinking...
+╭─ bash ─╮
+│ $ ls -la
+╰─────────╯
+
+✓ bash
+
+total 240
+drwxr-xr-x@ 18 jinjingzhou staff    576 Apr 23 22:26 .
+drwxr-xr-x@ 13 jinjingzhou staff    416 Apr 24 11:52 ..
+...
+[FULL 20+ line ls -la output dumped inline — not collapsible]
+
+[markdown table rendered inline]
+
+✓ ✨ Done
+> /█
+```
+
+**Key visual traits:**
+- Plain key-value startup header (no borders, no layout)
+- `>` simple prompt, no background highlight
+- Emoji-heavy responses (👋) — no structured bullet/glyph system
+- Tool calls in box-drawing borders (`╭─ bash ─╮`) — this is good
+- Tool output is **fully dumped** — `ls -la` shows all 20+ lines with no collapse
+- Markdown tables render well (box-drawing with column alignment)
+- `✓ ✨ Done` completion — no persistent status line
+- No scrollbar, no fixed footer, no alternate screen
+- Slash completion works but via rustyline inline, not as an overlay dropdown
+
+### Side-by-Side Delta Summary
+
+| Element | TS | Rust | Visual Impact |
+|---------|:--:|:----:|---------------|
+| Welcome banner | Two-column bordered panel with avatar | Plain key-value text | High — first impression |
+| User prompt | `›` chevron, bold, background highlight | `>` plain text | Medium |
+| Response prefix | `●` colored bullet | None (inline text) | Medium |
+| Tool result display | Collapsible with "ctrl+o to expand" | Full dump, no collapse | **High** — biggest readability issue |
+| Slash autocomplete | Overlay dropdown with descriptions | Inline rustyline completion | Medium |
+| Screen mode | Alternate screen, fixed footer | Inline scrollback | **High** — input scrolls off screen |
+| Status line | Persistent bottom bar | None after startup | High |
+| Scrollbar | Visual indicator on right edge | None (terminal native) | Low |
+| Borders/chrome | Orange dashed borders, themed | Box-drawing characters | Low — Rust borders look fine |
+
+---
+
 ## 1. Architecture Gap
 
 | Aspect | TypeScript (Claude Code) | Rust (sudo-code) | Gap |
