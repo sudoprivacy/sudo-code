@@ -1,6 +1,6 @@
 # TUI Gap Analysis: Rust (`scode`) vs TypeScript (`claude`)
 
-*Source-level comparison with exact file paths and line numbers.*
+*Source-level comparison. Every gap below was verified by reading the actual source code in both repositories.*
 
 **TS source**: `/Users/jinjingzhou/code/joezhoujinjing/claude-code-source-code/` (v2.1.88)
 **Rust source**: `rust/crates/rusty-claude-cli/src/` (this repo)
@@ -131,9 +131,10 @@
   TOOL_OUTPUT_DISPLAY_MAX_LINES = 60
   TOOL_OUTPUT_DISPLAY_MAX_CHARS = 4,000
   ```
-- `main.rs:8553-8585` — `format_bash_result()`: Outputs full stdout/stderr inline, only truncates beyond limits.
-- `main.rs:9067-9070` — Emission: `self.renderer.stream_markdown(&markdown, &mut io::stdout())?` — no collapsibility, no expand/collapse state.
-- Tool completion: `\x1b[1;32m✓\x1b[0m {name}` (bold green check) or `\x1b[1;31m✗\x1b[0m` (bold red cross).
+- `main.rs:8553-8590` — `format_bash_result()`: Builds a vector of lines starting with `✓ bash`, then appends the full stdout (truncated at 60 lines / 4000 chars) and stderr (same limits, colored red via `\x1b[38;5;203m`). All lines joined and returned as one string.
+- `main.rs:9067-9070` — Emission path: `format_tool_result()` → `stream_markdown()` → `write!(stdout)`. No state tracking, no collapse/expand. The output is written once and cannot be hidden after the fact.
+- `main.rs:8464-8490` — `format_tool_result()` dispatches per tool name: `format_bash_result`, `format_read_result`, `format_write_result`, `format_edit_result`, `format_glob_result`, `format_grep_result`, or `format_generic_tool_result`. Each dumps its output inline.
+- Tool completion icon: `\x1b[1;32m✓\x1b[0m` (bold green) or `\x1b[1;31m✗\x1b[0m` (bold red), always static.
 
 ### Gap
 
@@ -164,21 +165,22 @@ This is the **single biggest readability gap** visible in the screenshots. A `ls
 
 ### What Rust does
 
-**Single-mode braille spinner with static label.**
+**Spinner is designed for animation but never actually animates.**
 
-- `render.rs:48-116` — `Spinner` struct with 10 braille frames: `["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]`.
-- `render.rs:60-79` — `tick()`: Advances frame, uses `SavePosition` / `RestorePosition` / `Clear(CurrentLine)` to overwrite.
-- `render.rs:81-97` — `finish()`: Shows `✔ {label}` in green.
-- `render.rs:99-115` — `fail()`: Shows `✘ {label}` in red.
-- `main.rs:4640-4646` — Only one label: `spinner.tick("🦀 Thinking...", ...)`.
-- `main.rs:4653` — Only one completion: `spinner.finish("✨ Done", ...)`.
-- No mode switching, no stall detection, no elapsed time, no token count.
+- `render.rs:48-116` — `Spinner` struct with 10 braille frames and `SavePosition`/`RestorePosition` cursor control — designed for in-place animation.
+- **But**: `main.rs:4638-4648` — `tick()` is called **once** before the blocking `runtime.run_turn()` call. There is no animation loop. The spinner shows a single static frame (`⠋ 🦀 Thinking...`).
+- Streaming happens inside `run_turn()` via `AnthropicRuntimeClient::stream_message()` (line 7880+). Tool calls are prefixed with `\n` (line 7981: `writeln!(out, "\n{}", format_tool_call_start(...))`), so they write below the spinner line, leaving "🦀 Thinking..." visible above.
+- Text deltas write directly below via `write!(out, "{rendered}")` (line 7948-7950).
+- After `run_turn()` returns, `finish()` (line 4653) prints `✔ ✨ Done` at the current cursor position (below all streaming output), or `fail()` (line 4670) prints `✘ ❌ Request failed`.
+- **Net effect**: "🦀 Thinking..." appears once, stays frozen, streaming output appears below it, then "✔ ✨ Done" appears at the end. No continuous animation, no mode switching, no stall detection.
 
 ### Gap
 
 | Aspect | TS | Rust |
 |--------|:--:|:----:|
-| Modes | ✅ thinking/responding/tool_use | ❌ Single mode |
+| Animation | ✅ 50ms continuous animation | ❌ Single frozen frame |
+| Modes | ✅ thinking/responding/tool_use | ❌ Single label |
+| Updates during streaming | ✅ Token count, elapsed time | ❌ Frozen until turn ends |
 | Stall detection | ✅ Color fades to red after 3s | ❌ |
 | Shimmer/glimmer | ✅ Per-character color wave | ❌ |
 | Elapsed time | ✅ Shown after thinking | ❌ |
@@ -204,9 +206,11 @@ This is the **single biggest readability gap** visible in the screenshots. A `ls
 **Inline rustyline completion.**
 
 - `input.rs:23-99` — `SlashCommandHelper` implements rustyline's `Completer` trait.
-- `input.rs:30-52` — Prefix-based matching: filters commands that start with the typed text.
-- `input.rs:111` — `completion_type: CompletionType::List` — rustyline shows matches below the prompt.
-- No descriptions, no overlay, no icons, no scrollable list.
+- `input.rs:58-79` — `complete()` method: filters `self.completions` by prefix match. Returns `Vec<Pair>` where each `Pair` has `display` and `replacement` fields — both set to the command string itself. No description field.
+- `input.rs:109-110` — Config: `CompletionType::List` — rustyline renders matches below the prompt in a flat list.
+- `input.rs:200-211` — `slash_command_prefix()`: Only triggers completion when cursor is at end of line and input starts with `/`.
+- `input.rs:213-220` — `normalize_completions()`: Deduplicates and filters to `/`-prefixed strings only.
+- No descriptions, no overlay positioning, no icons, no scrollable list, no type indicators.
 
 ### Gap
 
@@ -251,10 +255,15 @@ AlternateScreen (mouseTracking)
 
 **Inline scrollback, no layout control.**
 
-- `main.rs:3737-3813` — `run_repl()`: Sequential loop of `editor.read_line()` → `cli.run_turn()`.
-- All output via `println!()` / `write!(stdout, ...)` — appends to terminal scrollback.
-- No alternate screen, no fixed regions, no scroll management.
-- When the model generates long output (e.g., full `ls -la`), the prompt and spinner scroll off-screen.
+- `main.rs:3737-3813` — `run_repl()`: A simple loop:
+  1. `editor.read_line()` (line 3767) — rustyline handles prompt display and input
+  2. `SlashCommand::parse()` (line 3777) — check for slash commands
+  3. `cli.run_turn(&trimmed)` (line 3802) — blocking call that streams output to stdout
+  4. Back to step 1
+- `main.rs:4638-4678` — `run_turn()`: Creates `Spinner`, ticks once, calls `runtime.run_turn()` (blocking), then finishes spinner.
+- Inside `runtime.run_turn()`, `stream_message()` (line 7880+) handles SSE events and writes rendered markdown/tool output directly to stdout via `write!(out, ...)`.
+- `main.rs:7883-7887` — Output destination: `if self.emit_output { &mut stdout } else { &mut sink }` — either stdout or /dev/null, nothing in between.
+- No alternate screen, no fixed regions, no scroll management, no cursor positioning for layout. When the model generates long output, the prompt scrolls off-screen.
 
 ### Gap
 
@@ -283,18 +292,20 @@ AlternateScreen (mouseTracking)
 
 **Generic Y/N text prompt for all tools.**
 
-- `main.rs:7693-7730` — `CliPermissionPrompter::decide()`:
+- `main.rs:7683-7730` — `CliPermissionPrompter` struct with single method `decide()`.
+- `main.rs:7698-7706` — Output is plain `println!()` calls:
+  ```rust
+  println!("Permission approval required");
+  println!("  Tool             {}", request.tool_name);
+  println!("  Current mode     {}", self.current_mode.as_str());
+  println!("  Required mode    {}", request.required_mode.as_str());
+  // ... reason, input
+  print!("Approve this tool call? [y/N]: ");
   ```
-  Permission approval required
-    Tool             {tool_name}
-    Current mode     {permission_mode}
-    Required mode    {required_mode}
-    Reason           {reason}
-    Input            {input}
-  Approve this tool call? [y/N]:
-  ```
-- `main.rs:7711` — Reads one line from stdin, accepts "y"/"yes".
-- No select menu, no per-tool formatting, no "allow for session" option, no feedback on deny.
+- `main.rs:7711-7714` — Reads one line from stdin via `io::stdin().read_line()`, accepts "y"/"yes" (case-insensitive). Everything else is a deny.
+- `main.rs:7717-7721` — Deny reason is hardcoded: `"tool '{name}' denied by user approval prompt"`. No user feedback captured.
+- The `request.input` field dumps the raw JSON tool input — not a human-readable summary.
+- No select menu, no per-tool formatting, no "allow for session" option.
 
 ### Gap
 
