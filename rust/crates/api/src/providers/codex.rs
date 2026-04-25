@@ -557,6 +557,7 @@ impl StreamState {
                             id: call_id,
                             name,
                             input: json!({}),
+                            thought_signature: None,
                         },
                     }));
 
@@ -814,6 +815,7 @@ mod tests {
                         id: "call_123".to_string(),
                         name: "get_weather".to_string(),
                         input: json!({"city": "SF"}),
+                        thought_signature: None,
                     }],
                 },
                 InputMessage::user_tool_result("call_123", "72F sunny", false),

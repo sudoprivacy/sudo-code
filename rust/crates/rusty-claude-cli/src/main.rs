@@ -1317,12 +1317,16 @@ fn run_repl(
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
                     editor.push_history(input);
                     cli.record_prompt_history(&trimmed);
-                    cli.run_turn(&prompt)?;
+                    if let Err(e) = cli.run_turn(&prompt) {
+                        eprintln!("\x1b[31m{e}\x1b[0m");
+                    }
                     continue;
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
+                if let Err(e) = cli.run_turn(&trimmed) {
+                    eprintln!("\x1b[31m{e}\x1b[0m");
+                }
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {

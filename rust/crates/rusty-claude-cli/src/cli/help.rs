@@ -22,7 +22,7 @@ pub(crate) fn render_repl_help() -> String {
         "  Up/Down              Navigate prompt history".to_string(),
         "  Ctrl-R               Reverse-search prompt history".to_string(),
         "  Tab                  Complete commands, modes, and recent sessions".to_string(),
-        "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
+        "  Ctrl-C               Clear input (double Ctrl-C to exit)".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
         "  Auto-save            .scode/sessions/<session-id>.jsonl".to_string(),
         "  Resume latest        /resume latest".to_string(),
@@ -449,9 +449,9 @@ pub(crate) fn render_last_tool_debug_report(
         .rev()
         .find_map(|message| {
             message.blocks.iter().rev().find_map(|block| match block {
-                ContentBlock::ToolUse { id, name, input } => {
-                    Some((id.clone(), name.clone(), input.clone()))
-                }
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => Some((id.clone(), name.clone(), input.clone())),
                 _ => None,
             })
         })

@@ -2,6 +2,7 @@ use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
 use crate::providers::codex::CodexClient;
+use crate::providers::gemini::{self, GeminiClient};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
 use crate::providers::registry::{ApiFormat, Credential, ResolvedProvider};
 use crate::providers::{AuthMode, ProviderKind};
@@ -14,6 +15,7 @@ pub enum ProviderClient {
     Xai(OpenAiCompatClient),
     OpenAi(OpenAiCompatClient),
     Codex(CodexClient),
+    Gemini(GeminiClient),
 }
 
 impl ProviderClient {
@@ -22,6 +24,7 @@ impl ProviderClient {
     /// This is the primary entry point for config-driven provider construction.
     /// The caller is responsible for calling `resolve_provider_from_config()`
     /// first to obtain the `ResolvedProvider`.
+    #[allow(clippy::too_many_lines)]
     pub fn from_resolved(
         resolved: &ResolvedProvider,
         mode: Option<AuthMode>,
@@ -130,6 +133,10 @@ impl ProviderClient {
                     _ => Ok(Self::OpenAi(client)),
                 }
             }
+            ApiFormat::GeminiGenerateContent => {
+                let client = GeminiClient::from_resolved(resolved)?;
+                Ok(Self::Gemini(client))
+            }
         }
     }
 
@@ -140,6 +147,7 @@ impl ProviderClient {
             Self::Xai(_) => ProviderKind::Xai,
             Self::OpenAi(_) => ProviderKind::OpenAi,
             Self::Codex(_) => ProviderKind::Codex,
+            Self::Gemini(_) => ProviderKind::Gemini,
         }
     }
 
@@ -147,6 +155,7 @@ impl ProviderClient {
     pub fn with_prompt_cache(self, prompt_cache: PromptCache) -> Self {
         match self {
             Self::Anthropic(client) => Self::Anthropic(client.with_prompt_cache(prompt_cache)),
+            Self::Gemini(_) => self,
             other => other,
         }
     }
@@ -155,7 +164,7 @@ impl ProviderClient {
     pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
         match self {
             Self::Anthropic(client) => client.prompt_cache_stats(),
-            Self::Xai(_) | Self::OpenAi(_) | Self::Codex(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::Codex(_) | Self::Gemini(_) => None,
         }
     }
 
@@ -163,7 +172,7 @@ impl ProviderClient {
     pub fn take_last_prompt_cache_record(&self) -> Option<PromptCacheRecord> {
         match self {
             Self::Anthropic(client) => client.take_last_prompt_cache_record(),
-            Self::Xai(_) | Self::OpenAi(_) | Self::Codex(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::Codex(_) | Self::Gemini(_) => None,
         }
     }
 
@@ -175,6 +184,7 @@ impl ProviderClient {
             Self::Anthropic(client) => client.send_message(request).await,
             Self::Xai(client) | Self::OpenAi(client) => client.send_message(request).await,
             Self::Codex(client) => client.send_message(request).await,
+            Self::Gemini(client) => client.send_message(request).await,
         }
     }
 
@@ -195,6 +205,10 @@ impl ProviderClient {
                 .stream_message(request)
                 .await
                 .map(MessageStream::Codex),
+            Self::Gemini(client) => client
+                .stream_message(request)
+                .await
+                .map(MessageStream::Gemini),
         }
     }
 }
@@ -204,6 +218,7 @@ pub enum MessageStream {
     Anthropic(anthropic::MessageStream),
     OpenAiCompat(openai_compat::MessageStream),
     Codex(crate::providers::codex::MessageStream),
+    Gemini(gemini::MessageStream),
 }
 
 impl MessageStream {
@@ -213,6 +228,7 @@ impl MessageStream {
             Self::Anthropic(stream) => stream.request_id(),
             Self::OpenAiCompat(stream) => stream.request_id(),
             Self::Codex(stream) => stream.request_id(),
+            Self::Gemini(stream) => stream.request_id(),
         }
     }
 
@@ -221,6 +237,7 @@ impl MessageStream {
             Self::Anthropic(stream) => stream.next_event().await,
             Self::OpenAiCompat(stream) => stream.next_event().await,
             Self::Codex(stream) => stream.next_event().await,
+            Self::Gemini(stream) => stream.next_event().await,
         }
     }
 }

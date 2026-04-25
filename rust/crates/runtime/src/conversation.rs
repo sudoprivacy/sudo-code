@@ -33,6 +33,7 @@ pub enum AssistantEvent {
         id: String,
         name: String,
         input: String,
+        thought_signature: Option<String>,
     },
     Usage(TokenUsage),
     PromptCache(PromptCacheEvent),
@@ -393,9 +394,9 @@ where
                 .blocks
                 .iter()
                 .filter_map(|block| match block {
-                    ContentBlock::ToolUse { id, name, input } => {
-                        Some((id.clone(), name.clone(), input.clone()))
-                    }
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => Some((id.clone(), name.clone(), input.clone())),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -746,12 +747,22 @@ fn build_assistant_message(
                 }
                 text.push_str(&delta);
             }
-            AssistantEvent::ToolUse { id, name, input } => {
+            AssistantEvent::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature,
+            } => {
                 if let Some(observer) = observer.as_mut() {
                     observer.on_tool_use(&id, &name, &input);
                 }
                 flush_text_block(&mut text, &mut blocks);
-                blocks.push(ContentBlock::ToolUse { id, name, input });
+                blocks.push(ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input,
+                    thought_signature,
+                });
             }
             AssistantEvent::Usage(value) => usage = Some(value),
             AssistantEvent::PromptCache(event) => prompt_cache_events.push(event),
@@ -917,6 +928,7 @@ mod tests {
                             id: "tool-1".to_string(),
                             name: "add".to_string(),
                             input: "2,2".to_string(),
+                            thought_signature: None,
                         },
                         AssistantEvent::Usage(TokenUsage {
                             input_tokens: 20,
@@ -1134,6 +1146,7 @@ mod tests {
                         id: "tool-1".to_string(),
                         name: "blocked".to_string(),
                         input: "secret".to_string(),
+                        thought_signature: None,
                     },
                     AssistantEvent::MessageStop,
                 ])
@@ -1179,6 +1192,7 @@ mod tests {
                         id: "tool-1".to_string(),
                         name: "blocked".to_string(),
                         input: r#"{"path":"secret.txt"}"#.to_string(),
+                        thought_signature: None,
                     },
                     AssistantEvent::MessageStop,
                 ])
@@ -1241,6 +1255,7 @@ mod tests {
                         id: "tool-1".to_string(),
                         name: "blocked".to_string(),
                         input: r#"{"path":"secret.txt"}"#.to_string(),
+                        thought_signature: None,
                     },
                     AssistantEvent::MessageStop,
                 ])
@@ -1301,6 +1316,7 @@ mod tests {
                             id: "tool-1".to_string(),
                             name: "add".to_string(),
                             input: r#"{"lhs":2,"rhs":2}"#.to_string(),
+                            thought_signature: None,
                         },
                         AssistantEvent::MessageStop,
                     ]),
@@ -1376,6 +1392,7 @@ mod tests {
                             id: "tool-1".to_string(),
                             name: "fail".to_string(),
                             input: r#"{"path":"README.md"}"#.to_string(),
+                            thought_signature: None,
                         },
                         AssistantEvent::MessageStop,
                     ]),
@@ -1504,6 +1521,7 @@ mod tests {
                         id: "tool-1".to_string(),
                         name: "blocked".to_string(),
                         input: "secret".to_string(),
+                        thought_signature: None,
                     },
                     AssistantEvent::MessageStop,
                 ])
@@ -1556,6 +1574,7 @@ mod tests {
                         id: "tool-1".to_string(),
                         name: "fail".to_string(),
                         input: "{}".to_string(),
+                        thought_signature: None,
                     },
                     AssistantEvent::MessageStop,
                 ])
@@ -2001,6 +2020,7 @@ mod tests {
                         id: "tool-1".to_string(),
                         name: "echo".to_string(),
                         input: "payload".to_string(),
+                        thought_signature: None,
                     },
                     AssistantEvent::MessageStop,
                 ])

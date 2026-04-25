@@ -101,6 +101,8 @@ impl Helper for SlashCommandHelper {}
 pub struct LineEditor {
     prompt: String,
     editor: Editor<SlashCommandHelper, DefaultHistory>,
+    /// Whether the previous read returned a Ctrl-C on an empty prompt.
+    pending_exit: bool,
 }
 
 impl LineEditor {
@@ -119,6 +121,7 @@ impl LineEditor {
         Self {
             prompt: prompt.into(),
             editor,
+            pending_exit: false,
         }
     }
 
@@ -147,14 +150,23 @@ impl LineEditor {
         }
 
         match self.editor.readline(&self.prompt) {
-            Ok(line) => Ok(ReadOutcome::Submit(line)),
+            Ok(line) => {
+                self.pending_exit = false;
+                Ok(ReadOutcome::Submit(line))
+            }
             Err(ReadlineError::Interrupted) => {
                 let has_input = !self.current_line().is_empty();
                 self.finish_interrupted_read()?;
                 if has_input {
+                    self.pending_exit = false;
                     Ok(ReadOutcome::Cancel)
-                } else {
+                } else if self.pending_exit {
                     Ok(ReadOutcome::Exit)
+                } else {
+                    self.pending_exit = true;
+                    let mut stdout = io::stdout();
+                    writeln!(stdout, "Press Ctrl-C again to exit.")?;
+                    Ok(ReadOutcome::Cancel)
                 }
             }
             Err(ReadlineError::Eof) => {
