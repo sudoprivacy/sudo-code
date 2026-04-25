@@ -1543,6 +1543,11 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
         "opus" | "sonnet" | "haiku" => return Ok(()),
         _ => {}
     }
+    // Check sudocode.json config for additional model aliases.
+    let config = load_sudocode_config_for_current_dir();
+    if api::resolve_model(&config, trimmed).is_some() {
+        return Ok(());
+    }
     // Check for spaces (malformed)
     if trimmed.contains(' ') {
         return Err(format!(
@@ -7805,22 +7810,25 @@ impl AnthropicRuntimeClient {
         let sudocode_config = &config.sudocode_config;
         let resolved_model = resolve_model_alias(&config.model);
 
+        // Check whether config-driven resolution applies for this model.
+        let has_config_model = !sudocode_config.auth_modes.is_empty()
+            && api::resolve_model(sudocode_config, &config.model).is_some();
+
         // Resolve the effective auth mode: use the explicit --auth flag if
-        // provided, otherwise auto-detect from env vars.
+        // provided, otherwise auto-detect from env vars.  Skip env-var
+        // validation when sudocode.json provides credentials for this model.
         let effective_mode = match config.auth_mode {
             Some(mode) => {
-                validate_auth_env(mode)?;
+                if !has_config_model {
+                    validate_auth_env(mode)?;
+                }
                 Some(mode)
             }
             None => resolve_auth_mode(None).ok(),
         };
 
         // Try config-driven resolution first (sudocode.json).
-        let client = if !sudocode_config.auth_modes.is_empty()
-            && sudocode_config
-                .models
-                .contains_key(&config.model.to_ascii_lowercase())
-        {
+        let client = if has_config_model {
             let resolved = api::resolve_provider_from_config(
                 &config.model,
                 effective_mode.or(config.auth_mode),

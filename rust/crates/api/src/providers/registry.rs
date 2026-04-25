@@ -63,7 +63,18 @@ pub struct ResolvedProvider {
 /// Look up a model by alias (case-insensitive).
 #[must_use]
 pub fn resolve_model<'a>(config: &'a SudoCodeConfig, alias: &str) -> Option<&'a ModelConfigEntry> {
-    config.models.get(&alias.trim().to_ascii_lowercase())
+    let key = alias.trim().to_ascii_lowercase();
+    // Direct alias lookup first.
+    if let Some(entry) = config.models.get(&key) {
+        return Some(entry);
+    }
+    // Fall back: match by wire model ID in any provider mapping.
+    config.models.values().find(|entry| {
+        entry
+            .providers
+            .values()
+            .any(|m| m.model.eq_ignore_ascii_case(&key))
+    })
 }
 
 /// List available auth modes for a model alias, in config order.
@@ -567,5 +578,53 @@ mod tests {
             let expected = std::path::PathBuf::from(home).join(".claude/credentials.json");
             assert_eq!(path, expected);
         }
+    }
+
+    #[test]
+    fn resolve_provider_with_inline_token_subscription() {
+        let mut config = sample_config();
+        // Set an inline token on the subscription claude provider.
+        config
+            .auth_modes
+            .get_mut("subscription")
+            .unwrap()
+            .get_mut("claude")
+            .unwrap()
+            .token = Some("sk-inline-oauth-token".to_string());
+
+        let resolved = resolve_provider_from_config("opus", Some(AuthMode::Subscription), &config)
+            .expect("should resolve with inline token");
+        assert_eq!(resolved.kind, ProviderKind::Anthropic);
+        assert_eq!(resolved.api_format, ApiFormat::AnthropicMessages);
+        assert_eq!(resolved.base_url, "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            resolved.credential,
+            Credential::Token("sk-inline-oauth-token".to_string())
+        );
+        assert_eq!(resolved.model_id, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn resolve_provider_with_inline_apikey() {
+        let mut config = sample_config();
+        // Set an inline API key on the api-key anthropic provider.
+        config
+            .auth_modes
+            .get_mut("api-key")
+            .unwrap()
+            .get_mut("anthropic")
+            .unwrap()
+            .api_key = Some("sk-inline-api-key".to_string());
+
+        let resolved = resolve_provider_from_config("opus", Some(AuthMode::ApiKey), &config)
+            .expect("should resolve with inline api key");
+        assert_eq!(resolved.kind, ProviderKind::Anthropic);
+        assert_eq!(resolved.api_format, ApiFormat::AnthropicMessages);
+        assert_eq!(resolved.base_url, "https://api.anthropic.com");
+        assert_eq!(
+            resolved.credential,
+            Credential::ApiKey("sk-inline-api-key".to_string())
+        );
+        assert_eq!(resolved.model_id, "claude-opus-4-6");
     }
 }

@@ -2322,4 +2322,97 @@ mod tests {
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
+
+    #[test]
+    fn parses_sudocode_json_with_inline_credentials() {
+        let root = temp_dir();
+        let home = root.join("home").join(".nexus").join("sudocode");
+        fs::create_dir_all(&home).expect("config dir");
+
+        let json = r#"{
+          "auth_modes": {
+            "subscription": {
+              "claude": {
+                "baseUrl": "https://api.anthropic.com/v1/messages",
+                "token": "sk-test-oauth-token"
+              }
+            },
+            "proxy": {
+              "sudorouter": {
+                "baseUrl": "https://hk.sudorouter.ai/v1",
+                "apiKey": "sk-test-proxy-key"
+              }
+            },
+            "api-key": {
+              "anthropic": {
+                "baseUrl": "https://api.anthropic.com",
+                "apiKey": "sk-test-anthropic-key"
+              }
+            }
+          },
+          "models": {
+            "opus": {
+              "alias": "opus",
+              "name": "Claude Opus 4.6",
+              "input": ["text"],
+              "providers": {
+                "subscription": { "provider": "claude", "model": "claude-opus-4-6" },
+                "proxy":        { "provider": "sudorouter", "model": "claude-opus-4-6", "api": "openai-completions" },
+                "api-key":      { "provider": "anthropic", "model": "claude-opus-4-6" }
+              }
+            },
+            "deepseek": {
+              "alias": "deepseek",
+              "name": "DeepSeek V3",
+              "input": ["text"],
+              "providers": {
+                "proxy": { "provider": "sudorouter", "model": "deepseek-chat", "api": "openai-completions" }
+              }
+            }
+          }
+        }"#;
+
+        fs::write(home.join("sudocode.json"), json).expect("write sudocode.json");
+
+        let cwd = root.join("project");
+        fs::create_dir_all(&cwd).expect("project dir");
+        let loader = ConfigLoader::new(&cwd, &home);
+        let config = loader.load_sudocode_config().expect("should parse");
+
+        // auth_modes
+        assert_eq!(config.auth_modes.len(), 3);
+        let sub_claude = &config.auth_modes["subscription"]["claude"];
+        assert_eq!(sub_claude.base_url, "https://api.anthropic.com/v1/messages");
+        assert_eq!(sub_claude.token.as_deref(), Some("sk-test-oauth-token"));
+        assert!(sub_claude.token_env.is_none());
+
+        let proxy = &config.auth_modes["proxy"]["sudorouter"];
+        assert_eq!(proxy.base_url, "https://hk.sudorouter.ai/v1");
+        assert_eq!(proxy.api_key.as_deref(), Some("sk-test-proxy-key"));
+
+        let apikey = &config.auth_modes["api-key"]["anthropic"];
+        assert_eq!(apikey.base_url, "https://api.anthropic.com");
+        assert_eq!(apikey.api_key.as_deref(), Some("sk-test-anthropic-key"));
+
+        // models
+        assert_eq!(config.models.len(), 2);
+        let opus = &config.models["opus"];
+        assert_eq!(opus.name, "Claude Opus 4.6");
+        assert_eq!(opus.providers.len(), 3);
+        assert_eq!(opus.providers["subscription"].provider, "claude");
+        assert_eq!(opus.providers["subscription"].model, "claude-opus-4-6");
+        assert!(opus.providers["subscription"].api.is_none());
+        assert_eq!(opus.providers["proxy"].provider, "sudorouter");
+        assert_eq!(
+            opus.providers["proxy"].api.as_deref(),
+            Some("openai-completions")
+        );
+        assert_eq!(opus.providers["api-key"].provider, "anthropic");
+
+        let deepseek = &config.models["deepseek"];
+        assert_eq!(deepseek.providers.len(), 1);
+        assert_eq!(deepseek.providers["proxy"].model, "deepseek-chat");
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
 }
