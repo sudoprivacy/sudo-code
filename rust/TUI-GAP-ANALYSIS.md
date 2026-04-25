@@ -27,11 +27,11 @@
 
 **Plain text key-value list** with ASCII art logo.
 
-- `main.rs:4558-4600` — `startup_banner()` method. Builds a format string with:
+- `main.rs:1719` — `startup_banner()` method on `ReplSession`. Builds a format string with:
   - ASCII art: `███████╗██╗...` in ANSI color 117 (light blue), "Code" in color 208 (orange).
   - Key-value pairs (Model, Permissions, Branch, Workspace, Directory, Session, Auto-save) with dim labels (`\x1b[2m`).
   - Help line at bottom: "Type /help for commands..."
-- `main.rs:3759` — `println!("{}", cli.startup_banner());` — emitted once at REPL start.
+- `main.rs:1238` — `run_repl()` emits `startup_banner()` once at REPL start.
 
 ### Gap
 
@@ -62,7 +62,7 @@
 **Plain `> ` prefix via rustyline.**
 
 - `input.rs:108` — `LineEditor::new("> ", candidates)` — prompt is a static string.
-- `main.rs:3758` — `let mut editor = input::LineEditor::new("> ", ...)` — creates the editor with `> ` prompt.
+- `main.rs:1238` — `run_repl()` creates the editor with `> ` prompt.
 - No background highlight, no colored chevron, no visual distinction of user messages in scrollback.
 
 ### Gap
@@ -94,9 +94,9 @@
 
 **No prefix, no visual structure.**
 
-- `main.rs:7948-7952` — Streaming text is written directly: `write!(out, "{rendered}")?; out.flush()?;`.
+- `cli/api_client.rs:217-240` — Streaming text is written directly: `write!(out, "{rendered}")?; out.flush()?;`.
 - No bullet, no connector glyph, no visual distinction between assistant text and tool output.
-- Tool completion uses `✓` / `✗` icons (`main.rs:8464-8490`), but these mark tool results, not the assistant's text blocks.
+- Tool completion uses `✓` / `✗` icons (`cli/format.rs:667`), but these mark tool results, not the assistant's text blocks.
 
 ### Gap
 
@@ -124,16 +124,16 @@
 
 **Full output dumped inline, truncated only at generous limits.**
 
-- `main.rs:8492-8497` — Truncation constants:
+- `cli/format.rs:17-20` — Truncation constants:
   ```
   READ_DISPLAY_MAX_LINES = 80
   READ_DISPLAY_MAX_CHARS = 6,000
   TOOL_OUTPUT_DISPLAY_MAX_LINES = 60
   TOOL_OUTPUT_DISPLAY_MAX_CHARS = 4,000
   ```
-- `main.rs:8553-8590` — `format_bash_result()`: Builds a vector of lines starting with `✓ bash`, then appends the full stdout (truncated at 60 lines / 4000 chars) and stderr (same limits, colored red via `\x1b[38;5;203m`). All lines joined and returned as one string.
-- `main.rs:9067-9070` — Emission path: `format_tool_result()` → `stream_markdown()` → `write!(stdout)`. No state tracking, no collapse/expand. The output is written once and cannot be hidden after the fact.
-- `main.rs:8464-8490` — `format_tool_result()` dispatches per tool name: `format_bash_result`, `format_read_result`, `format_write_result`, `format_edit_result`, `format_glob_result`, `format_grep_result`, or `format_generic_tool_result`. Each dumps its output inline.
+- `cli/format.rs:749` — `format_bash_result()`: Builds a vector of lines starting with `✓ bash`, then appends the full stdout (truncated at 60 lines / 4000 chars) and stderr (same limits, colored red via `\x1b[38;5;203m`). All lines joined and returned as one string.
+- Emission path: `format_tool_result()` (`cli/format.rs:667`) → `stream_markdown()` → `write!(stdout)`. No state tracking, no collapse/expand. The output is written once and cannot be hidden after the fact.
+- `cli/format.rs:667` — `format_tool_result()` dispatches per tool name: `format_bash_result`, `format_read_result`, `format_write_result`, `format_edit_result`, `format_glob_result`, `format_grep_result`, or `format_generic_tool_result`. Each dumps its output inline.
 - Tool completion icon: `\x1b[1;32m✓\x1b[0m` (bold green) or `\x1b[1;31m✗\x1b[0m` (bold red), always static.
 
 ### Gap
@@ -168,10 +168,10 @@ This is the **single biggest readability gap** visible in the screenshots. A `ls
 **Spinner is designed for animation but never actually animates.**
 
 - `render.rs:48-116` — `Spinner` struct with 10 braille frames and `SavePosition`/`RestorePosition` cursor control — designed for in-place animation.
-- **But**: `main.rs:4638-4648` — `tick()` is called **once** before the blocking `runtime.run_turn()` call. There is no animation loop. The spinner shows a single static frame (`⠋ 🦀 Thinking...`).
-- Streaming happens inside `run_turn()` via `AnthropicRuntimeClient::stream_message()` (line 7880+). Tool calls are prefixed with `\n` (line 7981: `writeln!(out, "\n{}", format_tool_call_start(...))`), so they write below the spinner line, leaving "🦀 Thinking..." visible above.
-- Text deltas write directly below via `write!(out, "{rendered}")` (line 7948-7950).
-- After `run_turn()` returns, `finish()` (line 4653) prints `✔ ✨ Done` at the current cursor position (below all streaming output), or `fail()` (line 4670) prints `✘ ❌ Request failed`.
+- **But**: `main.rs:1818-1822` — `run_turn()` creates a `Spinner`, calls `tick()` **once** before the blocking `runtime.run_turn()` call. There is no animation loop. The spinner shows a single static frame (`⠋ 🦀 Thinking...`).
+- Streaming happens inside `run_turn()` via `cli/api_client.rs:144` (`stream_message()`). Tool calls are prefixed with `\n` using `format_tool_call_start()` (`cli/format.rs:614`), so they write below the spinner line, leaving "🦀 Thinking..." visible above.
+- Text deltas write directly below via `write!(out, "{rendered}")` (`cli/api_client.rs:217-240`).
+- After `run_turn()` returns, `finish()` (`main.rs:1833`) prints `✔ ✨ Done` at the current cursor position (below all streaming output), or `fail()` prints `✘ ❌ Request failed`.
 - **Net effect**: "🦀 Thinking..." appears once, stays frozen, streaming output appears below it, then "✔ ✨ Done" appears at the end. No continuous animation, no mode switching, no stall detection.
 
 ### Gap
@@ -255,14 +255,14 @@ AlternateScreen (mouseTracking)
 
 **Inline scrollback, no layout control.**
 
-- `main.rs:3737-3813` — `run_repl()`: A simple loop:
-  1. `editor.read_line()` (line 3767) — rustyline handles prompt display and input
-  2. `SlashCommand::parse()` (line 3777) — check for slash commands
-  3. `cli.run_turn(&trimmed)` (line 3802) — blocking call that streams output to stdout
+- `main.rs:1238` — `run_repl()`: A simple loop:
+  1. `editor.read_line()` — rustyline handles prompt display and input
+  2. `SlashCommand::parse()` — check for slash commands
+  3. `cli.run_turn(&trimmed)` (`main.rs:1818`) — blocking call that streams output to stdout
   4. Back to step 1
-- `main.rs:4638-4678` — `run_turn()`: Creates `Spinner`, ticks once, calls `runtime.run_turn()` (blocking), then finishes spinner.
-- Inside `runtime.run_turn()`, `stream_message()` (line 7880+) handles SSE events and writes rendered markdown/tool output directly to stdout via `write!(out, ...)`.
-- `main.rs:7883-7887` — Output destination: `if self.emit_output { &mut stdout } else { &mut sink }` — either stdout or /dev/null, nothing in between.
+- `main.rs:1818` — `run_turn()`: Creates `Spinner`, ticks once, calls `runtime.run_turn()` (blocking), then finishes spinner.
+- Inside `runtime.run_turn()`, `cli/api_client.rs:144` handles SSE events and writes rendered markdown/tool output directly to stdout via `write!(out, ...)`.
+- `cli/api_client.rs:150-155` — Output destination: `if self.emit_output { &mut stdout } else { &mut sink }` — either stdout or /dev/null, nothing in between.
 - No alternate screen, no fixed regions, no scroll management, no cursor positioning for layout. When the model generates long output, the prompt scrolls off-screen.
 
 ### Gap
@@ -292,8 +292,8 @@ AlternateScreen (mouseTracking)
 
 **Generic Y/N text prompt for all tools.**
 
-- `main.rs:7683-7730` — `CliPermissionPrompter` struct with single method `decide()`.
-- `main.rs:7698-7706` — Output is plain `println!()` calls:
+- `main.rs:3174` — `CliPermissionPrompter` struct with single method `decide()` (`main.rs:3185-3219`).
+- `main.rs:3190` — Output is plain `println!()` calls:
   ```rust
   println!("Permission approval required");
   println!("  Tool             {}", request.tool_name);
@@ -302,8 +302,8 @@ AlternateScreen (mouseTracking)
   // ... reason, input
   print!("Approve this tool call? [y/N]: ");
   ```
-- `main.rs:7711-7714` — Reads one line from stdin via `io::stdin().read_line()`, accepts "y"/"yes" (case-insensitive). Everything else is a deny.
-- `main.rs:7717-7721` — Deny reason is hardcoded: `"tool '{name}' denied by user approval prompt"`. No user feedback captured.
+- Reads one line from stdin via `io::stdin().read_line()`, accepts "y"/"yes" (case-insensitive). Everything else is a deny.
+- Deny reason is hardcoded: `"tool '{name}' denied by user approval prompt"`. No user feedback captured.
 - The `request.input` field dumps the raw JSON tool input — not a human-readable summary.
 - No select menu, no per-tool formatting, no "allow for session" option.
 
@@ -331,7 +331,7 @@ AlternateScreen (mouseTracking)
 
 ### What Rust does
 
-**Nothing persistent.** Status info shown only in startup banner (`main.rs:4558-4600`) and via `/status` command (`main.rs:5986-6017`).
+**Nothing persistent.** Status info shown only in startup banner (`main.rs:1719`) and via `/status` command (`main.rs:2129`, `print_status()`).
 
 ---
 
@@ -352,7 +352,7 @@ AlternateScreen (mouseTracking)
 
 - `render.rs:14-45` — `ColorTheme` with 11 fields: heading (Cyan), emphasis (Magenta), strong (Yellow), inline_code (Green), link (Blue), quote (DarkGrey), table_border (DarkCyan), code_block_border (DarkGrey), spinner_active (Blue), spinner_done (Green), spinner_failed (Red).
 - `render.rs:30-44` — `ColorTheme::default()` — only one theme, no switching, no detection.
-- `main.rs:4577-4583` — Banner uses raw ANSI codes (`\x1b[38;5;117m`) mixed with crossterm — inconsistent styling approach.
+- `main.rs:1719` — Banner uses raw ANSI codes (`\x1b[38;5;117m`) mixed with crossterm — inconsistent styling approach.
 
 ---
 
@@ -370,7 +370,7 @@ Commands like `/help`, `/status`, `/config`, `/model`, `/theme`, `/permissions` 
 
 **31 implemented, 38 stubs** (print "not yet implemented").
 
-**Implemented** (`main.rs:4776-4893` — `handle_repl_command()`):
+**Implemented** (`main.rs:1951` — `handle_repl_command()`):
 
 | Command | What it does |
 |---------|-------------|
@@ -406,7 +406,7 @@ Commands like `/help`, `/status`, `/config`, `/model`, `/theme`, `/permissions` 
 | `/debug-tool-call` | Replays last tool call |
 | `/sandbox` | Shows sandbox status |
 
-**Stubs** (`main.rs:4895-4932` — all print `"command.slash_name() is not yet implemented"`):
+**Stubs** (`main.rs:2110-2116` — all print `"cmd_name is not yet implemented in this build."`):
 
 `/login`, `/logout`, `/vim`, `/upgrade`, `/share`, `/feedback`, `/files`, `/fast`, `/summary`, `/desktop`, `/brief`, `/advisor`, `/stickers`, `/insights`, `/thinkback`, `/release-notes`, `/security-review`, `/keybindings`, `/privacy-settings`, `/plan`, `/review`, `/tasks`, `/theme`, `/voice`, `/usage`, `/rename`, `/copy`, `/hooks`, `/context`, `/color`, `/effort`, `/branch`, `/rewind`, `/ide`, `/tag`, `/output-style`, `/add-dir`
 
@@ -466,12 +466,12 @@ Commands like `/help`, `/status`, `/config`, `/model`, `/theme`, `/permissions` 
 
 **Every command uses `println!()` — zero interactive UI.**
 
-- `main.rs:4776-4893` — All 31 implemented commands in `handle_repl_command()` output via `println!()` or `format!()` → `println!()`.
-- `/help` (`main.rs:4776-4790`) — Prints a flat text list of commands with descriptions. No categories, no navigation.
-- `/model` (`main.rs:4810-4828`) — If argument given, sets model. Otherwise prints current model name. No picker.
-- `/status` (`main.rs:5986-6017`) — Prints key-value pairs. No formatting beyond raw text.
-- `/config` (`main.rs:4844-4860`) — Prints raw config text. No section navigation.
-- `/resume` (`main.rs:4831-4842`) — Requires exact file path argument. No fuzzy search, no session list.
+- `main.rs:1951` — All 31 implemented commands in `handle_repl_command()` output via `println!()` or `format!()` → `println!()`.
+- `/help` (`main.rs:1956-1959`, helper at `cli/help.rs:17`) — Prints a flat text list of commands with descriptions. No categories, no navigation.
+- `/model` (`main.rs:2000`, impl at `main.rs:2212`) — If argument given, sets model. Otherwise prints current model name. No picker.
+- `/status` (`main.rs:1960-1963`, impl at `main.rs:2129`) — Prints key-value pairs. No formatting beyond raw text.
+- `/config` (`main.rs:2009-2011`, impl at `main.rs:2381`) — Prints raw config text. No section navigation.
+- `/resume` (`main.rs:2008`, impl at `main.rs:2352`) — Requires exact file path argument. No fuzzy search, no session list.
 - No crate in `Cargo.toml` provides interactive selection (no `dialoguer`, no `inquire`, no `console`). The only interactive library is `rustyline` (line editor).
 - `crossterm` is a dependency and provides raw terminal mode, cursor control, and event reading — but is only used for color output via `crossterm::style::Stylize`, never for interactive UI.
 
@@ -506,14 +506,14 @@ Ranked by how much they affect usability — animation/visual polish gaps exclud
 
 | # | Gap | TS Source | Rust Source | Impact |
 |---|-----|-----------|-------------|--------|
-| 1 | **Tool output not collapsible** | `CtrlOToExpand.tsx:29-50` | `main.rs:8553-8585` (full dump) | **Critical** — floods screen, kills readability |
-| 2 | **No fixed footer** — input/spinner scroll away during long output | `FullscreenLayout.tsx:413` (bottom slot) | `main.rs:3737` (inline loop) | **Critical** — lose context mid-turn |
-| 3 | **Y/N permission prompt** — no select menu, no "allow for session", raw JSON context | `PermissionPrompt.tsx` + `CustomSelect` | `main.rs:7693-7730` (stdin readline) | **High** — friction on every permission check |
-| 4 | **No interactive command display** — all commands use `println!()`, no pickers/menus/panes | `CustomSelect`, `Pane`, `useSelectableList` | `main.rs:4776-4893` (all `println!()`) | **High** — commands feel like a debug dump |
+| 1 | **Tool output not collapsible** | `CtrlOToExpand.tsx:29-50` | `cli/format.rs:749` (full dump) | **Critical** — floods screen, kills readability |
+| 2 | **No fixed footer** — input/spinner scroll away during long output | `FullscreenLayout.tsx:413` (bottom slot) | `main.rs:1238` (inline loop) | **Critical** — lose context mid-turn |
+| 3 | **Y/N permission prompt** — no select menu, no "allow for session", raw JSON context | `PermissionPrompt.tsx` + `CustomSelect` | `main.rs:3174-3219` (stdin readline) | **High** — friction on every permission check |
+| 4 | **No interactive command display** — all commands use `println!()`, no pickers/menus/panes | `CustomSelect`, `Pane`, `useSelectableList` | `main.rs:1951` (all `println!()`) | **High** — commands feel like a debug dump |
 | 5 | **No status line** — model/tokens/cost not visible during session | `StatusLine.tsx` | Not implemented | **High** — users must run /status manually |
-| 6 | **Spinner shows no useful info** — frozen frame, no mode, no elapsed time | `SpinnerAnimationRow.tsx` (modes + time) | `render.rs:60` (single tick) | **Medium** — user doesn't know what's happening |
-| 7 | **No response structure** — no bullet prefix, no visual hierarchy between assistant text and tool output | `ToolUseLoader.tsx:19` + `MessageResponse.tsx:22` | `main.rs:7948` (raw write) | **Medium** — harder to scan conversation |
-| 8 | **Plain startup banner** — no bordered layout, no tips/activity feeds | `LogoV2.tsx:331-436` (2-col layout) | `main.rs:4558-4600` (key-value) | **Low** — cosmetic, seen once |
+| 6 | **Spinner shows no useful info** — frozen frame, no mode, no elapsed time | `SpinnerAnimationRow.tsx` (modes + time) | `main.rs:1820-1822` (single tick) | **Medium** — user doesn't know what's happening |
+| 7 | **No response structure** — no bullet prefix, no visual hierarchy between assistant text and tool output | `ToolUseLoader.tsx:19` + `MessageResponse.tsx:22` | `cli/api_client.rs:217` (raw write) | **Medium** — harder to scan conversation |
+| 8 | **Plain startup banner** — no bordered layout, no tips/activity feeds | `LogoV2.tsx:331-436` (2-col layout) | `main.rs:1719` (key-value) | **Low** — cosmetic, seen once |
 | 9 | **Inline autocomplete** — no descriptions next to command names | `PromptInputFooterSuggestions.tsx` | `input.rs:23-99` (rustyline) | **Low** — functional, just less informative |
 
 **Explicitly excluded** (not worth bridging):
@@ -526,4 +526,4 @@ Ranked by how much they affect usability — animation/visual polish gaps exclud
 
 ---
 
-*Generated: 2026-04-24 | This report is for discussion — let's decide which gaps to bridge.*
+*Updated: 2026-04-25 | Source references updated for post-refactor module structure (`main.rs` → `cli/` modules).*
