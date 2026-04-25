@@ -356,22 +356,28 @@ AlternateScreen (mouseTracking)
 
 ---
 
-## Summary: Gaps Ranked by Visual Impact
+## Summary: Gaps Ranked by Functional Impact
 
-From the screenshots, these are the gaps ordered by how much they affect the user experience:
+Ranked by how much they affect usability — animation/visual polish gaps excluded per decision.
 
 | # | Gap | TS Source | Rust Source | Impact |
 |---|-----|-----------|-------------|--------|
-| 1 | **Tool output not collapsible** | `CtrlOToExpand.tsx:29-50` | `main.rs:8553-8585` (full dump) | **Critical** — floods screen |
-| 2 | **No fixed footer** — input/spinner scroll away | `FullscreenLayout.tsx:413` (bottom slot) | `main.rs:3737` (inline loop) | **Critical** — lose context |
-| 3 | **No status line** — model/tokens/cost not visible | `StatusLine.tsx` | Not implemented | **High** |
-| 4 | **Single-mode spinner** — no thinking/responding/tool differentiation | `SpinnerAnimationRow.tsx` (3 modes) | `render.rs:60` (single tick) | **High** |
-| 5 | **Y/N permission prompt** — no select menu, no batch options | `PermissionPrompt.tsx` + `CustomSelect` | `main.rs:7693-7730` (stdin readline) | **High** |
-| 6 | **No response structure** — no bullet prefix, no connector glyph | `ToolUseLoader.tsx:19` + `MessageResponse.tsx:22` | `main.rs:7948` (raw write) | **Medium** |
-| 7 | **Plain startup banner** — no bordered layout, no feeds | `LogoV2.tsx:331-436` (2-col layout) | `main.rs:4558-4600` (key-value) | **Medium** |
-| 8 | **Inline autocomplete** — no overlay dropdown with descriptions | `PromptInputFooterSuggestions.tsx` | `input.rs:23-99` (rustyline) | **Medium** |
-| 9 | **No theming** — single hardcoded dark theme | `theme.ts` (6 themes, 90+ fields) | `render.rs:14-45` (11 fields) | **Low** |
-| 10 | **No stall/shimmer effects** in spinner | `useStalledAnimation.ts`, `ShimmerChar.tsx` | Not implemented | **Low** |
+| 1 | **Tool output not collapsible** | `CtrlOToExpand.tsx:29-50` | `main.rs:8553-8585` (full dump) | **Critical** — floods screen, kills readability |
+| 2 | **No fixed footer** — input/spinner scroll away during long output | `FullscreenLayout.tsx:413` (bottom slot) | `main.rs:3737` (inline loop) | **Critical** — lose context mid-turn |
+| 3 | **Y/N permission prompt** — no select menu, no "allow for session", raw JSON context | `PermissionPrompt.tsx` + `CustomSelect` | `main.rs:7693-7730` (stdin readline) | **High** — friction on every permission check |
+| 4 | **No status line** — model/tokens/cost not visible during session | `StatusLine.tsx` | Not implemented | **High** — users must run /status manually |
+| 5 | **Spinner shows no useful info** — frozen frame, no mode, no elapsed time | `SpinnerAnimationRow.tsx` (modes + time) | `render.rs:60` (single tick) | **Medium** — user doesn't know what's happening |
+| 6 | **No response structure** — no bullet prefix, no visual hierarchy between assistant text and tool output | `ToolUseLoader.tsx:19` + `MessageResponse.tsx:22` | `main.rs:7948` (raw write) | **Medium** — harder to scan conversation |
+| 7 | **Plain startup banner** — no bordered layout, no tips/activity feeds | `LogoV2.tsx:331-436` (2-col layout) | `main.rs:4558-4600` (key-value) | **Low** — cosmetic, seen once |
+| 8 | **Inline autocomplete** — no descriptions next to command names | `PromptInputFooterSuggestions.tsx` | `input.rs:23-99` (rustyline) | **Low** — functional, just less informative |
+
+**Explicitly excluded** (not worth bridging):
+- Shimmer/glimmer text effects
+- Stall detection color interpolation
+- Continuous spinner animation
+- Mouse tracking / text selection
+- Virtual scrolling / viewport culling
+- Live theme preview
 
 ---
 
