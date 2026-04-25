@@ -92,6 +92,7 @@ use commands::{
     slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
+use dialoguer::{FuzzySelect, Select};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
@@ -2211,15 +2212,22 @@ impl LiveCli {
 
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(model) = model else {
-            println!(
-                "{}",
-                format_model_report(
-                    &self.config.model,
-                    self.runtime.session().messages.len(),
-                    self.runtime.usage().turns(),
-                )
-            );
-            return Ok(false);
+            let models = &[
+                "claude-sonnet-4-20250514",
+                "claude-haiku-4-5-20251001",
+                "claude-opus-4-20250115",
+                "gemini-3-pro",
+                "gpt-4.1",
+            ];
+            let selection = FuzzySelect::new()
+                .with_prompt("Select model")
+                .items(models)
+                .default(0)
+                .interact_opt()?;
+            return match selection {
+                Some(idx) => self.set_model(Some(models[idx].to_string())),
+                None => Ok(false),
+            };
         };
 
         let model = resolve_model_alias_with_config(&model);
@@ -2354,8 +2362,24 @@ impl LiveCli {
         session_path: Option<String>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(session_ref) = session_path else {
-            println!("{}", render_resume_usage());
-            return Ok(false);
+            let sessions = list_managed_sessions()?;
+            if sessions.is_empty() {
+                println!("No sessions found.");
+                return Ok(false);
+            }
+            let labels: Vec<String> = sessions
+                .iter()
+                .map(|s| format!("{} ({} msgs)", s.id, s.message_count))
+                .collect();
+            let selection = Select::new()
+                .with_prompt("Select session to resume")
+                .items(&labels)
+                .default(0)
+                .interact_opt()?;
+            return match selection {
+                Some(idx) => self.resume_session(Some(sessions[idx].id.clone())),
+                None => Ok(false),
+            };
         };
 
         let (handle, session) = load_session_reference(&session_ref)?;
@@ -3188,31 +3212,51 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     ) -> runtime::PermissionPromptDecision {
         println!();
         println!("Permission approval required");
-        println!("  Tool             {}", request.tool_name);
-        println!("  Current mode     {}", self.current_mode.as_str());
-        println!("  Required mode    {}", request.required_mode.as_str());
+        println!("  Tool             \x1b[36m{}\x1b[0m", request.tool_name);
         if let Some(reason) = &request.reason {
-            println!("  Reason           {reason}");
+            println!("  Reason           \x1b[2m{reason}\x1b[0m");
         }
-        println!("  Input            {}", request.input);
-        print!("Approve this tool call? [y/N]: ");
-        let _ = io::stdout().flush();
 
-        let mut response = String::new();
-        match io::stdin().read_line(&mut response) {
-            Ok(_) => {
-                let normalized = response.trim().to_ascii_lowercase();
-                if matches!(normalized.as_str(), "y" | "yes") {
-                    runtime::PermissionPromptDecision::Allow
-                } else {
-                    runtime::PermissionPromptDecision::Deny {
-                        reason: format!(
-                            "tool '{}' denied by user approval prompt",
-                            request.tool_name
-                        ),
+        if !io::stdin().is_terminal() {
+            // Non-interactive fallback: read a line from stdin.
+            print!("Approve this tool call? [y/N]: ");
+            let _ = io::stdout().flush();
+            let mut response = String::new();
+            return match io::stdin().read_line(&mut response) {
+                Ok(_) => {
+                    let normalized = response.trim().to_ascii_lowercase();
+                    if matches!(normalized.as_str(), "y" | "yes") {
+                        runtime::PermissionPromptDecision::Allow
+                    } else {
+                        runtime::PermissionPromptDecision::Deny {
+                            reason: format!(
+                                "tool '{}' denied by user approval prompt",
+                                request.tool_name
+                            ),
+                        }
                     }
                 }
-            }
+                Err(error) => runtime::PermissionPromptDecision::Deny {
+                    reason: format!("permission approval failed: {error}"),
+                },
+            };
+        }
+
+        let items = &["Allow once", "Deny"];
+        let selection = Select::new()
+            .with_prompt("Approve this tool call?")
+            .items(items)
+            .default(0)
+            .interact_opt();
+
+        match selection {
+            Ok(Some(0)) => runtime::PermissionPromptDecision::Allow,
+            Ok(Some(_) | None) => runtime::PermissionPromptDecision::Deny {
+                reason: format!(
+                    "tool '{}' denied by user approval prompt",
+                    request.tool_name
+                ),
+            },
             Err(error) => runtime::PermissionPromptDecision::Deny {
                 reason: format!("permission approval failed: {error}"),
             },
