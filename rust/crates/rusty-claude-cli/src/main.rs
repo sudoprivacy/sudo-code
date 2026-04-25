@@ -1689,6 +1689,24 @@ impl HookAbortMonitor {
     }
 }
 
+/// Measure visible string width by stripping ANSI escape sequences.
+fn strip_ansi_width(s: &str) -> usize {
+    let mut width = 0;
+    let mut in_escape = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+        } else if in_escape {
+            if c == 'm' {
+                in_escape = false;
+            }
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
 impl LiveCli {
     fn new(
         model: String,
@@ -1767,33 +1785,60 @@ impl LiveCli {
         .map(|r| r.base_url)
         .unwrap_or_default();
 
-        format!(
-            "\x1b[38;5;117m\
+        let logo = "\x1b[38;5;117m\
 ███████╗██╗   ██╗██████╗  ██████╗ \n\
 ██╔════╝██║   ██║██╔══██╗██╔═══██╗\n\
 ███████╗██║   ██║██║  ██║██║   ██║\n\
 ╚════██║██║   ██║██║  ██║██║   ██║\n\
 ███████║╚██████╔╝██████╔╝╚██████╔╝\n\
-╚══════╝ ╚═════╝ ╚═════╝  ╚═════╝\x1b[0m \x1b[38;5;208mCode\x1b[0m\n\n\
-  \x1b[2mModel\x1b[0m            {}\n\
-  \x1b[2mAuth mode\x1b[0m        {}\n\
-  \x1b[2mEndpoint\x1b[0m         {}\n\
-  \x1b[2mPermissions\x1b[0m      {}\n\
-  \x1b[2mBranch\x1b[0m           {}\n\
-  \x1b[2mWorkspace\x1b[0m        {}\n\
-  \x1b[2mDirectory\x1b[0m        {}\n\
-  \x1b[2mSession\x1b[0m          {}\n\
-  \x1b[2mAuto-save\x1b[0m        {}\n\n\
-  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
-            self.config.model,
-            auth_mode_str,
-            endpoint,
-            self.config.permission_mode.as_str(),
-            git_branch,
-            workspace,
-            cwd,
-            self.session.id,
-            session_path,
+╚══════╝ ╚═════╝ ╚═════╝  ╚═════╝\x1b[0m \x1b[38;5;208mCode\x1b[0m";
+
+        let lines = [
+            format!("  \x1b[2mModel\x1b[0m            {}", self.config.model),
+            format!("  \x1b[2mAuth mode\x1b[0m        {}", auth_mode_str),
+            format!("  \x1b[2mEndpoint\x1b[0m         {}", endpoint),
+            format!(
+                "  \x1b[2mPermissions\x1b[0m      {}",
+                self.config.permission_mode.as_str()
+            ),
+            format!("  \x1b[2mBranch\x1b[0m           {}", git_branch),
+            format!("  \x1b[2mWorkspace\x1b[0m        {}", workspace),
+            format!("  \x1b[2mDirectory\x1b[0m        {}", cwd),
+            format!("  \x1b[2mSession\x1b[0m          {}", self.session.id),
+            format!("  \x1b[2mAuto-save\x1b[0m        {}", session_path),
+        ];
+
+        let max_width = lines.iter().map(|l| strip_ansi_width(l)).max().unwrap_or(0);
+        let box_width = max_width + 2; // 1 space padding on each side
+
+        let grey = "\x1b[38;5;245m";
+        let reset = "\x1b[0m";
+
+        let top = format!("{grey}╭{}╮{reset}", "─".repeat(box_width));
+        let bottom = format!("{grey}╰{}╯{reset}", "─".repeat(box_width));
+
+        let boxed_lines: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                let visible_width = strip_ansi_width(line);
+                let padding = max_width - visible_width;
+                format!(
+                    "{grey}│{reset} {}{} {grey}│{reset}",
+                    line,
+                    " ".repeat(padding)
+                )
+            })
+            .collect();
+
+        let hint = "  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline";
+
+        format!(
+            "{}\n\n{}\n{}\n{}\n\n{}",
+            logo,
+            top,
+            boxed_lines.join("\n"),
+            bottom,
+            hint,
         )
     }
 
