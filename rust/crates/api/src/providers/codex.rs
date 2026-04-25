@@ -1,8 +1,8 @@
-//! OpenAI Codex provider — Responses API via chatgpt.com backend.
+//! `OpenAI` Codex provider — Responses API via chatgpt.com backend.
 //!
 //! Subscription auth reads credentials from `~/.codex/auth.json` (written by
 //! the Codex CLI). The endpoint is `https://chatgpt.com/backend-api/codex/responses`
-//! which speaks the OpenAI Responses API (not Chat Completions).
+//! which speaks the `OpenAI` Responses API (not Chat Completions).
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -28,12 +28,38 @@ const AUTH_FILE_REL: &str = ".codex/auth.json";
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-struct CodexAuthFile {
+struct CodexAuthTokens {
     access_token: String,
+    #[serde(default)]
     account_id: String,
 }
 
-fn read_auth_file() -> Result<CodexAuthFile, ApiError> {
+/// The Codex CLI writes `~/.codex/auth.json` with a nested `tokens` object.
+/// We also support a flat layout for backwards compat / testing.
+#[derive(Debug, Deserialize)]
+struct CodexAuthFile {
+    /// Nested format: `{ "tokens": { "access_token": "...", "account_id": "..." } }`
+    tokens: Option<CodexAuthTokens>,
+    /// Flat format: `{ "access_token": "...", "account_id": "..." }`
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
+}
+
+impl CodexAuthFile {
+    fn into_credentials(self) -> Result<(String, String), &'static str> {
+        if let Some(tokens) = self.tokens {
+            return Ok((tokens.access_token, tokens.account_id));
+        }
+        if let Some(token) = self.access_token {
+            return Ok((token, self.account_id.unwrap_or_default()));
+        }
+        Err("no access_token found in auth file")
+    }
+}
+
+fn read_auth_file() -> Result<(String, String), ApiError> {
     let home = std::env::var("HOME").map_err(|_| {
         ApiError::Auth(
             "cannot determine home directory (HOME not set) for ~/.codex/auth.json".to_string(),
@@ -46,8 +72,11 @@ fn read_auth_file() -> Result<CodexAuthFile, ApiError> {
             path.display()
         ))
     })?;
-    serde_json::from_str::<CodexAuthFile>(&content)
-        .map_err(|e| ApiError::Auth(format!("failed to parse {}: {e}", path.display())))
+    let auth_file: CodexAuthFile = serde_json::from_str(&content)
+        .map_err(|e| ApiError::Auth(format!("failed to parse {}: {e}", path.display())))?;
+    auth_file
+        .into_credentials()
+        .map_err(|msg| ApiError::Auth(format!("{}: {msg}", path.display())))
 }
 
 // ---------------------------------------------------------------------------
@@ -63,17 +92,28 @@ pub struct CodexClient {
 }
 
 impl CodexClient {
+    /// Build from resolved config values (base URL + credentials).
+    #[must_use]
+    pub fn new(base_url: String, access_token: String, account_id: String) -> Self {
+        Self {
+            http: build_http_client_or_default(),
+            base_url,
+            access_token,
+            account_id,
+        }
+    }
+
     /// Build from `~/.codex/auth.json`.
     pub fn from_auth_file() -> Result<Self, ApiError> {
-        let auth = read_auth_file()?;
+        let (access_token, account_id) = read_auth_file()?;
         let http = build_http_client_or_default();
         let base_url =
             std::env::var("CODEX_BASE_URL").unwrap_or_else(|_| DEFAULT_CODEX_BASE_URL.to_string());
         Ok(Self {
             http,
             base_url,
-            access_token: auth.access_token,
-            account_id: auth.account_id,
+            access_token,
+            account_id,
         })
     }
 
@@ -158,20 +198,26 @@ async fn error_from_response(status: reqwest::StatusCode, response: reqwest::Res
 fn build_codex_request(request: &MessageRequest) -> Value {
     let mut input: Vec<Value> = Vec::new();
 
-    if let Some(system) = request.system.as_ref().filter(|s| !s.is_empty()) {
-        input.push(json!({"role": "system", "content": system}));
-    }
-
     for msg in &request.messages {
         translate_input_message(msg, &mut input);
     }
 
     let wire_model = strip_codex_prefix(&request.model);
 
+    // The Responses API uses a top-level `instructions` field for the system
+    // prompt (required by the chatgpt.com backend).
+    let instructions = request
+        .system
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("You are a helpful assistant.");
+
     let mut payload = json!({
         "model": wire_model,
+        "instructions": instructions,
         "input": input,
         "stream": true,
+        "store": false,
     });
 
     if let Some(tools) = &request.tools {
@@ -279,7 +325,7 @@ impl SseParser {
         Self { buffer: Vec::new() }
     }
 
-    fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, ApiError> {
+    fn push(&mut self, chunk: &[u8]) -> Vec<SseFrame> {
         self.buffer.extend_from_slice(chunk);
         let mut frames = Vec::new();
 
@@ -287,7 +333,7 @@ impl SseParser {
             frames.push(frame);
         }
 
-        Ok(frames)
+        frames
     }
 
     fn next_frame(&mut self) -> Option<SseFrame> {
@@ -345,6 +391,7 @@ pub struct MessageStream {
 }
 
 impl MessageStream {
+    #[allow(clippy::unused_self)]
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
         None
@@ -366,7 +413,7 @@ impl MessageStream {
 
             match self.response.chunk().await? {
                 Some(chunk) => {
-                    for frame in self.parser.push(&chunk)? {
+                    for frame in self.parser.push(&chunk) {
                         self.pending.extend(self.state.ingest_frame(&frame)?);
                     }
                 }
@@ -422,6 +469,7 @@ impl StreamState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn ingest_frame(&mut self, frame: &SseFrame) -> Result<Vec<StreamEvent>, ApiError> {
         if frame.data.is_empty() || frame.data == "[DONE]" {
             return Ok(Vec::new());
@@ -646,12 +694,11 @@ async fn collect_stream(
             StreamEvent::ContentBlockDelta(delta) => {
                 apply_delta(&mut content, &delta);
             }
-            StreamEvent::ContentBlockStop(_) => {}
+            StreamEvent::ContentBlockStop(_) | StreamEvent::MessageStop(_) => {}
             StreamEvent::MessageDelta(d) => {
                 stop_reason = d.delta.stop_reason;
                 usage = d.usage;
             }
-            StreamEvent::MessageStop(_) => {}
         }
     }
 
@@ -685,7 +732,7 @@ fn apply_delta(content: &mut [OutputContentBlock], delta: &ContentBlockDeltaEven
     };
     match (&mut *block, &delta.delta) {
         (OutputContentBlock::Text { text }, ContentBlockDelta::TextDelta { text: new_text }) => {
-            text.push_str(new_text)
+            text.push_str(new_text);
         }
         (
             OutputContentBlock::ToolUse { input, .. },
@@ -737,14 +784,14 @@ mod tests {
         };
 
         let payload = build_codex_request(&request);
+        assert_eq!(payload["instructions"], "You are helpful.");
         let input = payload["input"].as_array().unwrap();
-        assert_eq!(input.len(), 2);
-        assert_eq!(input[0]["role"], "system");
-        assert_eq!(input[0]["content"], "You are helpful.");
-        assert_eq!(input[1]["role"], "user");
-        assert_eq!(input[1]["content"], "Hello");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "Hello");
         assert_eq!(payload["model"], "gpt-5.4-mini");
         assert!(payload["stream"].as_bool().unwrap());
+        assert!(!payload["store"].as_bool().unwrap());
     }
 
     #[test]
@@ -809,7 +856,7 @@ mod tests {
                      event: response.output_text.delta\n\
                      data: {\"delta\":\"hi\"}\n\n";
 
-        let frames = parser.push(raw).unwrap();
+        let frames = parser.push(raw);
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].event_type, "response.created");
         assert!(frames[0].data.contains("resp_1"));
@@ -851,13 +898,13 @@ mod tests {
         assert!(matches!(&events[0], StreamEvent::ContentBlockDelta(_)));
 
         let events = state
-            .ingest_frame(&frame("response.output_text.done", r#"{}"#))
+            .ingest_frame(&frame("response.output_text.done", r"{}"))
             .unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], StreamEvent::ContentBlockStop(_)));
 
         let events = state
-            .ingest_frame(&frame("response.completed", r#"{}"#))
+            .ingest_frame(&frame("response.completed", r"{}"))
             .unwrap();
         assert!(events.is_empty());
 

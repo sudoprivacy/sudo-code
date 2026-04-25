@@ -26,7 +26,7 @@ pub enum ApiFormat {
     AnthropicMessages,
     /// OpenAI-compatible chat completions API (`/v1/chat/completions`).
     OpenAiCompletions,
-    /// OpenAI Responses API (`/v1/responses`).
+    /// `OpenAI` Responses API (`/v1/responses`).
     OpenAiResponses,
 }
 
@@ -61,18 +61,42 @@ pub struct ResolvedProvider {
 /// Look up a model by alias (case-insensitive).
 #[must_use]
 pub fn resolve_model<'a>(config: &'a SudoCodeConfig, alias: &str) -> Option<&'a ModelConfigEntry> {
+    resolve_model_for_mode(config, alias, None)
+}
+
+/// Look up a model by alias, preferring entries that support the given auth mode
+/// when multiple entries share the same wire model ID.
+fn resolve_model_for_mode<'a>(
+    config: &'a SudoCodeConfig,
+    alias: &str,
+    auth_mode: Option<&str>,
+) -> Option<&'a ModelConfigEntry> {
     let key = alias.trim().to_ascii_lowercase();
     // Direct alias lookup first.
     if let Some(entry) = config.models.get(&key) {
         return Some(entry);
     }
     // Fall back: match by wire model ID in any provider mapping.
-    config.models.values().find(|entry| {
-        entry
+    // When an auth mode is specified, prefer entries that support it.
+    let mut fallback: Option<&'a ModelConfigEntry> = None;
+    for entry in config.models.values() {
+        let has_wire_match = entry
             .providers
             .values()
-            .any(|m| m.model.eq_ignore_ascii_case(&key))
-    })
+            .any(|m| m.model.eq_ignore_ascii_case(&key));
+        if !has_wire_match {
+            continue;
+        }
+        if let Some(mode) = auth_mode {
+            if entry.providers.contains_key(mode) {
+                return Some(entry);
+            }
+        }
+        if fallback.is_none() {
+            fallback = Some(entry);
+        }
+    }
+    fallback
 }
 
 /// Look up connection config for a provider under a given auth mode.
@@ -141,8 +165,7 @@ pub fn resolve_provider_from_config(
                 .cloned()
                 .ok_or_else(|| {
                     ApiError::Configuration(format!(
-                        "model '{}' has no provider mappings in sudocode.json",
-                        model_alias
+                        "model '{model_alias}' has no provider mappings in sudocode.json"
                     ))
                 })?
         }
@@ -210,10 +233,8 @@ fn resolve_api_format(
     // Infer from provider name.
     match provider_name {
         "anthropic" | "claude" => Ok(ApiFormat::AnthropicMessages),
-        "openai" | "xai" | "dashscope" | "google" | "codex" | "gemini" => {
-            Ok(ApiFormat::OpenAiCompletions)
-        }
-        // Unknown providers under api-key mode: default to OpenAI-compatible.
+        "codex" => Ok(ApiFormat::OpenAiResponses),
+        // Known and unknown providers default to OpenAI-compatible.
         _ => Ok(ApiFormat::OpenAiCompletions),
     }
 }
@@ -274,10 +295,11 @@ fn resolve_credential(
                     return Ok(Credential::AuthFile(expanded));
                 }
             }
-            Err(ApiError::Configuration(format!(
+            Err(ApiError::Configuration(
                 "no token available for subscription provider. \
                  Set token, tokenEnv, or authFile in sudocode.json."
-            )))
+                    .to_string(),
+            ))
         }
         _ => {
             // Unknown auth mode — try apiKey then token.
@@ -302,6 +324,7 @@ fn infer_provider_kind(provider_name: &str, api_format: ApiFormat) -> ProviderKi
         ApiFormat::AnthropicMessages => ProviderKind::Anthropic,
         ApiFormat::OpenAiCompletions | ApiFormat::OpenAiResponses => match provider_name {
             "xai" => ProviderKind::Xai,
+            "codex" => ProviderKind::Codex,
             _ => ProviderKind::OpenAi,
         },
     }
@@ -334,6 +357,7 @@ mod tests {
             .unwrap_or_default()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn sample_config() -> SudoCodeConfig {
         let mut auth_modes = BTreeMap::new();
 
@@ -348,6 +372,17 @@ mod tests {
                 token: None,
                 token_env: Some("CLAUDE_CODE_OAUTH_TOKEN".to_string()),
                 auth_file: Some("~/.claude/credentials.json".to_string()),
+            },
+        );
+        subscription.insert(
+            "codex".to_string(),
+            ProviderConnectionConfig {
+                base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+                api_key: None,
+                api_key_env: None,
+                token: None,
+                token_env: None,
+                auth_file: Some("~/.codex/auth.json".to_string()),
             },
         );
         auth_modes.insert("subscription".to_string(), subscription);
@@ -386,6 +421,17 @@ mod tests {
                 base_url: "https://api.x.ai/v1".to_string(),
                 api_key: None,
                 api_key_env: Some("XAI_API_KEY".to_string()),
+                token: None,
+                token_env: None,
+                auth_file: None,
+            },
+        );
+        api_key.insert(
+            "openai".to_string(),
+            ProviderConnectionConfig {
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: None,
+                api_key_env: Some("OPENAI_API_KEY".to_string()),
                 token: None,
                 token_env: None,
                 auth_file: None,
@@ -446,6 +492,34 @@ mod tests {
                 name: "Grok 3".to_string(),
                 input: vec!["text".to_string()],
                 providers: grok_providers,
+            },
+        );
+
+        // codex model
+        let mut codex_providers = BTreeMap::new();
+        codex_providers.insert(
+            "subscription".to_string(),
+            ModelProviderMapping {
+                provider: "codex".to_string(),
+                model: "gpt-5.4-mini".to_string(),
+                api: None,
+            },
+        );
+        codex_providers.insert(
+            "api-key".to_string(),
+            ModelProviderMapping {
+                provider: "openai".to_string(),
+                model: "gpt-5.4-mini".to_string(),
+                api: None,
+            },
+        );
+        models.insert(
+            "codex".to_string(),
+            ModelConfigEntry {
+                alias: "codex".to_string(),
+                name: "GPT 5.4 Mini".to_string(),
+                input: vec!["text".to_string()],
+                providers: codex_providers,
             },
         );
 
@@ -565,6 +639,66 @@ mod tests {
         let config = SudoCodeConfig::default();
         assert!(config.auth_modes.is_empty());
         assert!(config.models.is_empty());
+    }
+
+    #[test]
+    fn resolve_codex_subscription_uses_codex_provider() {
+        let mut config = sample_config();
+        // Set an inline token so the test doesn't depend on ~/.codex/auth.json existing.
+        config
+            .auth_modes
+            .get_mut("subscription")
+            .unwrap()
+            .get_mut("codex")
+            .unwrap()
+            .token = Some("codex-test-token".to_string());
+
+        let resolved = resolve_provider_from_config("codex", Some(AuthMode::Subscription), &config)
+            .expect("should resolve codex subscription");
+        assert_eq!(resolved.kind, ProviderKind::Codex);
+        assert_eq!(resolved.api_format, ApiFormat::OpenAiResponses);
+        assert_eq!(resolved.base_url, "https://chatgpt.com/backend-api/codex");
+        assert_eq!(resolved.model_id, "gpt-5.4-mini");
+        assert_eq!(
+            resolved.credential,
+            Credential::Token("codex-test-token".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_codex_apikey_uses_openai_provider() {
+        let config = sample_config();
+        let resolved = resolve_provider_from_config("codex", Some(AuthMode::ApiKey), &config);
+        // Will fail credential resolution since OPENAI_API_KEY is not set, but
+        // if it happens to be set that's fine — check the provider routing.
+        match resolved {
+            Err(ApiError::Configuration(msg)) => {
+                assert!(msg.contains("API key"), "unexpected error: {msg}");
+            }
+            Ok(r) => {
+                assert_eq!(r.kind, ProviderKind::OpenAi);
+                assert_eq!(r.api_format, ApiFormat::OpenAiCompletions);
+                assert_eq!(r.base_url, "https://api.openai.com/v1");
+                assert_eq!(r.model_id, "gpt-5.4-mini");
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn resolve_api_format_codex_returns_responses() {
+        assert_eq!(
+            resolve_api_format("subscription", "codex", None).unwrap(),
+            ApiFormat::OpenAiResponses
+        );
+    }
+
+    #[test]
+    fn infer_provider_kind_codex() {
+        assert_eq!(
+            infer_provider_kind("codex", ApiFormat::OpenAiResponses),
+            ProviderKind::Codex
+        );
     }
 
     #[test]

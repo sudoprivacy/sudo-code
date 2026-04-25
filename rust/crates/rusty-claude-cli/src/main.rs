@@ -1729,9 +1729,10 @@ fn format_connected_line_with_config(
         .models
         .get(&model.to_ascii_lowercase())
         .map(|m| m.name.as_str());
-    let provider = config_display
-        .map(String::from)
-        .unwrap_or_else(|| provider_label(detect_provider_kind(model)).to_string());
+    let provider = config_display.map_or_else(
+        || provider_label(detect_provider_kind(model)).to_string(),
+        String::from,
+    );
     let resolved_mode = mode.or_else(|| resolve_auth_mode(None).ok());
     let auth_hint = match resolved_mode {
         Some(m) => format!(" ({})", m.label()),
@@ -1741,10 +1742,10 @@ fn format_connected_line_with_config(
         Some(m) => api::base_url_for_mode(m),
         None => api::read_base_url(),
     };
-    let endpoint_hint = if base_url != api::DEFAULT_BASE_URL {
-        format!("\nEndpoint:  {base_url}")
-    } else {
+    let endpoint_hint = if base_url == api::DEFAULT_BASE_URL {
         String::new()
+    } else {
+        format!("\nEndpoint:  {base_url}")
     };
     format!("Connected: {model} via {provider}{auth_hint}{endpoint_hint}")
 }
@@ -3051,6 +3052,7 @@ fn format_unknown_slash_command_message(name: &str) -> String {
 }
 
 fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
+    use std::fmt::Write;
     let config = load_sudocode_config_for_current_dir();
     let mut available_lines = String::new();
     for (alias, entry) in &config.models {
@@ -3059,13 +3061,14 @@ fn format_model_report(model: &str, message_count: usize, turns: u32) -> String 
         } else {
             ""
         };
-        let modes: Vec<&str> = entry.providers.keys().map(String::as_str).collect();
-        available_lines.push_str(&format!(
+        let auth_modes: Vec<&str> = entry.providers.keys().map(String::as_str).collect();
+        let _ = write!(
+            available_lines,
             "\n    {:<16} {} ({}){marker}",
             alias,
             entry.name,
-            modes.join(", ")
-        ));
+            auth_modes.join(", ")
+        );
     }
     let available = if available_lines.is_empty() {
         String::from("opus, sonnet, haiku")
@@ -4059,7 +4062,7 @@ impl AcpCliAgent {
         }
     }
 
-    fn build_session(&self, cwd: PathBuf) -> Result<AcpCliSession, AcpError> {
+    fn build_session(&self, cwd: &Path) -> Result<AcpCliSession, AcpError> {
         let cwd = canonical_session_cwd(cwd)?;
         let model = self.resolve_model_for_cwd(&cwd)?;
         let permission_mode = self.resolve_permission_mode_for_cwd(&cwd)?;
@@ -4127,10 +4130,9 @@ impl AcpCliAgent {
 impl runtime::AcpAgent for AcpCliAgent {
     fn new_session(&mut self, cwd: Option<PathBuf>) -> Result<String, AcpError> {
         let cwd = cwd
-            .map(Ok)
-            .unwrap_or_else(env::current_dir)
+            .map_or_else(env::current_dir, Ok)
             .map_err(|error| AcpError::internal(format!("failed to resolve cwd: {error}")))?;
-        let session = self.build_session(cwd)?;
+        let session = self.build_session(&cwd)?;
         let session_id = session.handle.id.clone();
         self.sessions.insert(session_id.clone(), session);
         Ok(session_id)
@@ -4179,8 +4181,8 @@ impl Drop for ScopedCurrentDir {
     }
 }
 
-fn canonical_session_cwd(cwd: PathBuf) -> Result<PathBuf, AcpError> {
-    let canonical = fs::canonicalize(&cwd).map_err(|error| {
+fn canonical_session_cwd(cwd: &Path) -> Result<PathBuf, AcpError> {
+    let canonical = fs::canonicalize(cwd).map_err(|error| {
         AcpError::invalid_params(format!("params.cwd is not accessible: {error}"))
     })?;
     if !canonical.is_dir() {
@@ -4653,8 +4655,7 @@ impl LiveCli {
         let auth_mode_str = self
             .config
             .auth_mode
-            .map(|m| m.label().to_string())
-            .unwrap_or_else(|| "auto".to_string());
+            .map_or_else(|| "auto".to_string(), |m| m.label().to_string());
 
         // Endpoint from config-driven resolution.
         let config = &self.config.sudocode_config;
@@ -5210,15 +5211,14 @@ impl LiveCli {
         let current_str = self
             .config
             .auth_mode
-            .map(|m| m.as_str().to_string())
-            .unwrap_or_else(|| "auto".to_string());
+            .map_or_else(|| "auto".to_string(), |m| m.as_str().to_string());
 
         let Some(mode) = mode else {
             println!("{}", format_auth_report(&current_str));
             return Ok(false);
         };
 
-        let parsed = AuthMode::parse(&mode).map_err(|e| e)?;
+        let parsed = AuthMode::parse(&mode)?;
 
         if parsed.as_str() == current_str {
             println!("{}", format_auth_report(&current_str));
@@ -7855,11 +7855,14 @@ impl AnthropicRuntimeClient {
             api::resolve_provider_from_config(&config.model, effective_mode, sudocode_config)?;
         let client = ApiProviderClient::from_resolved(&resolved, effective_mode)?
             .with_prompt_cache(PromptCache::new(session_id));
+        // Use the wire model ID from config resolution (not the alias) for API
+        // requests, so that e.g. alias "codex" sends "gpt-5.4-mini" on the wire.
+        let wire_model = resolved.model_id;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
             session_id: session_id.to_string(),
-            model: config.model.clone(),
+            model: wire_model,
             enable_tools: config.enable_tools,
             emit_output: config.emit_output,
             allowed_tools: config.allowed_tools.clone(),

@@ -144,6 +144,57 @@ impl ProviderClient {
                 Ok(Self::Anthropic(client))
             }
             ApiFormat::OpenAiCompletions | ApiFormat::OpenAiResponses => {
+                // Codex uses its own client (Responses API + special headers).
+                if resolved.kind == ProviderKind::Codex {
+                    return match &resolved.credential {
+                        Credential::AuthFile(path) => {
+                            let content = std::fs::read_to_string(path).map_err(|e| {
+                                ApiError::Configuration(format!(
+                                    "failed to read codex auth file {}: {e}",
+                                    path.display()
+                                ))
+                            })?;
+                            let parsed: serde_json::Value = serde_json::from_str(&content)
+                                .map_err(|e| {
+                                    ApiError::Configuration(format!(
+                                        "failed to parse codex auth file {}: {e}",
+                                        path.display()
+                                    ))
+                                })?;
+                            // Support both nested (`tokens.access_token`) and flat
+                            // (`access_token`) layouts.
+                            let tokens = parsed.get("tokens").unwrap_or(&parsed);
+                            let access_token = tokens
+                                .get("access_token")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| {
+                                    ApiError::Configuration(
+                                        "codex auth file missing 'access_token' field".to_string(),
+                                    )
+                                })?
+                                .to_string();
+                            let account_id = tokens
+                                .get("account_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            Ok(Self::Codex(CodexClient::new(
+                                resolved.base_url.clone(),
+                                access_token,
+                                account_id,
+                            )))
+                        }
+                        Credential::Token(token) => Ok(Self::Codex(CodexClient::new(
+                            resolved.base_url.clone(),
+                            token.clone(),
+                            String::new(),
+                        ))),
+                        _ => Err(ApiError::Configuration(
+                            "codex provider requires authFile or token credential".to_string(),
+                        )),
+                    };
+                }
+
                 // Build OpenAiCompatClient with the resolved credential + base URL.
                 let api_key = match &resolved.credential {
                     Credential::ApiKey(key) => key.clone(),

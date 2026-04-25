@@ -134,14 +134,11 @@ fn env_present(key: &str) -> bool {
 /// Codex CLI has written subscription credentials.
 #[must_use]
 pub fn codex_auth_file_exists() -> bool {
-    std::env::var("HOME")
-        .ok()
-        .map(|home| {
-            std::path::Path::new(&home)
-                .join(".codex/auth.json")
-                .exists()
-        })
-        .unwrap_or(false)
+    std::env::var("HOME").ok().is_some_and(|home| {
+        std::path::Path::new(&home)
+            .join(".codex/auth.json")
+            .exists()
+    })
 }
 
 #[allow(dead_code)]
