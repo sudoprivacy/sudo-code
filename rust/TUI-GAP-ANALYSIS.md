@@ -356,6 +356,95 @@ AlternateScreen (mouseTracking)
 
 ---
 
+## 11. Slash Commands
+
+### What TS does
+
+~67 implemented commands, most rendering as interactive React components (`local-jsx` type).
+
+Key commands: `/help`, `/status`, `/model`, `/config`, `/diff`, `/compact`, `/clear`, `/cost`, `/export`, `/resume`, `/session`, `/mcp`, `/memory`, `/init`, `/doctor`, `/permissions`, `/theme`, `/plan`, `/review`, `/tasks`, `/vim`, `/files`, `/context`, `/effort`, `/fast`, `/copy`, `/rename`, `/hooks`, `/keybindings`, `/privacy-settings`, `/color`, `/usage`, `/stats`, `/skills`, `/agents`, `/plugins`, `/add-dir`, `/branch`, `/rewind`, `/tag`, `/ide`, `/desktop`, `/feedback`, `/upgrade`, `/login`, `/logout`, `/release-notes`, `/voice`, `/stickers`, `/insights`
+
+Commands like `/help`, `/status`, `/config`, `/model`, `/theme`, `/permissions` render as **full interactive panes** (`Pane` component with `Divider`, keyboard navigation, input fields). `/resume` uses a **fuzzy picker**. `/model` shows an **interactive list** of models.
+
+### What Rust does
+
+**31 implemented, 38 stubs** (print "not yet implemented").
+
+**Implemented** (`main.rs:4776-4893` — `handle_repl_command()`):
+
+| Command | What it does |
+|---------|-------------|
+| `/help` | Prints text help (no interactive pane) |
+| `/status` | Prints text status report |
+| `/model [name]` | Sets model or prints current (no picker) |
+| `/permissions [mode]` | Sets mode or prints current (no picker) |
+| `/auth [mode]` | Sets auth mode (added in `de86b1a`) |
+| `/compact` | Compacts session history |
+| `/clear [--confirm]` | Clears session |
+| `/cost` | Prints token usage |
+| `/resume <path>` | Loads session from file path (no picker) |
+| `/config [section]` | Prints config as text |
+| `/mcp [action] [target]` | Inspects MCP servers |
+| `/memory` | Prints loaded memory files |
+| `/init` | Creates starter CLAUDE.md |
+| `/diff` | Prints raw git diff text |
+| `/version` | Prints version |
+| `/export [file]` | Exports conversation to file |
+| `/session [action] [id]` | Lists/switches/forks/deletes sessions |
+| `/plugins [action] [target]` | Manages plugins |
+| `/agents [args]` | Lists agents |
+| `/skills [args]` | Lists/invokes skills |
+| `/doctor` | Runs diagnostics |
+| `/history [count]` | Shows prompt history |
+| `/stats` | Shows session statistics |
+| `/bughunter [scope]` | Runs bug inspection prompt |
+| `/commit` | Generates commit message |
+| `/pr [context]` | Drafts pull request |
+| `/issue [context]` | Drafts GitHub issue |
+| `/ultraplan [task]` | Runs deep planning prompt |
+| `/teleport [target]` | Searches workspace for symbol |
+| `/debug-tool-call` | Replays last tool call |
+| `/sandbox` | Shows sandbox status |
+
+**Stubs** (`main.rs:4895-4932` — all print `"command.slash_name() is not yet implemented"`):
+
+`/login`, `/logout`, `/vim`, `/upgrade`, `/share`, `/feedback`, `/files`, `/fast`, `/summary`, `/desktop`, `/brief`, `/advisor`, `/stickers`, `/insights`, `/thinkback`, `/release-notes`, `/security-review`, `/keybindings`, `/privacy-settings`, `/plan`, `/review`, `/tasks`, `/theme`, `/voice`, `/usage`, `/rename`, `/copy`, `/hooks`, `/context`, `/color`, `/effort`, `/branch`, `/rewind`, `/ide`, `/tag`, `/output-style`, `/add-dir`
+
+### Gap
+
+| Aspect | TS | Rust |
+|--------|:--:|:----:|
+| Implemented commands | ~67 | 31 |
+| Stub commands | 0 | 38 |
+| Display style | Interactive React panes, pickers, forms | Plain text `println!()` |
+| `/help` | Formatted pane with categories | Text list |
+| `/model` | Interactive model picker | Set by argument or print current |
+| `/resume` | Fuzzy session picker | Requires exact session path |
+| `/theme` | Interactive theme picker with live preview | Stub |
+| `/plan` | Plan mode toggle with UI | Stub |
+| `/files` | Lists files in context | Stub |
+| `/vim` | Toggles vim keybindings | Stub |
+| `/tasks` | Interactive task manager | Stub |
+| `/context` | Context usage visualization | Stub |
+| `/copy` | Copy to clipboard | Stub |
+| `/hooks` | Hook configuration viewer | Stub |
+| `/effort` | Set reasoning effort | Stub |
+| `/review` | Code review runner | Stub |
+
+**High-priority missing implementations** (functional, not cosmetic):
+1. `/plan` — plan mode is a core workflow feature
+2. `/files` — seeing what's in context is essential
+3. `/context` — context window usage visibility
+4. `/tasks` — background task management
+5. `/review` — code review workflow
+6. `/vim` — vim users expect this
+7. `/copy` — clipboard access
+8. `/effort` — controls reasoning quality
+9. `/theme` — basic dark/light switching
+10. `/hooks` — hook inspection
+
+---
+
 ## Summary: Gaps Ranked by Functional Impact
 
 Ranked by how much they affect usability — animation/visual polish gaps excluded per decision.
