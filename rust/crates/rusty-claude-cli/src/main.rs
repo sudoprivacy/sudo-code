@@ -361,12 +361,11 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 
 /// Returns `true` for CLI actions that require a valid `sudocode.json`
 /// config file (model registry) to operate. Introspection-only commands
-/// (version, help, status, doctor, etc.) do not.
+/// (version, help, status, doctor, etc.) do not. ACP is excluded
+/// because its protocol handshake does not need model resolution;
+/// config is loaded lazily when actual API calls are made.
 fn action_requires_sudocode_config(action: &CliAction) -> bool {
-    matches!(
-        action,
-        CliAction::Prompt { .. } | CliAction::Repl { .. } | CliAction::Acp { .. }
-    )
+    matches!(action, CliAction::Prompt { .. } | CliAction::Repl { .. })
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
