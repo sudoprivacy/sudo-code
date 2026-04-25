@@ -36,7 +36,6 @@ pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
     resolve_model_alias, AuthMode, ProviderKind,
 };
-pub use providers::{resolve_auth_mode, validate_auth_env};
 pub use sse::{parse_frame, SseParser};
 pub use types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
