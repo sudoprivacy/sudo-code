@@ -208,6 +208,7 @@ impl GeminiClient {
             .post(&url)
             .header("authorization", format!("Bearer {token}"))
             .header("content-type", "application/json")
+            .header("user-agent", gemini_cli_user_agent("unknown"))
             .json(&json!({}))
             .send()
             .await?;
@@ -285,7 +286,8 @@ impl GeminiClient {
         let mut req_builder = self
             .http
             .post(&url)
-            .header("content-type", "application/json");
+            .header("content-type", "application/json")
+            .header("user-agent", gemini_cli_user_agent(&request.model));
 
         if self.is_subscription {
             req_builder = req_builder.header("authorization", format!("Bearer {token}"));
@@ -306,6 +308,16 @@ impl GeminiClient {
             state: StreamState::new(request.model.clone()),
         })
     }
+}
+
+fn gemini_cli_user_agent(model: &str) -> String {
+    format!(
+        "GeminiCLI/{}/{} ({}; {}; terminal)",
+        env!("CARGO_PKG_VERSION"),
+        model,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
 }
 
 fn now_epoch_ms() -> u64 {
