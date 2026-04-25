@@ -171,16 +171,16 @@ const MODEL_SPECS: &[(&str, ModelTokenLimit)] = &[
             context_window_tokens: 200_000,
         },
     ),
-    // Gemini (native)
+    // Gemini
     (
-        "gemini-2.5-flash",
+        "gemini-3.1-pro-preview",
         ModelTokenLimit {
             max_output_tokens: 65_536,
             context_window_tokens: 1_048_576,
         },
     ),
     (
-        "gemini-2.5-pro",
+        "gemini-3-flash-preview",
         ModelTokenLimit {
             max_output_tokens: 65_536,
             context_window_tokens: 1_048_576,

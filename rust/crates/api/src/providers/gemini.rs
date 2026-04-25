@@ -939,7 +939,7 @@ mod tests {
     #[test]
     fn build_gemini_request_includes_system_and_messages() {
         let request = MessageRequest {
-            model: "gemini-2.5-flash".to_string(),
+            model: "gemini-3.1-pro-preview".to_string(),
             max_tokens: 16_384,
             messages: vec![InputMessage::user_text("Hello")],
             system: Some("You are helpful.".to_string()),
@@ -963,7 +963,7 @@ mod tests {
     #[test]
     fn build_gemini_request_translates_tool_use_to_function_call() {
         let request = MessageRequest {
-            model: "gemini-2.5-pro".to_string(),
+            model: "gemini-3-flash-preview".to_string(),
             max_tokens: 16_384,
             messages: vec![
                 InputMessage::user_text("What's the weather?"),
@@ -1025,7 +1025,7 @@ mod tests {
 
     #[test]
     fn stream_state_text_response() {
-        let mut state = StreamState::new("gemini-2.5-flash".to_string());
+        let mut state = StreamState::new("gemini-3.1-pro-preview".to_string());
 
         let frame = |data: &str| SseFrame {
             data: data.to_string(),
@@ -1073,7 +1073,7 @@ mod tests {
 
     #[test]
     fn stream_state_tool_call() {
-        let mut state = StreamState::new("gemini-2.5-pro".to_string());
+        let mut state = StreamState::new("gemini-3-flash-preview".to_string());
 
         let frame = |data: &str| SseFrame {
             data: data.to_string(),
