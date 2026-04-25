@@ -138,37 +138,35 @@ pub fn resolve_provider_from_config(
     })?;
 
     // 2. Determine the auth mode to use.
-    let auth_mode_str = match explicit_auth {
-        Some(mode) => {
-            let s = mode.as_str();
-            if !model_config.providers.contains_key(s) {
-                return Err(ApiError::Configuration(format!(
-                    "auth mode '{}' is not available for model '{}'. Available: {}",
-                    s,
-                    model_alias,
-                    model_config
-                        .providers
-                        .keys()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
-            }
-            s.to_string()
+    let auth_mode_str = if let Some(mode) = explicit_auth {
+        let s = mode.as_str();
+        if !model_config.providers.contains_key(s) {
+            return Err(ApiError::Configuration(format!(
+                "auth mode '{}' is not available for model '{}'. Available: {}",
+                s,
+                model_alias,
+                model_config
+                    .providers
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
-        None => {
-            // Pick first available (BTreeMap is lexicographically sorted).
-            model_config
-                .providers
-                .keys()
-                .next()
-                .cloned()
-                .ok_or_else(|| {
-                    ApiError::Configuration(format!(
-                        "model '{model_alias}' has no provider mappings in sudocode.json"
-                    ))
-                })?
-        }
+        s.to_string()
+    } else {
+        // Auto-detect from model config: pick the first auth mode the
+        // model supports in priority order subscription > proxy > api-key.
+        const PRIORITY: &[&str] = &["subscription", "proxy", "api-key"];
+        PRIORITY
+            .iter()
+            .find(|m| model_config.providers.contains_key(**m))
+            .map(|m| (*m).to_string())
+            .ok_or_else(|| {
+                ApiError::Configuration(format!(
+                    "model '{model_alias}' has no provider mappings in sudocode.json"
+                ))
+            })?
     };
 
     // 3. Get the provider mapping for this auth mode.

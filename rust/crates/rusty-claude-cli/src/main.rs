@@ -30,8 +30,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    base_url_for_mode, detect_provider_kind, resolve_auth_mode, resolve_startup_auth_source,
-    validate_auth_env, AnthropicClient, AuthMode, AuthSource, ContentBlockDelta, InputContentBlock,
+    base_url_for_mode, detect_provider_kind, resolve_startup_auth_source, AnthropicClient,
+    AuthMode, AuthSource, ContentBlockDelta, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
     ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
     ToolDefinition, ToolResultContentBlock,
@@ -1733,7 +1733,13 @@ fn format_connected_line_with_config(
         || provider_label(detect_provider_kind(model)).to_string(),
         String::from,
     );
-    let resolved_mode = mode.or_else(|| resolve_auth_mode(None).ok());
+    let resolved_mode = mode.or_else(|| {
+        // Auto-detect from model config: first available in priority order.
+        const PRIORITY: &[&str] = &["subscription", "proxy", "api-key"];
+        let entry = sudocode_config.models.get(&model.to_ascii_lowercase())?;
+        let mode_str = PRIORITY.iter().find(|m| entry.providers.contains_key(**m))?;
+        AuthMode::parse(mode_str).ok()
+    });
     let auth_hint = match resolved_mode {
         Some(m) => format!(" ({})", m.label()),
         None => String::new(),
