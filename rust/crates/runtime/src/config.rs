@@ -410,11 +410,11 @@ impl ConfigLoader {
         let path = self.config_home.join("sudocode.json");
         if !path.exists() {
             return Err(ConfigError::Parse(format!(
-                "missing sudocode.json: expected at {}\n\
-                 Create this file to configure models and providers.\n\
-                 A sample is available in the repository at \
-                 crates/runtime/src/sudocode.sample.json",
-                path.display()
+                "missing sudocode.json: expected at {path}\n\
+                 Create this file to configure models and providers.\n\n\
+                 To get started, copy the sample config:\n  \
+                 cp crates/runtime/src/sudocode.sample.json {path}",
+                path = path.display()
             )));
         }
         parse_sudocode_json(&path)
