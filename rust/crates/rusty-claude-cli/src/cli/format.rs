@@ -997,6 +997,22 @@ pub(crate) fn truncate_for_summary(value: &str, limit: usize) -> String {
     }
 }
 
+pub(crate) fn format_turn_status_line(
+    model: &str,
+    turn: u32,
+    usage: &TokenUsage,
+    elapsed: Duration,
+) -> String {
+    let total = usage.total_tokens();
+    let tokens_display = if total >= 1000 {
+        format!("{:.1}k", f64::from(total) / 1000.0)
+    } else {
+        total.to_string()
+    };
+    let secs = elapsed.as_secs_f64();
+    format!("\x1b[2m[{model}] · turn {turn} · {tokens_display} tokens · {secs:.1}s\x1b[0m")
+}
+
 pub(crate) fn truncate_output_for_display(
     content: &str,
     max_lines: usize,
