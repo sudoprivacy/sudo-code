@@ -406,8 +406,11 @@ impl ConfigLoader {
         let path = self.config_home.join("sudocode.json");
         if path.exists() {
             let user = parse_sudocode_json(&path)?;
-            // User entries override builtins.
-            config.auth_modes.extend(user.auth_modes);
+            // Deep-merge auth_modes so user entries add to (not replace)
+            // the builtin provider maps within each auth mode.
+            for (mode, providers) in user.auth_modes {
+                config.auth_modes.entry(mode).or_default().extend(providers);
+            }
             config.models.extend(user.models);
         }
         Ok(config)

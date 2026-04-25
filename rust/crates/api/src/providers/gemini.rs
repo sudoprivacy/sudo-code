@@ -456,12 +456,71 @@ fn flatten_tool_result(content: &[ToolResultContentBlock]) -> String {
 fn gemini_function_declaration(tool: &ToolDefinition) -> Value {
     let mut decl = json!({
         "name": tool.name,
-        "parameters": tool.input_schema,
+        "parameters": sanitize_schema_for_gemini(&tool.input_schema),
     });
     if let Some(desc) = &tool.description {
         decl["description"] = json!(desc);
     }
     decl
+}
+
+/// Sanitize a JSON Schema value to be Gemini-compatible.
+///
+/// Gemini's proto-based API is stricter than `OpenAPI` / JSON Schema:
+/// - `type` must be a single string, not an array (e.g. `["string","null"]` → `"string"`)
+/// - `additionalProperties` is not supported and must be removed
+/// - Nested objects and arrays must be recursively sanitized
+fn sanitize_schema_for_gemini(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in map {
+                match key.as_str() {
+                    // Remove unsupported fields.
+                    "additionalProperties" | "$schema" | "default" => {}
+
+                    // Flatten type arrays: ["string","null"] → "string"
+                    "type" => {
+                        if let Some(arr) = value.as_array() {
+                            let non_null: Vec<&Value> =
+                                arr.iter().filter(|v| v.as_str() != Some("null")).collect();
+                            if non_null.len() == 1 {
+                                out.insert("type".to_string(), non_null[0].clone());
+                            } else if non_null.is_empty() {
+                                out.insert("type".to_string(), json!("string"));
+                            } else {
+                                // Multiple non-null types — pick the first.
+                                out.insert("type".to_string(), non_null[0].clone());
+                            }
+                        } else {
+                            out.insert("type".to_string(), value.clone());
+                        }
+                    }
+                    // Recursively sanitize nested schemas.
+                    "properties" => {
+                        if let Some(props) = value.as_object() {
+                            let mut sanitized_props = serde_json::Map::new();
+                            for (prop_key, prop_val) in props {
+                                sanitized_props
+                                    .insert(prop_key.clone(), sanitize_schema_for_gemini(prop_val));
+                            }
+                            out.insert("properties".to_string(), Value::Object(sanitized_props));
+                        } else {
+                            out.insert(key.clone(), value.clone());
+                        }
+                    }
+                    "items" => {
+                        out.insert("items".to_string(), sanitize_schema_for_gemini(value));
+                    }
+                    _ => {
+                        out.insert(key.clone(), sanitize_schema_for_gemini(value));
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -613,8 +672,12 @@ impl StreamState {
             return Ok(Vec::new());
         }
 
-        let json: Value = serde_json::from_str(&frame.data)
+        let raw: Value = serde_json::from_str(&frame.data)
             .map_err(|e| ApiError::json_deserialize("Gemini", &self.model, &frame.data, e))?;
+
+        // Cloud Code proxy wraps the response in a `response` envelope.
+        // Direct API responses have candidates at the top level.
+        let json = raw.get("response").unwrap_or(&raw);
 
         let mut events = Vec::new();
 
