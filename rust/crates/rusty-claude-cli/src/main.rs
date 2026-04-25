@@ -505,7 +505,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
+        CliAction::Login => run_login()?,
+        CliAction::Logout => run_logout()?,
     }
+    Ok(())
+}
+
+fn run_login() -> Result<(), Box<dyn std::error::Error>> {
+    let token_set = runtime::import_claude_code_credentials()
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    eprintln!("Login successful — imported credentials from Claude Code.");
+    if !token_set.scopes.is_empty() {
+        eprintln!("Scopes: {}", token_set.scopes.join(", "));
+    }
+    Ok(())
+}
+
+fn run_logout() -> Result<(), Box<dyn std::error::Error>> {
+    runtime::clear_oauth_credentials()?;
+    eprintln!("Logged out. Credentials cleared from keychain and file.");
     Ok(())
 }
 

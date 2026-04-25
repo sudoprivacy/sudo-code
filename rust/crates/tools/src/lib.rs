@@ -9461,7 +9461,9 @@ printf 'pwsh:%s' "$1"
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
+        let original_oauth = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN");
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
+        std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test-token");
         let fallback_config = ProviderFallbackConfig::default();
 
         // when
@@ -9480,6 +9482,10 @@ printf 'pwsh:%s' "$1"
             Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
             None => std::env::remove_var("ANTHROPIC_API_KEY"),
         }
+        match original_oauth {
+            Some(value) => std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", value),
+            None => std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN"),
+        }
     }
 
     #[test]
@@ -9490,8 +9496,10 @@ printf 'pwsh:%s' "$1"
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
         let original_xai = std::env::var_os("XAI_API_KEY");
+        let original_oauth = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN");
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
         std::env::set_var("XAI_API_KEY", "xai-test-key");
+        std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test-token");
         let fallback_config = ProviderFallbackConfig::new(
             None,
             vec!["grok-3".to_string(), "grok-3-mini".to_string()],
@@ -9519,6 +9527,10 @@ printf 'pwsh:%s' "$1"
             Some(value) => std::env::set_var("XAI_API_KEY", value),
             None => std::env::remove_var("XAI_API_KEY"),
         }
+        match original_oauth {
+            Some(value) => std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", value),
+            None => std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN"),
+        }
     }
 
     #[test]
@@ -9529,16 +9541,16 @@ printf 'pwsh:%s' "$1"
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
         let original_xai = std::env::var_os("XAI_API_KEY");
+        let original_oauth = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN");
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
         std::env::set_var("XAI_API_KEY", "xai-test-key");
-        let fallback_config = ProviderFallbackConfig::new(
-            Some("grok-3".to_string()),
-            vec!["claude-sonnet-4-6".to_string()],
-        );
+        std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test-token");
+        let fallback_config =
+            ProviderFallbackConfig::new(Some("grok-3".to_string()), vec!["sonnet".to_string()]);
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-haiku-4-5-20251213".to_string(),
+            "haiku".to_string(),
             BTreeSet::new(),
             &fallback_config,
         )
@@ -9557,6 +9569,10 @@ printf 'pwsh:%s' "$1"
             Some(value) => std::env::set_var("XAI_API_KEY", value),
             None => std::env::remove_var("XAI_API_KEY"),
         }
+        match original_oauth {
+            Some(value) => std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", value),
+            None => std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN"),
+        }
     }
 
     #[test]
@@ -9566,18 +9582,17 @@ printf 'pwsh:%s' "$1"
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
+        let original_oauth = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN");
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
+        std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test-token");
         let fallback_config = ProviderFallbackConfig::new(
             None,
-            vec![
-                "nonexistent-model-xyz".to_string(),
-                "claude-haiku-4-5-20251213".to_string(),
-            ],
+            vec!["nonexistent-model-xyz".to_string(), "haiku".to_string()],
         );
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-sonnet-4-6".to_string(),
+            "sonnet".to_string(),
             BTreeSet::new(),
             &fallback_config,
         )
@@ -9586,11 +9601,15 @@ printf 'pwsh:%s' "$1"
         // then — nonexistent-model-xyz is skipped, haiku succeeds
         assert_eq!(client.chain.len(), 2);
         assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
-        assert_eq!(client.chain[1].model, "claude-haiku-4-5-20251213");
+        assert_eq!(client.chain[1].model, "claude-haiku-4-5-20251001");
 
         match original_anthropic {
             Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
             None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        match original_oauth {
+            Some(value) => std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", value),
+            None => std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN"),
         }
     }
 

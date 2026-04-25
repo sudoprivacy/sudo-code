@@ -286,8 +286,7 @@ pub(crate) fn check_auth_health() -> DiagnosticCheck {
                     token_set.scopes.join(",")
                 }
             ),
-            "Suggested action  set ANTHROPIC_API_KEY or use --auth; `scode login` is removed"
-                .to_string(),
+            "Suggested action  run `scode login` to refresh, or set ANTHROPIC_API_KEY".to_string(),
         ])
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),

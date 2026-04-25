@@ -146,6 +146,8 @@ pub(crate) enum CliAction {
     Help {
         output_format: CliOutputFormat,
     },
+    Login,
+    Logout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,7 +547,8 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             reasoning_effort,
             auth_mode,
         ),
-        "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
+        "login" => Ok(CliAction::Login),
+        "logout" => Ok(CliAction::Logout),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
@@ -743,10 +746,6 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
         )
     };
     Some(guidance)
-}
-
-pub(crate) fn removed_auth_surface_error(command_name: &str) -> String {
-    format!("`scode {command_name}` has been removed. Set ANTHROPIC_API_KEY or use --auth instead.")
 }
 
 pub(crate) fn parse_acp_args(
