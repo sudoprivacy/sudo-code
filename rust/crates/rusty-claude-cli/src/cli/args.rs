@@ -1145,15 +1145,15 @@ pub(crate) fn load_sudocode_config_for_current_dir() -> api::SudoCodeConfig {
 
 /// Load `SudoCodeConfig` from the config home for a given directory.
 ///
-/// Falls back to `SudoCodeConfig::builtin()` if the config file is
-/// missing so that non-critical call-sites (model alias resolution,
-/// display helpers) keep working without a config file. Critical
-/// call-sites should call `require_sudocode_config_for_cwd` instead.
+/// Returns an empty config if `sudocode.json` is missing so that
+/// non-critical call-sites (model alias resolution, display helpers)
+/// degrade gracefully. Critical call-sites should use
+/// `require_sudocode_config_for_cwd` instead.
 pub(crate) fn load_sudocode_config_for_cwd(cwd: &Path) -> api::SudoCodeConfig {
     let loader = ConfigLoader::default_for(cwd);
     loader
         .load_sudocode_config()
-        .unwrap_or_else(|_| api::SudoCodeConfig::builtin())
+        .unwrap_or_default()
 }
 
 /// Load `SudoCodeConfig` or return a fatal error. Used during startup

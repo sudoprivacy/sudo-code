@@ -34,7 +34,8 @@ pub(crate) fn format_connected_line(model: &str) -> String {
 }
 
 pub(crate) fn format_connected_line_with_mode(model: &str, mode: Option<AuthMode>) -> String {
-    format_connected_line_with_config(model, mode, &api::SudoCodeConfig::builtin())
+    let config = load_sudocode_config_for_current_dir();
+    format_connected_line_with_config(model, mode, &config)
 }
 
 pub(crate) fn format_connected_line_with_config(
