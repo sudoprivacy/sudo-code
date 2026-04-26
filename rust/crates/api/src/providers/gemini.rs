@@ -38,6 +38,31 @@ struct OAuthCreds {
     client_id: Option<String>,
     #[serde(default)]
     client_secret: Option<String>,
+    /// JWT `id_token` — the `azp` claim contains the OAuth client ID.
+    #[serde(default)]
+    id_token: Option<String>,
+}
+
+impl OAuthCreds {
+    /// Resolve the OAuth client ID: explicit field, or extracted from the
+    /// `azp` claim in the `id_token` JWT.
+    fn resolve_client_id(&self) -> Option<String> {
+        if let Some(ref id) = self.client_id {
+            return Some(id.clone());
+        }
+        let token = self.id_token.as_deref()?;
+        let payload = token.split('.').nth(1)?;
+        let decoded = base64_decode_jwt_segment(payload)?;
+        let val: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+        val.get("azp").and_then(|v| v.as_str()).map(String::from)
+    }
+}
+
+/// Decode a base64url-encoded JWT segment (no padding required).
+fn base64_decode_jwt_segment(segment: &str) -> Option<Vec<u8>> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    URL_SAFE_NO_PAD.decode(segment).ok()
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,19 +168,19 @@ impl GeminiClient {
                     )
                 })?;
 
-                // Default Google Cloud Code client ID / secret (split to
-                // bypass GitHub push protection for public standard clients).
-                let default_client_id = format!(
-                    "{}-{}",
-                    "77364799047", "8urp5qkm1o5l5hvc3sflbkm63ds6lrhl.apps.googleusercontent.com"
-                );
-                let default_client_secret =
-                    format!("{}-{}", "GOCSPX", "4uHgMPm-1o7Sk-geV6Cu5clXFsxl");
-                let client_id_owned = creds.client_id.clone().unwrap_or(default_client_id);
-                let client_id = client_id_owned.as_str();
-                let client_secret_owned =
-                    creds.client_secret.clone().unwrap_or(default_client_secret);
-                let client_secret = client_secret_owned.as_str();
+                let client_id = creds.resolve_client_id().ok_or_else(|| {
+                    ApiError::Auth(
+                        "gemini OAuth token is expired and no client_id (or id_token with azp claim) is available in ~/.gemini/oauth_creds.json"
+                            .to_string(),
+                    )
+                })?;
+
+                let client_secret = creds.client_secret.as_deref().ok_or_else(|| {
+                    ApiError::Auth(
+                        "gemini OAuth token is expired and no client_secret is available in ~/.gemini/oauth_creds.json"
+                            .to_string(),
+                    )
+                })?;
 
                 let resp = self
                     .http
@@ -163,7 +188,7 @@ impl GeminiClient {
                     .form(&[
                         ("grant_type", "refresh_token"),
                         ("refresh_token", refresh_token),
-                        ("client_id", client_id),
+                        ("client_id", &client_id),
                         ("client_secret", client_secret),
                     ])
                     .send()

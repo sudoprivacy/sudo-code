@@ -14,6 +14,9 @@ use tools::GlobalToolRegistry;
 
 use super::format::{format_tool_call_start, format_user_visible_api_error};
 use crate::render::{MarkdownStreamState, TerminalRenderer};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use crate::{
     AllowedToolSet, InternalPromptProgressReporter, RuntimeConfig, POST_TOOL_STALL_TIMEOUT,
 };
@@ -35,6 +38,9 @@ pub(crate) struct AnthropicRuntimeClient {
     pub(crate) tool_registry: GlobalToolRegistry,
     pub(crate) progress_reporter: Option<InternalPromptProgressReporter>,
     pub(crate) reasoning_effort: Option<String>,
+    /// Shared flag from the Spinner. Set to `true` before writing output to
+    /// pause the spinner animation, `false` after to let it resume.
+    pub(crate) spinner_pause: Option<Arc<AtomicBool>>,
 }
 
 impl AnthropicRuntimeClient {
@@ -64,7 +70,31 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter: config.progress_reporter.clone(),
             reasoning_effort: None,
+            spinner_pause: None,
         })
+    }
+
+    pub(crate) fn set_spinner_pause(&mut self, flag: Arc<AtomicBool>) {
+        self.spinner_pause = Some(flag);
+    }
+
+    /// Pause the spinner and clear its line before writing content.
+    fn pause_spinner(&self) {
+        if let Some(flag) = &self.spinner_pause {
+            flag.store(true, Ordering::SeqCst);
+            // Brief sleep to let the spinner thread finish its current tick.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            // Clear the spinner text from the current line.
+            let _ = write!(io::stdout(), "\r\x1b[2K");
+            let _ = io::stdout().flush();
+        }
+    }
+
+    /// Resume the spinner after content has been written.
+    fn resume_spinner(&self) {
+        if let Some(flag) = &self.spinner_pause {
+            flag.store(false, Ordering::SeqCst);
+        }
     }
 
     pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) {
@@ -160,6 +190,7 @@ impl AnthropicRuntimeClient {
         let mut block_has_thinking_summary = false;
         let mut saw_stop = false;
         let mut received_any_event = false;
+        let mut glyph_state = ResponseGlyphState::new(query_terminal_width());
 
         loop {
             let next = if apply_stall_timeout && !received_any_event {
@@ -194,6 +225,7 @@ impl AnthropicRuntimeClient {
                             &mut pending_tool,
                             true,
                             &mut block_has_thinking_summary,
+                            &mut glyph_state,
                         )?;
                     }
                 }
@@ -205,6 +237,7 @@ impl AnthropicRuntimeClient {
                         &mut pending_tool,
                         true,
                         &mut block_has_thinking_summary,
+                        &mut glyph_state,
                     )?;
                 }
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
@@ -214,7 +247,9 @@ impl AnthropicRuntimeClient {
                                 progress_reporter.mark_text_phase(&text);
                             }
                             if let Some(rendered) = markdown_stream.push(&renderer, &text) {
-                                write!(out, "{rendered}")
+                                self.pause_spinner();
+                                let prefixed = glyph_state.apply(&rendered);
+                                write!(out, "{prefixed}")
                                     .and_then(|()| out.flush())
                                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                             }
@@ -228,8 +263,10 @@ impl AnthropicRuntimeClient {
                     }
                     ContentBlockDelta::ThinkingDelta { .. } => {
                         if !block_has_thinking_summary {
+                            self.pause_spinner();
                             render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
+                            glyph_state.visible_col = 0;
                         }
                     }
                     ContentBlockDelta::SignatureDelta { .. } => {}
@@ -237,7 +274,8 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        write!(out, "{rendered}")
+                        let prefixed = glyph_state.apply(&rendered);
+                        write!(out, "{prefixed}")
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                     }
@@ -245,10 +283,13 @@ impl AnthropicRuntimeClient {
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
-                        // Display tool call now that input is fully accumulated
+                        self.pause_spinner();
                         writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        glyph_state.visible_col = 0;
+                        // Resume spinner so it shows during tool execution.
+                        self.resume_spinner();
                         events.push(AssistantEvent::ToolUse {
                             id,
                             name,
@@ -263,7 +304,8 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        write!(out, "{rendered}")
+                        let prefixed = glyph_state.apply(&rendered);
+                        write!(out, "{prefixed}")
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                     }
@@ -405,15 +447,105 @@ pub(crate) fn render_thinking_block_summary(
     redacted: bool,
 ) -> Result<(), RuntimeError> {
     let summary = if redacted {
-        "\n▶ Thinking block hidden by provider\n".to_string()
+        "\n  ▶ Thinking block hidden by provider\n".to_string()
     } else if let Some(char_count) = char_count {
-        format!("\n▶ Thinking ({char_count} chars hidden)\n")
+        format!("\n  ▶ Thinking ({char_count} chars hidden)\n")
     } else {
-        "\n▶ Thinking hidden\n".to_string()
+        "\n  ▶ Thinking hidden\n".to_string()
     };
     write!(out, "{summary}")
         .and_then(|()| out.flush())
         .map_err(|error| RuntimeError::new(error.to_string()))
+}
+
+/// Stateful processor that prefixes the first line with ⏺ (bold) and indents
+/// all continuation lines by two spaces so that column 0 is reserved
+/// exclusively for status glyphs. Hard-wraps text at the terminal width so
+/// the terminal never soft-wraps into column 0.
+pub(crate) struct ResponseGlyphState {
+    started: bool,
+    visible_col: usize,
+    max_col: usize,
+    in_escape: bool,
+}
+
+impl ResponseGlyphState {
+    fn new(terminal_width: usize) -> Self {
+        Self {
+            started: false,
+            visible_col: 0,
+            // Ensure at least 4 columns to avoid degenerate wrapping.
+            max_col: terminal_width.max(4),
+            in_escape: false,
+        }
+    }
+
+    /// Process a rendered ANSI text chunk. Returns the wrapped+margined output.
+    fn apply(&mut self, rendered: &str) -> String {
+        if rendered.is_empty() {
+            return String::new();
+        }
+
+        let mut out = String::with_capacity(rendered.len() + 64);
+
+        for ch in rendered.chars() {
+            if ch == '\r' {
+                out.push(ch);
+                self.visible_col = 0;
+                continue;
+            }
+            if ch == '\n' {
+                out.push(ch);
+                self.visible_col = 0;
+                continue;
+            }
+
+            // At line start, emit glyph or margin.
+            if self.visible_col == 0 {
+                if self.started {
+                    out.push_str("  ");
+                } else {
+                    self.started = true;
+                    out.push_str("\r\x1b[2K\x1b[1m⏺\x1b[0m ");
+                }
+                self.visible_col = 2;
+            }
+
+            // ANSI escape start.
+            if ch == '\x1b' {
+                self.in_escape = true;
+                out.push(ch);
+                continue;
+            }
+
+            // Inside an ANSI CSI sequence — push until ASCII letter terminates.
+            if self.in_escape {
+                out.push(ch);
+                if ch.is_ascii_alphabetic() {
+                    self.in_escape = false;
+                }
+                continue;
+            }
+
+            // Hard wrap: line has reached the terminal edge.
+            if self.visible_col >= self.max_col {
+                out.push('\n');
+                out.push_str("  ");
+                self.visible_col = 2;
+            }
+
+            out.push(ch);
+            self.visible_col += 1;
+        }
+
+        out
+    }
+}
+
+fn query_terminal_width() -> usize {
+    crossterm::terminal::size()
+        .map(|(cols, _)| cols as usize)
+        .unwrap_or(80)
 }
 
 pub(crate) fn push_output_block(
@@ -423,12 +555,14 @@ pub(crate) fn push_output_block(
     pending_tool: &mut Option<(String, String, String, Option<String>)>,
     streaming_tool_input: bool,
     block_has_thinking_summary: &mut bool,
+    glyph_state: &mut ResponseGlyphState,
 ) -> Result<(), RuntimeError> {
     match block {
         OutputContentBlock::Text { text } => {
             if !text.is_empty() {
                 let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
-                write!(out, "{rendered}")
+                let prefixed = glyph_state.apply(&rendered);
+                write!(out, "{prefixed}")
                     .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 events.push(AssistantEvent::TextDelta(text));
@@ -456,10 +590,12 @@ pub(crate) fn push_output_block(
         OutputContentBlock::Thinking { thinking, .. } => {
             render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
             *block_has_thinking_summary = true;
+            glyph_state.visible_col = 0;
         }
         OutputContentBlock::RedactedThinking { .. } => {
             render_thinking_block_summary(out, None, true)?;
             *block_has_thinking_summary = true;
+            glyph_state.visible_col = 0;
         }
     }
     Ok(())
@@ -471,6 +607,7 @@ pub(crate) fn response_to_events(
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
+    let mut glyph_state = ResponseGlyphState::new(query_terminal_width());
 
     for block in response.content {
         let mut block_has_thinking_summary = false;
@@ -481,6 +618,7 @@ pub(crate) fn response_to_events(
             &mut pending_tool,
             false,
             &mut block_has_thinking_summary,
+            &mut glyph_state,
         )?;
         if let Some((id, name, input, thought_signature)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse {

@@ -17,7 +17,7 @@ mod init;
 mod input;
 mod render;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -59,8 +59,8 @@ use cli::format::{
     format_commit_skipped_report, format_compact_report, format_cost_report,
     format_internal_prompt_progress_line, format_issue_report, format_model_report,
     format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-    format_pr_report, format_resume_report, format_sandbox_report, format_ultraplan_report,
-    render_resume_usage, render_version_report, truncate_for_summary,
+    format_pr_report, format_resume_report, format_sandbox_report, format_turn_status_line,
+    format_ultraplan_report, render_resume_usage, render_version_report, truncate_for_summary,
 };
 use cli::git::{
     enforce_broad_cwd_policy, git_output, parse_git_status_branch, parse_git_status_metadata,
@@ -92,6 +92,7 @@ use commands::{
     slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
+use dialoguer::{FuzzySelect, Select};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
@@ -1276,17 +1277,39 @@ fn run_repl(
     )?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
-        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
+        input::LineEditor::new("❯ ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
+        let term_width = crossterm::terminal::size()
+            .map(|(cols, _)| cols as usize)
+            .unwrap_or(80);
+        let separator = format!("\x1b[2m{}\x1b[0m", "─".repeat(term_width));
+        let footer = "  \x1b[2m/help · /status · Tab for /commands\x1b[0m";
+        // Print the entire input chrome block: top sep, prompt placeholder,
+        // bottom sep, footer.  Then move the cursor back to the prompt line
+        // so read_line() renders there — the user sees all four elements at once.
+        println!("{separator}");
+        println!();
+        println!("{separator}");
+        print!("{footer}");
+        print!("\x1b[2F\x1b[2K"); // cursor up 2 lines, clear prompt placeholder
+        std::io::Write::flush(&mut std::io::stdout())?;
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
+                // Clear pre-printed bottom sep + footer
+                print!("\x1b[J");
+                // Replace prompt line with gray-background echo of user input
                 let trimmed = input.trim().to_string();
-                if trimmed.is_empty() {
-                    continue;
-                }
+                let echo_display = format!(" › {}", trimmed.replace('\n', " "));
+                let pad = term_width.saturating_sub(echo_display.chars().count());
+                print!(
+                    "\x1b[1F\x1b[2K\x1b[48;5;236m{echo_display}{}\x1b[0m",
+                    " ".repeat(pad)
+                );
+                println!();
+                println!("{separator}");
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
                     cli.persist_session()?;
                     break;
@@ -1330,7 +1353,6 @@ fn run_repl(
                     eprintln!("\x1b[31m{e}\x1b[0m");
                 }
             }
-            input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
                 cli.persist_session()?;
                 break;
@@ -1696,6 +1718,24 @@ impl HookAbortMonitor {
     }
 }
 
+/// Measure visible string width by stripping ANSI escape sequences.
+fn strip_ansi_width(s: &str) -> usize {
+    let mut width = 0;
+    let mut in_escape = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+        } else if in_escape {
+            if c == 'm' {
+                in_escape = false;
+            }
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
 impl LiveCli {
     fn new(
         model: String,
@@ -1776,37 +1816,66 @@ impl LiveCli {
         .map(|r| r.base_url)
         .unwrap_or_default();
 
-        format!(
-            "\x1b[38;5;117m\
+        let logo = "\x1b[38;5;117m\
 ███████╗██╗   ██╗██████╗  ██████╗ \n\
 ██╔════╝██║   ██║██╔══██╗██╔═══██╗\n\
 ███████╗██║   ██║██║  ██║██║   ██║\n\
 ╚════██║██║   ██║██║  ██║██║   ██║\n\
 ███████║╚██████╔╝██████╔╝╚██████╔╝\n\
-╚══════╝ ╚═════╝ ╚═════╝  ╚═════╝\x1b[0m \x1b[38;5;208mCode\x1b[0m\n\n\
-  \x1b[2mModel\x1b[0m            {}\n\
-  \x1b[2mAuth mode\x1b[0m        {}\n\
-  \x1b[2mEndpoint\x1b[0m         {}\n\
-  \x1b[2mPermissions\x1b[0m      {}\n\
-  \x1b[2mBranch\x1b[0m           {}\n\
-  \x1b[2mWorkspace\x1b[0m        {}\n\
-  \x1b[2mDirectory\x1b[0m        {}\n\
-  \x1b[2mSession\x1b[0m          {}\n\
-  \x1b[2mAuto-save\x1b[0m        {}\n\n\
-  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
-            self.config.model,
-            auth_mode_str,
-            endpoint,
-            self.config.permission_mode.as_str(),
-            git_branch,
-            workspace,
-            cwd,
-            self.session.id,
-            session_path,
+╚══════╝ ╚═════╝ ╚═════╝  ╚═════╝\x1b[0m \x1b[38;5;208mCode\x1b[0m";
+
+        let lines = [
+            format!("  \x1b[2mModel\x1b[0m            {}", self.config.model),
+            format!("  \x1b[2mAuth mode\x1b[0m        {}", auth_mode_str),
+            format!("  \x1b[2mEndpoint\x1b[0m         {}", endpoint),
+            format!(
+                "  \x1b[2mPermissions\x1b[0m      {}",
+                self.config.permission_mode.as_str()
+            ),
+            format!("  \x1b[2mBranch\x1b[0m           {}", git_branch),
+            format!("  \x1b[2mWorkspace\x1b[0m        {}", workspace),
+            format!("  \x1b[2mDirectory\x1b[0m        {}", cwd),
+            format!("  \x1b[2mSession\x1b[0m          {}", self.session.id),
+            format!("  \x1b[2mAuto-save\x1b[0m        {}", session_path),
+        ];
+
+        let max_width = lines.iter().map(|l| strip_ansi_width(l)).max().unwrap_or(0);
+        let box_width = max_width + 2; // 1 space padding on each side
+
+        let grey = "\x1b[38;5;245m";
+        let reset = "\x1b[0m";
+
+        let top = format!("{grey}╭{}╮{reset}", "─".repeat(box_width));
+        let bottom = format!("{grey}╰{}╯{reset}", "─".repeat(box_width));
+
+        let boxed_lines: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                let visible_width = strip_ansi_width(line);
+                let padding = max_width - visible_width;
+                format!(
+                    "{grey}│{reset} {}{} {grey}│{reset}",
+                    line,
+                    " ".repeat(padding)
+                )
+            })
+            .collect();
+
+        let hint = "  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for /command completions";
+
+        format!(
+            "{}\n\n{}\n{}\n{}\n\n{}",
+            logo,
+            top,
+            boxed_lines.join("\n"),
+            bottom,
+            hint,
         )
     }
 
-    fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    fn repl_completion_candidates(
+        &self,
+    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
         Ok(slash_command_completion_candidates_with_sessions(
             &self.config.model,
             Some(&self.session.id),
@@ -1843,32 +1912,40 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let turn_start = Instant::now();
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
-        spinner.tick(
+        spinner.start(
             "🦀 Thinking...",
+            Some(self.config.model.as_str()),
             TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
+        );
+        let pause_flag = spinner.pause_flag();
+        runtime
+            .api_client_mut()
+            .set_spinner_pause(pause_flag.clone());
+        runtime.tool_executor_mut().set_spinner_pause(pause_flag);
         let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                println!();
+                spinner.clear(&mut stdout)?;
                 if let Some(event) = summary.auto_compaction {
                     println!(
                         "{}",
                         format_auto_compaction_notice(event.removed_message_count)
                     );
                 }
+                let elapsed = turn_start.elapsed();
+                let usage = self.runtime.usage().current_turn_usage();
+                let turns = self.runtime.usage().turns();
+                println!(
+                    "{}",
+                    format_turn_status_line(&self.config.model, turns, &usage, elapsed)
+                );
                 self.persist_session()?;
                 Ok(())
             }
@@ -2238,15 +2315,21 @@ impl LiveCli {
 
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(model) = model else {
-            println!(
-                "{}",
-                format_model_report(
-                    &self.config.model,
-                    self.runtime.session().messages.len(),
-                    self.runtime.usage().turns(),
-                )
-            );
-            return Ok(false);
+            let sudocode_config = load_sudocode_config_for_current_dir();
+            let models: Vec<String> = sudocode_config.models.keys().cloned().collect();
+            if models.is_empty() {
+                println!("No models configured in sudocode.json");
+                return Ok(false);
+            }
+            let selection = FuzzySelect::new()
+                .with_prompt("Select model")
+                .items(&models)
+                .default(0)
+                .interact_opt()?;
+            return match selection {
+                Some(idx) => self.set_model(Some(models[idx].clone())),
+                None => Ok(false),
+            };
         };
 
         let model = resolve_model_alias_with_config(&model);
@@ -2381,8 +2464,24 @@ impl LiveCli {
         session_path: Option<String>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(session_ref) = session_path else {
-            println!("{}", render_resume_usage());
-            return Ok(false);
+            let sessions = list_managed_sessions()?;
+            if sessions.is_empty() {
+                println!("No sessions found.");
+                return Ok(false);
+            }
+            let labels: Vec<String> = sessions
+                .iter()
+                .map(|s| format!("{} ({} msgs)", s.id, s.message_count))
+                .collect();
+            let selection = Select::new()
+                .with_prompt("Select session to resume")
+                .items(&labels)
+                .default(0)
+                .interact_opt()?;
+            return match selection {
+                Some(idx) => self.resume_session(Some(sessions[idx].id.clone())),
+                None => Ok(false),
+            };
         };
 
         let (handle, session) = load_session_reference(&session_ref)?;
@@ -3215,31 +3314,51 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     ) -> runtime::PermissionPromptDecision {
         println!();
         println!("Permission approval required");
-        println!("  Tool             {}", request.tool_name);
-        println!("  Current mode     {}", self.current_mode.as_str());
-        println!("  Required mode    {}", request.required_mode.as_str());
+        println!("  Tool             \x1b[36m{}\x1b[0m", request.tool_name);
         if let Some(reason) = &request.reason {
-            println!("  Reason           {reason}");
+            println!("  Reason           \x1b[2m{reason}\x1b[0m");
         }
-        println!("  Input            {}", request.input);
-        print!("Approve this tool call? [y/N]: ");
-        let _ = io::stdout().flush();
 
-        let mut response = String::new();
-        match io::stdin().read_line(&mut response) {
-            Ok(_) => {
-                let normalized = response.trim().to_ascii_lowercase();
-                if matches!(normalized.as_str(), "y" | "yes") {
-                    runtime::PermissionPromptDecision::Allow
-                } else {
-                    runtime::PermissionPromptDecision::Deny {
-                        reason: format!(
-                            "tool '{}' denied by user approval prompt",
-                            request.tool_name
-                        ),
+        if !io::stdin().is_terminal() {
+            // Non-interactive fallback: read a line from stdin.
+            print!("Approve this tool call? [y/N]: ");
+            let _ = io::stdout().flush();
+            let mut response = String::new();
+            return match io::stdin().read_line(&mut response) {
+                Ok(_) => {
+                    let normalized = response.trim().to_ascii_lowercase();
+                    if matches!(normalized.as_str(), "y" | "yes") {
+                        runtime::PermissionPromptDecision::Allow
+                    } else {
+                        runtime::PermissionPromptDecision::Deny {
+                            reason: format!(
+                                "tool '{}' denied by user approval prompt",
+                                request.tool_name
+                            ),
+                        }
                     }
                 }
-            }
+                Err(error) => runtime::PermissionPromptDecision::Deny {
+                    reason: format!("permission approval failed: {error}"),
+                },
+            };
+        }
+
+        let items = &["Allow once", "Deny"];
+        let selection = Select::new()
+            .with_prompt("Approve this tool call?")
+            .items(items)
+            .default(0)
+            .interact_opt();
+
+        match selection {
+            Ok(Some(0)) => runtime::PermissionPromptDecision::Allow,
+            Ok(Some(_) | None) => runtime::PermissionPromptDecision::Deny {
+                reason: format!(
+                    "tool '{}' denied by user approval prompt",
+                    request.tool_name
+                ),
+            },
             Err(error) => runtime::PermissionPromptDecision::Deny {
                 reason: format!("permission approval failed: {error}"),
             },
@@ -3367,17 +3486,17 @@ fn slash_command_completion_candidates_with_sessions(
     model: &str,
     active_session_id: Option<&str>,
     recent_session_ids: Vec<String>,
-) -> Vec<String> {
-    let mut completions = BTreeSet::new();
+) -> Vec<(String, String)> {
+    let mut completions = BTreeMap::new();
 
     for spec in slash_command_specs() {
         if STUB_COMMANDS.contains(&spec.name) {
             continue;
         }
-        completions.insert(format!("/{}", spec.name));
+        completions.insert(format!("/{}", spec.name), spec.summary.to_string());
         for alias in spec.aliases {
             if !STUB_COMMANDS.contains(alias) {
-                completions.insert(format!("/{alias}"));
+                completions.insert(format!("/{alias}"), spec.summary.to_string());
             }
         }
     }
@@ -3425,23 +3544,35 @@ fn slash_command_completion_candidates_with_sessions(
         "/mcp help",
         "/skills help",
     ] {
-        completions.insert(candidate.to_string());
+        completions
+            .entry(candidate.to_string())
+            .or_insert_with(String::new);
     }
 
     // Add config-driven model aliases to /model completions.
     let sudocode_config = load_sudocode_config_for_current_dir();
     for alias in sudocode_config.models.keys() {
-        completions.insert(format!("/model {alias}"));
+        completions
+            .entry(format!("/model {alias}"))
+            .or_insert_with(String::new);
     }
 
     if !model.trim().is_empty() {
-        completions.insert(format!("/model {}", resolve_model_alias_with_config(model)));
-        completions.insert(format!("/model {model}"));
+        completions
+            .entry(format!("/model {}", resolve_model_alias_with_config(model)))
+            .or_insert_with(String::new);
+        completions
+            .entry(format!("/model {model}"))
+            .or_insert_with(String::new);
     }
 
     if let Some(active_session_id) = active_session_id.filter(|value| !value.trim().is_empty()) {
-        completions.insert(format!("/resume {active_session_id}"));
-        completions.insert(format!("/session switch {active_session_id}"));
+        completions
+            .entry(format!("/resume {active_session_id}"))
+            .or_insert_with(String::new);
+        completions
+            .entry(format!("/session switch {active_session_id}"))
+            .or_insert_with(String::new);
     }
 
     for session_id in recent_session_ids
@@ -3449,8 +3580,12 @@ fn slash_command_completion_candidates_with_sessions(
         .filter(|value| !value.trim().is_empty())
         .take(10)
     {
-        completions.insert(format!("/resume {session_id}"));
-        completions.insert(format!("/session switch {session_id}"));
+        completions
+            .entry(format!("/resume {session_id}"))
+            .or_insert_with(String::new);
+        completions
+            .entry(format!("/session switch {session_id}"))
+            .or_insert_with(String::new);
     }
 
     completions.into_iter().collect()

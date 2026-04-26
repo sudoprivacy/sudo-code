@@ -40,8 +40,8 @@
     }
   },
   "models": {
-    "opus": {
-      "alias": "opus",
+    "claude-opus": {
+      "alias": "claude-opus",
       "name": "Claude Opus 4.6",
       "input": ["text"],
       "providers": {
@@ -50,8 +50,8 @@
         "api-key":      { "provider": "anthropic", "model": "claude-opus-4-6" }
       }
     },
-    "sonnet": {
-      "alias": "sonnet",
+    "claude-sonnet": {
+      "alias": "claude-sonnet",
       "name": "Claude Sonnet 4.6",
       "input": ["text"],
       "providers": {
@@ -60,8 +60,8 @@
         "api-key":      { "provider": "anthropic", "model": "claude-sonnet-4-6" }
       }
     },
-    "haiku": {
-      "alias": "haiku",
+    "claude-haiku": {
+      "alias": "claude-haiku",
       "name": "Claude Haiku 4.5",
       "input": ["text"],
       "providers": {

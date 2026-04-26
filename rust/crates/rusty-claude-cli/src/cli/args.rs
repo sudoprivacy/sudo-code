@@ -1047,9 +1047,9 @@ pub(crate) fn levenshtein_distance(left: &str, right: &str) -> usize {
 
 pub(crate) fn resolve_model_alias(model: &str) -> &str {
     match model {
-        "opus" => "claude-opus-4-6",
-        "sonnet" => "claude-sonnet-4-6",
-        "haiku" => "claude-haiku-4-5-20251213",
+        "claude-opus" | "opus" => "claude-opus-4-6",
+        "claude-sonnet" | "sonnet" => "claude-sonnet-4-6",
+        "claude-haiku" | "haiku" => "claude-haiku-4-5-20251213",
         _ => model,
     }
 }
@@ -1084,7 +1084,9 @@ pub(crate) fn validate_model_syntax(model: &str) -> Result<(), String> {
     }
     // Known aliases are always valid
     match trimmed {
-        "opus" | "sonnet" | "haiku" => return Ok(()),
+        "claude-opus" | "claude-sonnet" | "claude-haiku" | "opus" | "sonnet" | "haiku" => {
+            return Ok(())
+        }
         _ => {}
     }
     // Check sudocode.json config for additional model aliases.

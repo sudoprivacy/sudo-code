@@ -10,23 +10,44 @@ use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{
-    Cmd, CompletionType, Config, Context, EditMode, Editor, Helper, KeyCode, KeyEvent, Modifiers,
+    Cmd, CompletionType, ConditionalEventHandler, Config, Context, EditMode, Editor, EventContext,
+    EventHandler, Helper, KeyCode, KeyEvent, Modifiers, RepeatCount,
 };
+
+/// Accept the line only when it contains non-whitespace text.
+/// When the line is empty, Enter is a no-op.
+struct AcceptNonEmpty;
+
+impl ConditionalEventHandler for AcceptNonEmpty {
+    fn handle(
+        &self,
+        _evt: &rustyline::Event,
+        _n: RepeatCount,
+        _positive: bool,
+        ctx: &EventContext<'_>,
+    ) -> Option<Cmd> {
+        if ctx.line().trim().is_empty() {
+            Some(Cmd::Noop)
+        } else {
+            Some(Cmd::AcceptLine)
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
     Submit(String),
-    Cancel,
     Exit,
 }
 
 struct SlashCommandHelper {
-    completions: Vec<String>,
+    /// Each entry is (command, description). Description may be empty.
+    completions: Vec<(String, String)>,
     current_line: RefCell<String>,
 }
 
 impl SlashCommandHelper {
-    fn new(completions: Vec<String>) -> Self {
+    fn new(completions: Vec<(String, String)>) -> Self {
         Self {
             completions: normalize_completions(completions),
             current_line: RefCell::new(String::new()),
@@ -47,7 +68,7 @@ impl SlashCommandHelper {
         current.push_str(line);
     }
 
-    fn set_completions(&mut self, completions: Vec<String>) {
+    fn set_completions(&mut self, completions: Vec<(String, String)>) {
         self.completions = normalize_completions(completions);
     }
 }
@@ -68,10 +89,14 @@ impl Completer for SlashCommandHelper {
         let matches = self
             .completions
             .iter()
-            .filter(|candidate| candidate.starts_with(prefix))
-            .map(|candidate| Pair {
-                display: candidate.clone(),
-                replacement: candidate.clone(),
+            .filter(|(cmd, _)| cmd.starts_with(prefix))
+            .map(|(cmd, desc)| Pair {
+                display: if desc.is_empty() {
+                    cmd.clone()
+                } else {
+                    format!("{cmd:<24} — {desc}")
+                },
+                replacement: cmd.clone(),
             })
             .collect();
 
@@ -107,7 +132,7 @@ pub struct LineEditor {
 
 impl LineEditor {
     #[must_use]
-    pub fn new(prompt: impl Into<String>, completions: Vec<String>) -> Self {
+    pub fn new(prompt: impl Into<String>, completions: Vec<(String, String)>) -> Self {
         let config = Config::builder()
             .completion_type(CompletionType::List)
             .edit_mode(EditMode::Emacs)
@@ -117,6 +142,10 @@ impl LineEditor {
         editor.set_helper(Some(SlashCommandHelper::new(completions)));
         editor.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
         editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::SHIFT), Cmd::Newline);
+        editor.bind_sequence(
+            KeyEvent(KeyCode::Enter, Modifiers::NONE),
+            EventHandler::Conditional(Box::new(AcceptNonEmpty)),
+        );
 
         Self {
             prompt: prompt.into(),
@@ -134,7 +163,7 @@ impl LineEditor {
         let _ = self.editor.add_history_entry(entry);
     }
 
-    pub fn set_completions(&mut self, completions: Vec<String>) {
+    pub fn set_completions(&mut self, completions: Vec<(String, String)>) {
         if let Some(helper) = self.editor.helper_mut() {
             helper.set_completions(completions);
         }
@@ -149,31 +178,49 @@ impl LineEditor {
             helper.reset_current_line();
         }
 
-        match self.editor.readline(&self.prompt) {
-            Ok(line) => {
-                self.pending_exit = false;
-                Ok(ReadOutcome::Submit(line))
-            }
-            Err(ReadlineError::Interrupted) => {
-                let has_input = !self.current_line().is_empty();
-                self.finish_interrupted_read()?;
-                if has_input {
+        loop {
+            match self.editor.readline(&self.prompt) {
+                Ok(line) => {
                     self.pending_exit = false;
-                    Ok(ReadOutcome::Cancel)
-                } else if self.pending_exit {
-                    Ok(ReadOutcome::Exit)
-                } else {
-                    self.pending_exit = true;
-                    let mut stdout = io::stdout();
-                    writeln!(stdout, "Press Ctrl-C again to exit.")?;
-                    Ok(ReadOutcome::Cancel)
+                    return Ok(ReadOutcome::Submit(line));
                 }
+                Err(ReadlineError::Interrupted) => {
+                    let has_input = !self.current_line().is_empty();
+                    self.finish_interrupted_read();
+
+                    let mut stdout = io::stdout();
+                    // Undo rustyline's newline: move cursor back to prompt line, clear it.
+                    write!(stdout, "\x1b[1F\x1b[2K")?;
+
+                    if has_input {
+                        // Had text — clear it and restart the prompt.
+                        self.pending_exit = false;
+                    } else if self.pending_exit {
+                        // Second Ctrl-C — clear remaining chrome and exit.
+                        writeln!(stdout, "\x1b[J")?;
+                        stdout.flush()?;
+                        return Ok(ReadOutcome::Exit);
+                    } else {
+                        self.pending_exit = true;
+                        // Show exit hint in the footer area (2 lines below prompt).
+                        write!(
+                            stdout,
+                            "\x1b[2E\x1b[2K  \x1b[2mPress Ctrl-C again to exit\x1b[0m\x1b[2F"
+                        )?;
+                    }
+
+                    stdout.flush()?;
+                    // Loop re-enters readline on the correct prompt line.
+                }
+                Err(ReadlineError::Eof) => {
+                    self.finish_interrupted_read();
+                    let mut stdout = io::stdout();
+                    writeln!(stdout, "\x1b[J")?;
+                    stdout.flush()?;
+                    return Ok(ReadOutcome::Exit);
+                }
+                Err(error) => return Err(io::Error::other(error)),
             }
-            Err(ReadlineError::Eof) => {
-                self.finish_interrupted_read()?;
-                Ok(ReadOutcome::Exit)
-            }
-            Err(error) => Err(io::Error::other(error)),
         }
     }
 
@@ -183,12 +230,10 @@ impl LineEditor {
             .map_or_else(String::new, SlashCommandHelper::current_line)
     }
 
-    fn finish_interrupted_read(&mut self) -> io::Result<()> {
+    fn finish_interrupted_read(&mut self) {
         if let Some(helper) = self.editor.helper_mut() {
             helper.reset_current_line();
         }
-        let mut stdout = io::stdout();
-        writeln!(stdout)
     }
 
     fn read_line_fallback(&self) -> io::Result<ReadOutcome> {
@@ -222,11 +267,11 @@ fn slash_command_prefix(line: &str, pos: usize) -> Option<&str> {
     Some(prefix)
 }
 
-fn normalize_completions(completions: Vec<String>) -> Vec<String> {
+fn normalize_completions(completions: Vec<(String, String)>) -> Vec<(String, String)> {
     let mut seen = BTreeSet::new();
     completions
         .into_iter()
-        .filter(|candidate| candidate.starts_with('/'))
-        .filter(|candidate| seen.insert(candidate.clone()))
+        .filter(|(cmd, _)| cmd.starts_with('/'))
+        .filter(|(cmd, _)| seen.insert(cmd.clone()))
         .collect()
 }
