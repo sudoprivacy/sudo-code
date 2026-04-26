@@ -1311,7 +1311,7 @@ mod tests {
                 &worker.worker_id,
                 Some("Implement worker handshake"),
                 Some(WorkerTaskReceipt {
-                    repo: "sudo-code".to_string(),
+                    repo: "sudocode".to_string(),
                     task_kind: "repo_code".to_string(),
                     source_surface: "omx_team".to_string(),
                     expected_artifacts: vec!["patch".to_string(), "tests".to_string()],
@@ -1351,7 +1351,7 @@ mod tests {
                     "Explain this KakaoTalk screenshot for a friend".to_string()
                 ),
                 task_receipt: Some(WorkerTaskReceipt {
-                    repo: "sudo-code".to_string(),
+                    repo: "sudocode".to_string(),
                     task_kind: "repo_code".to_string(),
                     source_surface: "omx_team".to_string(),
                     expected_artifacts: vec!["patch".to_string(), "tests".to_string()],

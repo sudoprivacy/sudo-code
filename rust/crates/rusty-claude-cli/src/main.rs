@@ -216,9 +216,9 @@ const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
-pub(crate) const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/sudo-code";
-pub(crate) const OFFICIAL_REPO_SLUG: &str = "ultraworkers/sudo-code";
-pub(crate) const DEPRECATED_INSTALL_COMMAND: &str = "cargo install sudo-code";
+pub(crate) const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/sudocode";
+pub(crate) const OFFICIAL_REPO_SLUG: &str = "ultraworkers/sudocode";
+pub(crate) const DEPRECATED_INSTALL_COMMAND: &str = "cargo install sudocode";
 type RuntimePluginStateBuildOutput = (
     Option<Arc<Mutex<RuntimeMcpState>>>,
     Vec<RuntimeToolDefinition>,

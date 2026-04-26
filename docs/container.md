@@ -1,4 +1,4 @@
-# Container-first sudo-code workflows
+# Container-first sudocode workflows
 
 This repo already had **container detection** in the Rust runtime before this document was added:
 
@@ -22,13 +22,13 @@ From the repository root:
 ### Docker
 
 ```bash
-docker build -t sudo-code-dev -f Containerfile .
+docker build -t sudocode-dev -f Containerfile .
 ```
 
 ### Podman
 
 ```bash
-podman build -t sudo-code-dev -f Containerfile .
+podman build -t sudocode-dev -f Containerfile .
 ```
 
 ## Run `cargo test --workspace` in the container
@@ -42,7 +42,7 @@ docker run --rm -it \
   -v "$PWD":/workspace \
   -e CARGO_TARGET_DIR=/tmp/scode-target \
   -w /workspace/rust \
-  sudo-code-dev \
+  sudocode-dev \
   cargo test --workspace
 ```
 
@@ -53,7 +53,7 @@ podman run --rm -it \
   -v "$PWD":/workspace:Z \
   -e CARGO_TARGET_DIR=/tmp/scode-target \
   -w /workspace/rust \
-  sudo-code-dev \
+  sudocode-dev \
   cargo test --workspace
 ```
 
@@ -68,7 +68,7 @@ docker run --rm -it \
   -v "$PWD":/workspace \
   -e CARGO_TARGET_DIR=/tmp/scode-target \
   -w /workspace/rust \
-  sudo-code-dev
+  sudocode-dev
 ```
 
 ### Podman
@@ -78,7 +78,7 @@ podman run --rm -it \
   -v "$PWD":/workspace:Z \
   -e CARGO_TARGET_DIR=/tmp/scode-target \
   -w /workspace/rust \
-  sudo-code-dev
+  sudocode-dev
 ```
 
 Inside the shell:
@@ -94,7 +94,7 @@ The `sandbox` command is a useful sanity check: inside Docker or Podman it shoul
 
 ## Bind-mount this repo and another repo at the same time
 
-If you want to run `scode` against a second checkout while keeping `sudo-code` itself mounted read-write:
+If you want to run `scode` against a second checkout while keeping `sudocode` itself mounted read-write:
 
 ### Docker
 
@@ -104,7 +104,7 @@ docker run --rm -it \
   -v "$HOME/src/other-repo":/repo \
   -e CARGO_TARGET_DIR=/tmp/scode-target \
   -w /workspace/rust \
-  sudo-code-dev
+  sudocode-dev
 ```
 
 ### Podman
@@ -115,7 +115,7 @@ podman run --rm -it \
   -v "$HOME/src/other-repo":/repo:Z \
   -e CARGO_TARGET_DIR=/tmp/scode-target \
   -w /workspace/rust \
-  sudo-code-dev
+  sudocode-dev
 ```
 
 Then, for example:

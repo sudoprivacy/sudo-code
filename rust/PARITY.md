@@ -1,4 +1,4 @@
-# Parity Status — sudo-code Rust Port
+# Parity Status — sudocode Rust Port
 
 Last updated: 2026-04-03
 
