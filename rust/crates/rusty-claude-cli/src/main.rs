@@ -2294,20 +2294,19 @@ impl LiveCli {
 
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(model) = model else {
-            let models = &[
-                "claude-sonnet-4-20250514",
-                "claude-haiku-4-5-20251001",
-                "claude-opus-4-20250115",
-                "gemini-3-pro",
-                "gpt-4.1",
-            ];
+            let sudocode_config = load_sudocode_config_for_current_dir();
+            let models: Vec<String> = sudocode_config.models.keys().cloned().collect();
+            if models.is_empty() {
+                println!("No models configured in sudocode.json");
+                return Ok(false);
+            }
             let selection = FuzzySelect::new()
                 .with_prompt("Select model")
-                .items(models)
+                .items(&models)
                 .default(0)
                 .interact_opt()?;
             return match selection {
-                Some(idx) => self.set_model(Some(models[idx].to_string())),
+                Some(idx) => self.set_model(Some(models[idx].clone())),
                 None => Ok(false),
             };
         };
