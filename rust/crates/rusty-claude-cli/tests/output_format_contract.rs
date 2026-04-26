@@ -268,11 +268,11 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         .expect("install source check");
     assert_eq!(
         install_source["official_repo"],
-        "https://github.com/ultraworkers/sudo-code"
+        "https://github.com/ultraworkers/sudocode"
     );
     assert_eq!(
         install_source["deprecated_install"],
-        "cargo install sudo-code"
+        "cargo install sudocode"
     );
 
     let workspace = checks
@@ -470,7 +470,7 @@ fn parse_framed_json(stdout: &[u8]) -> Value {
 }
 
 fn write_upstream_fixture(root: &Path) -> PathBuf {
-    let upstream = root.join("sudo-code");
+    let upstream = root.join("sudocode");
     let src = upstream.join("src");
     let entrypoints = src.join("entrypoints");
     fs::create_dir_all(&entrypoints).expect("upstream entrypoints dir should exist");

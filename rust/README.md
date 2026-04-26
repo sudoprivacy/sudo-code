@@ -155,7 +155,7 @@ Top-level commands:
   init
 ```
 
-`scode acp` is a local discoverability surface for editor-first users: it reports the current ACP/Zed status without starting the runtime. As of April 16, 2026, sudo-code does **not** ship an ACP/Zed daemon entrypoint yet, and `scode acp serve` is only a status alias until the real protocol surface lands.
+`scode acp` is a local discoverability surface for editor-first users: it reports the current ACP/Zed status without starting the runtime. As of April 16, 2026, sudocode does **not** ship an ACP/Zed daemon entrypoint yet, and `scode acp serve` is only a status alias until the real protocol surface lands.
 
 The command surface is moving quickly. For the canonical live help text, run:
 
