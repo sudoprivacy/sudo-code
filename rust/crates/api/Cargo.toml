@@ -15,6 +15,8 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+mockito = "1"
+tempfile = "3"
 
 [lints]
 workspace = true

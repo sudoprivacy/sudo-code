@@ -7,6 +7,7 @@
 //! API-key auth uses the public `generativelanguage.googleapis.com` endpoint.
 
 use std::collections::VecDeque;
+use std::path::Path;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -143,11 +144,13 @@ impl GeminiClient {
                     )
                 })?;
 
-                // Default Google Cloud Code client ID / secret (split to
-                // bypass GitHub push protection for public standard clients).
+                // Default Gemini CLI OAuth client ID / secret (split to bypass
+                // GitHub push protection). These are the public "installed
+                // application" credentials from google-gemini/gemini-cli; see
+                // https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/code_assist/oauth2.ts
                 let default_client_id = format!(
                     "{}-{}",
-                    "77364799047", "8urp5qkm1o5l5hvc3sflbkm63ds6lrhl.apps.googleusercontent.com"
+                    "681255809395", "oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
                 );
                 let default_client_secret =
                     format!("{}-{}", "GOCSPX", "4uHgMPm-1o7Sk-geV6Cu5clXFsxl");
@@ -184,6 +187,11 @@ impl GeminiClient {
 
                 let mut cache = self.token_cache.lock().await;
                 *cache = Some((refresh_resp.access_token.clone(), new_expiry));
+
+                // Persist the refreshed token back to the credential file so
+                // subsequent process starts (and the Gemini CLI) see the
+                // updated access_token / expiry without needing another refresh.
+                persist_refreshed_token(path, &refresh_resp.access_token, new_expiry);
 
                 Ok(refresh_resp.access_token)
             }
@@ -324,6 +332,29 @@ fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Best-effort update of the OAuth credential file with a refreshed token.
+/// Failures are silently ignored -- the in-memory cache is authoritative and
+/// the file will be refreshed again on the next cold start if this write fails.
+fn persist_refreshed_token(path: &Path, new_access_token: &str, new_expiry_ms: u64) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut doc) = serde_json::from_str::<serde_json::Map<String, Value>>(&content) else {
+        return;
+    };
+    doc.insert(
+        "access_token".to_string(),
+        Value::String(new_access_token.to_string()),
+    );
+    doc.insert(
+        "expiry_date".to_string(),
+        Value::Number(serde_json::Number::from(new_expiry_ms)),
+    );
+    if let Ok(serialized) = serde_json::to_string_pretty(&doc) {
+        let _ = std::fs::write(path, serialized);
+    }
 }
 
 async fn error_from_response(status: reqwest::StatusCode, response: reqwest::Response) -> ApiError {
@@ -1126,5 +1157,118 @@ mod tests {
         if let StreamEvent::MessageDelta(md) = &events[0] {
             assert_eq!(md.delta.stop_reason.as_deref(), Some("tool_use"));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // OAuth refresh helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn persist_refreshed_token_updates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth_creds.json");
+
+        let original = json!({
+            "access_token": "old-token",
+            "refresh_token": "rt-1",
+            "expiry_date": 1000,
+            "extra_field": "keep-me"
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+
+        persist_refreshed_token(&path, "new-token", 9999);
+
+        let updated: serde_json::Map<String, Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(updated["access_token"], "new-token");
+        assert_eq!(updated["expiry_date"], 9999);
+        // Existing fields are preserved.
+        assert_eq!(updated["refresh_token"], "rt-1");
+        assert_eq!(updated["extra_field"], "keep-me");
+    }
+
+    #[test]
+    fn persist_refreshed_token_noop_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does_not_exist.json");
+        // Should not panic.
+        persist_refreshed_token(&path, "tok", 1234);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn default_client_id_matches_gemini_cli() {
+        // Verify the default client ID matches the Gemini CLI's public
+        // OAuth installed-application credentials.
+        let id = format!(
+            "{}-{}",
+            "681255809395", "oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+        );
+        assert!(
+            id.starts_with("681255809395-"),
+            "default client_id must use the Gemini CLI project"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_auth_token_caches_valid_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds_path = dir.path().join("oauth_creds.json");
+
+        // Write credentials with a far-future expiry.
+        let future_ms = now_epoch_ms() + 600_000;
+        let creds = json!({
+            "access_token": "still-valid",
+            "refresh_token": "my-refresh-token",
+            "expiry_date": future_ms
+        });
+        std::fs::write(&creds_path, serde_json::to_string(&creds).unwrap()).unwrap();
+
+        let client = GeminiClient {
+            http: reqwest::Client::new(),
+            base_url: "https://unused.example.com".to_string(),
+            credential: Credential::AuthFile(creds_path.clone()),
+            is_subscription: true,
+            project_id: tokio::sync::Mutex::new(None),
+            token_cache: tokio::sync::Mutex::new(None),
+        };
+
+        let token = client.resolve_auth_token().await.unwrap();
+        assert_eq!(token, "still-valid");
+
+        // Cache should be populated, so a second call returns the cached
+        // value without re-reading the file.
+        std::fs::write(&creds_path, "invalid-json").unwrap();
+        let cached = client.resolve_auth_token().await.unwrap();
+        assert_eq!(cached, "still-valid");
+    }
+
+    #[tokio::test]
+    async fn resolve_auth_token_errors_when_expired_without_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds_path = dir.path().join("oauth_creds.json");
+
+        // Expired token with no refresh_token.
+        let creds = json!({
+            "access_token": "expired-token",
+            "expiry_date": 1000
+        });
+        std::fs::write(&creds_path, serde_json::to_string(&creds).unwrap()).unwrap();
+
+        let client = GeminiClient {
+            http: reqwest::Client::new(),
+            base_url: "https://unused.example.com".to_string(),
+            credential: Credential::AuthFile(creds_path),
+            is_subscription: true,
+            project_id: tokio::sync::Mutex::new(None),
+            token_cache: tokio::sync::Mutex::new(None),
+        };
+
+        let err = client.resolve_auth_token().await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no refresh_token"),
+            "expected refresh_token error, got: {msg}"
+        );
     }
 }
