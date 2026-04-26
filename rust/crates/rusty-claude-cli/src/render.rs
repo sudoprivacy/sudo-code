@@ -49,6 +49,7 @@ impl Default for ColorTheme {
 
 pub struct Spinner {
     stop: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -59,14 +60,25 @@ impl Spinner {
     pub fn new() -> Self {
         Self {
             stop: Arc::new(AtomicBool::new(false)),
+            pause: Arc::new(AtomicBool::new(false)),
             handle: None,
         }
+    }
+
+    /// Returns a shared pause flag. Set to `true` before writing content to
+    /// prevent the spinner from overwriting output lines. Set back to `false`
+    /// after writing to let the spinner resume on the next empty line.
+    #[must_use]
+    pub fn pause_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.pause)
     }
 
     /// Start the spinner animation in a background thread.
     pub fn start(&mut self, label: &str, model: Option<&str>, theme: &ColorTheme) {
         self.stop.store(false, Ordering::SeqCst);
+        self.pause.store(false, Ordering::SeqCst);
         let stop = Arc::clone(&self.stop);
+        let pause = Arc::clone(&self.pause);
         let label = label.to_string();
         let model = model.map(ToString::to_string);
         let theme = *theme;
@@ -76,25 +88,27 @@ impl Spinner {
             let mut frame_index: usize = 0;
             let mut stdout = io::stdout();
             while !stop.load(Ordering::SeqCst) {
-                let frame = Self::FRAMES[frame_index % Self::FRAMES.len()];
-                frame_index += 1;
-                let elapsed = start_time.elapsed().as_secs_f64();
-                let mut line = format!("{frame} {label}");
-                if let Some(ref m) = model {
-                    let _ = write!(line, " [{m}]");
+                if !pause.load(Ordering::SeqCst) {
+                    let frame = Self::FRAMES[frame_index % Self::FRAMES.len()];
+                    frame_index += 1;
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let mut line = format!("{frame} {label}");
+                    if let Some(ref m) = model {
+                        let _ = write!(line, " [{m}]");
+                    }
+                    let _ = write!(line, " ({elapsed:.1}s)");
+                    let _ = queue!(
+                        stdout,
+                        SavePosition,
+                        MoveToColumn(0),
+                        Clear(ClearType::CurrentLine),
+                        SetForegroundColor(theme.spinner_active),
+                        Print(line),
+                        ResetColor,
+                        RestorePosition
+                    );
+                    let _ = stdout.flush();
                 }
-                let _ = write!(line, " ({elapsed:.1}s)");
-                let _ = queue!(
-                    stdout,
-                    SavePosition,
-                    MoveToColumn(0),
-                    Clear(ClearType::CurrentLine),
-                    SetForegroundColor(theme.spinner_active),
-                    Print(line),
-                    ResetColor,
-                    RestorePosition
-                );
-                let _ = stdout.flush();
                 std::thread::sleep(std::time::Duration::from_millis(80));
             }
         }));
@@ -105,6 +119,13 @@ impl Spinner {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+
+    /// Stop the spinner and clear its line without printing a final message.
+    pub fn clear(&mut self, out: &mut impl Write) -> io::Result<()> {
+        self.stop_thread();
+        execute!(out, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+        out.flush()
     }
 
     pub fn finish(
@@ -318,7 +339,12 @@ impl TerminalRenderer {
             Event::Start(Tag::Heading { level, .. }) => {
                 Self::start_heading(state, level as u8, output);
             }
-            Event::End(TagEnd::Paragraph) => output.push_str("\n\n"),
+            Event::End(TagEnd::Paragraph) => {
+                if state.list_stack.is_empty() {
+                    output.push_str("\n\n");
+                }
+                // Inside a list, End(Item) handles the newline.
+            }
             Event::Start(Tag::BlockQuote(..)) => self.start_quote(state, output),
             Event::End(TagEnd::BlockQuote(..)) => {
                 state.quote = state.quote.saturating_sub(1);
@@ -478,7 +504,7 @@ impl TerminalRenderer {
                 *next_index += 1;
                 format!("{value}. ")
             }
-            _ => "• ".to_string(),
+            _ => String::new(),
         };
         output.push_str(&marker);
     }

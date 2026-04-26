@@ -16,7 +16,7 @@ pub(crate) const DISPLAY_TRUNCATION_NOTICE: &str =
     "\x1b[2m… output truncated for display; full result preserved in session.\x1b[0m";
 pub(crate) const READ_DISPLAY_MAX_LINES: usize = 10;
 pub(crate) const READ_DISPLAY_MAX_CHARS: usize = 2_000;
-pub(crate) const TOOL_OUTPUT_DISPLAY_MAX_LINES: usize = 8;
+pub(crate) const TOOL_OUTPUT_DISPLAY_MAX_LINES: usize = 3;
 pub(crate) const TOOL_OUTPUT_DISPLAY_MAX_CHARS: usize = 1_500;
 
 pub(crate) fn provider_label(kind: ProviderKind) -> &'static str {
@@ -661,36 +661,37 @@ pub(crate) fn format_tool_call_start(name: &str, input: &str) -> String {
     };
 
     let border = "─".repeat(name.len() + 8);
+    let detail_indented = detail.replace('\n', "\n  ");
     format!(
-        "\x1b[38;5;245m╭─ \x1b[1;36m{name}\x1b[0;38;5;245m ─╮\x1b[0m\n\x1b[38;5;245m│\x1b[0m {detail}\n\x1b[38;5;245m╰{border}╯\x1b[0m"
+        "  \x1b[38;5;245m╭─ \x1b[1;36m{name}\x1b[0;38;5;245m ─╮\x1b[0m\n  \x1b[38;5;245m│\x1b[0m {detail_indented}\n  \x1b[38;5;245m╰{border}╯\x1b[0m"
     )
 }
 
 pub(crate) fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
     let icon = if is_error {
-        "\x1b[1;31m✗\x1b[0m"
+        "\x1b[1;31m⏺\x1b[0m"
     } else {
-        "\x1b[1;32m✓\x1b[0m"
+        "\x1b[1;32m⏺\x1b[0m"
     };
     if is_error {
         let summary = truncate_for_summary(output.trim(), 160);
-        return if summary.is_empty() {
+        if summary.is_empty() {
             format!("{icon} \x1b[38;5;245m{name}\x1b[0m")
         } else {
-            format!("{icon} \x1b[38;5;245m{name}\x1b[0m\n\x1b[38;5;203m{summary}\x1b[0m")
-        };
-    }
-
-    let parsed: serde_json::Value =
-        serde_json::from_str(output).unwrap_or(serde_json::Value::String(output.to_string()));
-    match name {
-        "bash" | "Bash" => format_bash_result(icon, &parsed),
-        "read_file" | "Read" => format_read_result(icon, &parsed),
-        "write_file" | "Write" => format_write_result(icon, &parsed),
-        "edit_file" | "Edit" => format_edit_result(icon, &parsed),
-        "glob_search" | "Glob" => format_glob_result(icon, &parsed),
-        "grep_search" | "Grep" => format_grep_result(icon, &parsed),
-        _ => format_generic_tool_result(icon, name, &parsed),
+            format!("{icon} \x1b[38;5;245m{name}\x1b[0m\n  \x1b[38;5;203m{summary}\x1b[0m")
+        }
+    } else {
+        let parsed: serde_json::Value =
+            serde_json::from_str(output).unwrap_or(serde_json::Value::String(output.to_string()));
+        match name {
+            "bash" | "Bash" => format_bash_result(icon, &parsed),
+            "read_file" | "Read" => format_read_result(icon, &parsed),
+            "write_file" | "Write" => format_write_result(icon, &parsed),
+            "edit_file" | "Edit" => format_edit_result(icon, &parsed),
+            "glob_search" | "Glob" => format_glob_result(icon, &parsed),
+            "grep_search" | "Grep" => format_grep_result(icon, &parsed),
+            _ => format_generic_tool_result(icon, name, &parsed),
+        }
     }
 }
 
@@ -751,21 +752,34 @@ pub(crate) fn first_visible_line(text: &str) -> &str {
 pub(crate) fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> String {
     use std::fmt::Write as _;
 
-    let mut lines = vec![format!("{icon} \x1b[38;5;245mbash\x1b[0m")];
+    // Extract command from input for the header.
+    let command = parsed
+        .get("command")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+
+    let mut header = if command.is_empty() {
+        format!("{icon} \x1b[38;5;245mBash\x1b[0m")
+    } else {
+        format!(
+            "{icon} \x1b[38;5;245mBash\x1b[0m({})",
+            truncate_for_summary(command, 120)
+        )
+    };
+
     if let Some(task_id) = parsed
         .get("backgroundTaskId")
         .and_then(|value| value.as_str())
     {
-        write!(&mut lines[0], " backgrounded ({task_id})").expect("write to string");
+        write!(&mut header, " backgrounded ({task_id})").expect("write to string");
     } else if let Some(status) = parsed
         .get("returnCodeInterpretation")
         .and_then(|value| value.as_str())
         .filter(|status| !status.is_empty())
     {
-        write!(&mut lines[0], " {status}").expect("write to string");
+        write!(&mut header, " {status}").expect("write to string");
     }
 
-    // Count total output lines for the summary suffix.
     let stdout_text = parsed
         .get("stdout")
         .and_then(|value| value.as_str())
@@ -774,60 +788,42 @@ pub(crate) fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> Stri
         .get("stderr")
         .and_then(|value| value.as_str())
         .unwrap_or_default();
-    let total_lines = stdout_text.lines().count() + stderr_text.lines().count();
-    if total_lines > 0 {
-        write!(&mut lines[0], " \x1b[2m— {total_lines} lines\x1b[0m").expect("write to string");
+
+    // Collect all output lines.
+    let all_output: Vec<&str> = stdout_text
+        .lines()
+        .chain(stderr_text.lines())
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+
+    if all_output.is_empty() {
+        return header;
     }
 
-    if !stdout_text.trim().is_empty() {
-        lines.push(truncate_output_for_display(
-            stdout_text,
-            TOOL_OUTPUT_DISPLAY_MAX_LINES,
-            TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-        ));
-    }
-    if !stderr_text.trim().is_empty() {
-        lines.push(format!(
-            "\x1b[38;5;203m{}\x1b[0m",
-            truncate_output_for_display(
-                stderr_text,
-                TOOL_OUTPUT_DISPLAY_MAX_LINES,
-                TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-            )
-        ));
+    let preview_count = TOOL_OUTPUT_DISPLAY_MAX_LINES;
+    let mut result = header;
+
+    for (i, line) in all_output.iter().take(preview_count).enumerate() {
+        if i == 0 {
+            write!(&mut result, "\n  └ {line}").expect("write to string");
+        } else {
+            write!(&mut result, "\n    {line}").expect("write to string");
+        }
     }
 
-    lines.join("\n\n")
+    if all_output.len() > preview_count {
+        let remaining = all_output.len() - preview_count;
+        write!(&mut result, "\n  \x1b[2m… +{remaining} lines\x1b[0m").expect("write to string");
+    }
+
+    result
 }
 
 pub(crate) fn format_read_result(icon: &str, parsed: &serde_json::Value) -> String {
     let file = parsed.get("file").unwrap_or(parsed);
     let path = extract_tool_path(file);
-    let start_line = file
-        .get("startLine")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(1);
-    let num_lines = file
-        .get("numLines")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let total_lines = file
-        .get("totalLines")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(num_lines);
-    let content = file
-        .get("content")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let end_line = start_line.saturating_add(num_lines.saturating_sub(1));
 
-    format!(
-        "{icon} \x1b[2m📄 Read {path} (lines {}-{} of {})\x1b[0m\n{}",
-        start_line,
-        end_line.max(start_line),
-        total_lines,
-        truncate_output_for_display(content, READ_DISPLAY_MAX_LINES, READ_DISPLAY_MAX_CHARS)
-    )
+    format!("{icon} \x1b[2mRead {path}\x1b[0m")
 }
 
 pub(crate) fn format_write_result(icon: &str, parsed: &serde_json::Value) -> String {
@@ -890,7 +886,10 @@ pub(crate) fn format_edit_result(icon: &str, parsed: &serde_json::Value) -> Stri
     });
 
     match preview {
-        Some(preview) => format!("{icon} \x1b[1;33m📝 Edited {path}{suffix}\x1b[0m\n{preview}"),
+        Some(preview) => {
+            let indented = preview.replace('\n', "\n  ");
+            format!("{icon} \x1b[1;33m📝 Edited {path}{suffix}\x1b[0m\n  {indented}")
+        }
         None => format!("{icon} \x1b[1;33m📝 Edited {path}{suffix}\x1b[0m"),
     }
 }
@@ -900,23 +899,8 @@ pub(crate) fn format_glob_result(icon: &str, parsed: &serde_json::Value) -> Stri
         .get("numFiles")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    let filenames = parsed
-        .get("filenames")
-        .and_then(|value| value.as_array())
-        .map(|files| {
-            files
-                .iter()
-                .filter_map(|value| value.as_str())
-                .take(8)
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-    if filenames.is_empty() {
-        format!("{icon} \x1b[38;5;245mglob_search\x1b[0m matched {num_files} files")
-    } else {
-        format!("{icon} \x1b[38;5;245mglob_search\x1b[0m matched {num_files} files\n{filenames}")
-    }
+
+    format!("{icon} \x1b[2mFound {num_files} files\x1b[0m")
 }
 
 pub(crate) fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> String {
@@ -928,39 +912,8 @@ pub(crate) fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> Stri
         .get("numFiles")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    let content = parsed
-        .get("content")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let filenames = parsed
-        .get("filenames")
-        .and_then(|value| value.as_array())
-        .map(|files| {
-            files
-                .iter()
-                .filter_map(|value| value.as_str())
-                .take(8)
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-    let summary = format!(
-        "{icon} \x1b[38;5;245mgrep_search\x1b[0m {num_matches} matches across {num_files} files"
-    );
-    if !content.trim().is_empty() {
-        format!(
-            "{summary}\n{}",
-            truncate_output_for_display(
-                content,
-                TOOL_OUTPUT_DISPLAY_MAX_LINES,
-                TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-            )
-        )
-    } else if !filenames.is_empty() {
-        format!("{summary}\n{filenames}")
-    } else {
-        summary
-    }
+
+    format!("{icon} \x1b[2m{num_matches} matches across {num_files} files\x1b[0m")
 }
 
 pub(crate) fn format_generic_tool_result(
@@ -985,7 +938,8 @@ pub(crate) fn format_generic_tool_result(
     if preview.is_empty() {
         format!("{icon} \x1b[38;5;245m{name}\x1b[0m")
     } else if preview.contains('\n') {
-        format!("{icon} \x1b[38;5;245m{name}\x1b[0m\n{preview}")
+        let indented = preview.replace('\n', "\n  ");
+        format!("{icon} \x1b[38;5;245m{name}\x1b[0m\n  {indented}")
     } else {
         format!("{icon} \x1b[38;5;245m{name}:\x1b[0m {preview}")
     }

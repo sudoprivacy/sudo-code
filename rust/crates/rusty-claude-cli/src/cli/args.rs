@@ -1084,7 +1084,9 @@ pub(crate) fn validate_model_syntax(model: &str) -> Result<(), String> {
     }
     // Known aliases are always valid
     match trimmed {
-        "claude-opus" | "claude-sonnet" | "claude-haiku" | "opus" | "sonnet" | "haiku" => return Ok(()),
+        "claude-opus" | "claude-sonnet" | "claude-haiku" | "opus" | "sonnet" | "haiku" => {
+            return Ok(())
+        }
         _ => {}
     }
     // Check sudocode.json config for additional model aliases.

@@ -557,6 +557,10 @@ where
         &mut self.api_client
     }
 
+    pub fn tool_executor_mut(&mut self) -> &mut T {
+        &mut self.tool_executor
+    }
+
     pub fn session_mut(&mut self) -> &mut Session {
         &mut self.session
     }

@@ -1136,6 +1136,28 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
                 object.insert("stop_sequences".to_string(), stop_val);
             }
         }
+        // Strip thought_signature from tool_use content blocks. The API
+        // rejects this field when extended thinking is not enabled.
+        strip_thought_signatures(object);
+    }
+}
+
+/// Walk `messages[].content[]` and remove `thought_signature` from any
+/// `tool_use` content blocks. Without an explicit `thinking` configuration
+/// in the request the Anthropic API treats the field as an extra input.
+fn strip_thought_signatures(body: &mut Map<String, Value>) {
+    if let Some(Value::Array(messages)) = body.get_mut("messages") {
+        for msg in messages.iter_mut() {
+            if let Some(Value::Array(content)) = msg.get_mut("content") {
+                for block in content.iter_mut() {
+                    if let Some(obj) = block.as_object_mut() {
+                        if obj.get("type").and_then(Value::as_str) == Some("tool_use") {
+                            obj.remove("thought_signature");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -1277,17 +1277,39 @@ fn run_repl(
     )?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
-        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
+        input::LineEditor::new("❯ ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
+        let term_width = crossterm::terminal::size()
+            .map(|(cols, _)| cols as usize)
+            .unwrap_or(80);
+        let separator = format!("\x1b[2m{}\x1b[0m", "─".repeat(term_width));
+        let footer = "  \x1b[2m/help · /status · Tab for /commands\x1b[0m";
+        // Print the entire input chrome block: top sep, prompt placeholder,
+        // bottom sep, footer.  Then move the cursor back to the prompt line
+        // so read_line() renders there — the user sees all four elements at once.
+        println!("{separator}");
+        println!();
+        println!("{separator}");
+        print!("{footer}");
+        print!("\x1b[2F\x1b[2K"); // cursor up 2 lines, clear prompt placeholder
+        std::io::Write::flush(&mut std::io::stdout())?;
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
+                // Clear pre-printed bottom sep + footer
+                print!("\x1b[J");
+                // Replace prompt line with gray-background echo of user input
                 let trimmed = input.trim().to_string();
-                if trimmed.is_empty() {
-                    continue;
-                }
+                let echo_display = format!(" › {}", trimmed.replace('\n', " "));
+                let pad = term_width.saturating_sub(echo_display.chars().count());
+                print!(
+                    "\x1b[1F\x1b[2K\x1b[48;5;236m{echo_display}{}\x1b[0m",
+                    " ".repeat(pad)
+                );
+                println!();
+                println!("{separator}");
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
                     cli.persist_session()?;
                     break;
@@ -1331,7 +1353,6 @@ fn run_repl(
                     eprintln!("\x1b[31m{e}\x1b[0m");
                 }
             }
-            input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
                 cli.persist_session()?;
                 break;
@@ -1840,7 +1861,7 @@ impl LiveCli {
             })
             .collect();
 
-        let hint = "  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline";
+        let hint = "  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for /command completions";
 
         format!(
             "{}\n\n{}\n{}\n{}\n\n{}",
@@ -1900,18 +1921,18 @@ impl LiveCli {
             Some(self.config.model.as_str()),
             TerminalRenderer::new().color_theme(),
         );
+        let pause_flag = spinner.pause_flag();
+        runtime
+            .api_client_mut()
+            .set_spinner_pause(pause_flag.clone());
+        runtime.tool_executor_mut().set_spinner_pause(pause_flag);
         let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                println!();
+                spinner.clear(&mut stdout)?;
                 if let Some(event) = summary.auto_compaction {
                     println!(
                         "{}",
