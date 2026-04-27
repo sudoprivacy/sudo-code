@@ -5,7 +5,7 @@ Last updated: 2026-04-03
 ## Mock parity harness — milestone 1
 
 - [x] Deterministic Anthropic-compatible mock service (`rust/crates/mock-anthropic-service`)
-- [x] Reproducible clean-environment CLI harness (`rust/crates/rusty-claude-cli/tests/mock_parity_harness.rs`)
+- [x] Reproducible clean-environment CLI harness (`rust/crates/rusty-sudocode-cli/tests/mock_parity_harness.rs`)
 - [x] Scripted scenarios: `streaming_text`, `read_file_roundtrip`, `grep_chunk_assembly`, `write_file_allowed`, `write_file_denied`
 
 ## Mock parity harness — milestone 2 (behavioral expansion)

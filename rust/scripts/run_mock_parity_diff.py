@@ -37,7 +37,7 @@ def run_harness(rust_root: Path) -> dict:
                 "cargo",
                 "test",
                 "-p",
-                "rusty-claude-cli",
+                "rusty-sudocode-cli",
                 "--test",
                 "mock_parity_harness",
                 "--",
