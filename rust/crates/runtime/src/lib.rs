@@ -4,6 +4,8 @@
 //! MCP plumbing, tool-facing file operations, and the core conversation loop
 //! that drives interactive and one-shot turns.
 
+#[cfg(feature = "acp-sdk")]
+pub mod acp_sdk_server;
 pub mod acp_server;
 mod bash;
 pub mod bash_validation;

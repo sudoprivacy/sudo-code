@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+acp-sdk = ["runtime/acp-sdk"]
+
 [[bin]]
 name = "scode"
 path = "src/main.rs"
