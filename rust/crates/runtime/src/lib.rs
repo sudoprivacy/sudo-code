@@ -5,6 +5,7 @@
 //! that drives interactive and one-shot turns.
 
 pub mod acp_sdk_server;
+pub mod acp_ws_server;
 mod bash;
 pub mod bash_validation;
 mod bootstrap;

@@ -173,7 +173,9 @@ impl RuntimeObserver for SdkSessionObserver {
 }
 
 /// Extract plain text from a slice of ACP `ContentBlock`s.
-fn extract_text_from_content_blocks(blocks: &[ContentBlock]) -> Result<String, AcpError> {
+pub(crate) fn extract_text_from_content_blocks(
+    blocks: &[ContentBlock],
+) -> Result<String, AcpError> {
     let text: String = blocks
         .iter()
         .filter_map(|block| match block {
@@ -207,7 +209,7 @@ pub use agent_client_protocol_schema::StopReason as AcpStopReason;
 // ---------------------------------------------------------------------------
 
 /// Commands sent from async handlers to the dedicated delegate worker thread.
-enum DelegateCmd {
+pub(crate) enum DelegateCmd {
     NewSession {
         cwd: PathBuf,
         reply: mpsc::Sender<Result<(String, PathBuf), AcpError>>,
@@ -225,12 +227,12 @@ enum DelegateCmd {
 /// A `Send + Sync` handle that async handlers use to invoke the delegate
 /// on its dedicated thread via channels.
 #[derive(Clone)]
-struct DelegateProxy {
+pub(crate) struct DelegateProxy {
     cmd_tx: mpsc::Sender<DelegateCmd>,
 }
 
 impl DelegateProxy {
-    fn new_session(&self, cwd: PathBuf) -> Result<(String, PathBuf), AcpError> {
+    pub(crate) fn new_session(&self, cwd: PathBuf) -> Result<(String, PathBuf), AcpError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         let _ = self.cmd_tx.send(DelegateCmd::NewSession {
             cwd,
@@ -241,7 +243,11 @@ impl DelegateProxy {
             .unwrap_or_else(|_| Err(AcpError::internal("delegate worker gone")))
     }
 
-    fn prompt(&self, session_id: String, prompt: String) -> (StopReason, Vec<SessionNotification>) {
+    pub(crate) fn prompt(
+        &self,
+        session_id: String,
+        prompt: String,
+    ) -> (StopReason, Vec<SessionNotification>) {
         let (reply_tx, reply_rx) = mpsc::channel();
         let _ = self.cmd_tx.send(DelegateCmd::Prompt {
             session_id,
@@ -251,7 +257,7 @@ impl DelegateProxy {
         reply_rx.recv().unwrap_or((StopReason::EndTurn, Vec::new()))
     }
 
-    fn list_sessions(&self) -> Vec<(String, PathBuf)> {
+    pub(crate) fn list_sessions(&self) -> Vec<(String, PathBuf)> {
         let (reply_tx, reply_rx) = mpsc::channel();
         let _ = self
             .cmd_tx
@@ -265,7 +271,7 @@ impl DelegateProxy {
 ///
 /// The delegate factory is called on the worker thread so the delegate
 /// itself never needs to be `Send`.
-fn spawn_delegate_worker<F>(factory: F) -> DelegateProxy
+pub(crate) fn spawn_delegate_worker<F>(factory: F) -> DelegateProxy
 where
     F: FnOnce() -> Box<dyn SdkAcpDelegate> + Send + 'static,
 {
@@ -481,7 +487,7 @@ where
 }
 
 /// Map our `AcpError` to the SDK's `Error` type.
-fn acp_error_to_sdk(e: &AcpError) -> Error {
+pub(crate) fn acp_error_to_sdk(e: &AcpError) -> Error {
     match e {
         AcpError::InvalidParams(msg) => {
             Error::invalid_params().data(serde_json::Value::String(msg.clone()))

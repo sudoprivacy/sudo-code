@@ -445,15 +445,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode_override,
             reasoning_effort,
             auth_mode,
+            ws_port,
         } => {
-            run_acp_server(
-                model,
-                model_flag_raw,
-                allowed_tools,
-                permission_mode_override,
-                reasoning_effort,
-                auth_mode,
-            )?;
+            if let Some(port) = ws_port {
+                run_acp_ws_server(
+                    model,
+                    model_flag_raw,
+                    allowed_tools,
+                    permission_mode_override,
+                    reasoning_effort,
+                    auth_mode,
+                    port,
+                )?;
+            } else {
+                run_acp_server(
+                    model,
+                    model_flag_raw,
+                    allowed_tools,
+                    permission_mode_override,
+                    reasoning_effort,
+                    auth_mode,
+                )?;
+            }
         }
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
@@ -1709,6 +1722,39 @@ fn run_acp_server(
                 auth_mode,
             ))
         },
+    ))
+}
+
+fn run_acp_ws_server(
+    model: String,
+    model_flag_raw: Option<String>,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode_override: Option<PermissionMode>,
+    reasoning_effort: Option<String>,
+    auth_mode: Option<AuthMode>,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = runtime::acp_sdk_server::SdkAcpConfig {
+        agent_version: VERSION.to_string(),
+        model: model.clone(),
+        model_flag_raw: model_flag_raw.clone(),
+        permission_mode_override,
+        reasoning_effort: reasoning_effort.clone(),
+    };
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(runtime::acp_ws_server::run_acp_ws_server(
+        config,
+        move || {
+            Box::new(AcpSdkDelegate::new(
+                model,
+                model_flag_raw,
+                allowed_tools,
+                permission_mode_override,
+                reasoning_effort,
+                auth_mode,
+            ))
+        },
+        port,
     ))
 }
 
