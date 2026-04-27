@@ -22,9 +22,37 @@ use agent_client_protocol_schema::{
 };
 use agent_client_protocol_tokio::Stdio;
 
-use crate::acp_server::AcpError;
 use crate::conversation::RuntimeObserver;
 use crate::permissions::PermissionMode;
+
+/// Error type returned by ACP agent implementations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpError {
+    InvalidParams(String),
+    Internal(String),
+}
+
+impl AcpError {
+    #[must_use]
+    pub fn invalid_params(message: impl Into<String>) -> Self {
+        Self::InvalidParams(message.into())
+    }
+
+    #[must_use]
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Internal(message.into())
+    }
+}
+
+impl std::fmt::Display for AcpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidParams(message) | Self::Internal(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for AcpError {}
 
 /// Configuration for the SDK-based ACP server.
 #[derive(Debug, Clone)]

@@ -1,12 +1,11 @@
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use runtime::Session;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -45,36 +44,6 @@ fn status_and_sandbox_emit_json_when_requested() {
     let sandbox = assert_json_command(&root, &["--output-format", "json", "sandbox"]);
     assert_eq!(sandbox["kind"], "sandbox");
     assert!(sandbox["filesystem_mode"].as_str().is_some());
-}
-
-#[test]
-fn acp_server_responds_to_framed_initialize() {
-    let root = unique_temp_dir("acp-jsonrpc");
-    fs::create_dir_all(&root).expect("temp dir should exist");
-
-    let acp = assert_framed_acp_command(
-        &root,
-        &["--output-format", "json", "acp"],
-        &json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": { "protocolVersion": 9 },
-        }),
-    );
-    assert_eq!(acp["id"], 1);
-    assert_eq!(acp["result"]["protocolVersion"], 9);
-    assert_eq!(acp["result"]["agentInfo"]["name"], "scode");
-    assert_eq!(
-        acp["result"]["agentInfo"]["version"],
-        env!("CARGO_PKG_VERSION")
-    );
-    assert_eq!(acp["result"]["agentCapabilities"]["loadSession"], false);
-    assert_eq!(
-        acp["result"]["agentCapabilities"]["mcpCapabilities"]["http"],
-        false
-    );
-    assert_eq!(acp["result"]["authMethods"], json!([]));
 }
 
 #[test]
@@ -419,54 +388,6 @@ fn run_scode(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output
         command.env(key, value);
     }
     command.output().expect("scode should launch")
-}
-
-fn assert_framed_acp_command(current_dir: &Path, args: &[&str], request: &Value) -> Value {
-    let request = serde_json::to_vec(request).expect("request should serialize");
-    let frame = format!("Content-Length: {}\r\n\r\n", request.len());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_scode"))
-        .current_dir(current_dir)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("scode should launch");
-    {
-        let stdin = child.stdin.as_mut().expect("stdin should be piped");
-        stdin
-            .write_all(frame.as_bytes())
-            .expect("frame header should write");
-        stdin.write_all(&request).expect("frame body should write");
-    }
-    drop(child.stdin.take());
-    let output = child.wait_with_output().expect("scode should exit");
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\n\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    parse_framed_json(&output.stdout)
-}
-
-fn parse_framed_json(stdout: &[u8]) -> Value {
-    let header_end = stdout
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .expect("stdout should contain JSON-RPC frame headers");
-    let headers = std::str::from_utf8(&stdout[..header_end]).expect("headers should be utf8");
-    let content_length = headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("Content-Length")
-                .then(|| value.trim().parse::<usize>().expect("valid content length"))
-        })
-        .expect("Content-Length header should exist");
-    let body_start = header_end + 4;
-    let body_end = body_start + content_length;
-    serde_json::from_slice(&stdout[body_start..body_end]).expect("body should be valid json")
 }
 
 fn write_upstream_fixture(root: &Path) -> PathBuf {
