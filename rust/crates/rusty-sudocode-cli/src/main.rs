@@ -1590,11 +1590,28 @@ impl runtime::AcpAgent for AcpCliAgent {
         Ok(session_id)
     }
 
+    fn list_sessions(
+        &self,
+        cwd: Option<PathBuf>,
+    ) -> Result<Vec<runtime::AcpSessionInfo>, AcpError> {
+        let cwd = cwd.as_deref().map(canonical_session_cwd).transpose()?;
+        let mut sessions = self
+            .sessions
+            .values()
+            .filter(|session| cwd.as_ref().is_none_or(|filter| session.cwd == *filter))
+            .map(|session| {
+                runtime::AcpSessionInfo::new(session.handle.id.clone(), session.cwd.clone())
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        Ok(sessions)
+    }
+
     fn run_prompt(
         &mut self,
         session_id: &str,
         prompt: String,
-        observer: &mut AcpSessionUpdateObserver<'_>,
+        observer: &mut AcpSessionUpdateObserver,
     ) -> Result<(), AcpError> {
         // Intercept slash commands — they should be handled locally, not sent to the LLM.
         if prompt.starts_with('/') {
@@ -1626,17 +1643,14 @@ impl AcpCliAgent {
         &mut self,
         session_id: &str,
         input: &str,
-        observer: &mut AcpSessionUpdateObserver<'_>,
+        observer: &mut AcpSessionUpdateObserver,
     ) -> Result<(), AcpError> {
         use runtime::RuntimeObserver as _;
-        let command = match SlashCommand::parse(input) {
-            Ok(Some(cmd)) => cmd,
-            Ok(None) | Err(_) => {
-                observer.on_text_delta(&format!(
-                    "Unknown slash command: `{input}`. Type `/help` for available commands."
-                ));
-                return Ok(());
-            }
+        let Ok(Some(command)) = SlashCommand::parse(input) else {
+            observer.on_text_delta(&format!(
+                "`{input}` is not supported in ACP mode. Type `/help` for available commands."
+            ));
+            return Ok(());
         };
 
         let response = match &command {

@@ -64,7 +64,7 @@ pub(crate) fn render_help_topic(topic: LocalHelpTopic) -> String {
   Usage            scode acp [serve]
   Aliases          scode --acp · scode -acp
   Purpose          run the ACP JSON-RPC agent server over stdio for editor integrations
-  Transport        LSP-style Content-Length framed JSON-RPC on stdin/stdout
+  Transport        line-delimited JSON-RPC on stdin/stdout
   Sessions         session/new creates managed .scode sessions for the requested cwd
   Related          scode --help"
             .to_string(),
@@ -575,7 +575,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  scode acp [serve]")?;
     writeln!(
         out,
-        "      Run the ACP JSON-RPC stdio server for editor integrations (aliases: --acp, -acp)"
+        "      Run the ACP stdio server for editor integrations (line-delimited JSON-RPC)"
     )?;
     writeln!(out, "      Source of truth: {OFFICIAL_REPO_SLUG}")?;
     writeln!(

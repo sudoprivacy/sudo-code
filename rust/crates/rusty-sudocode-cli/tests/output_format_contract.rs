@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,13 +48,14 @@ fn status_and_sandbox_emit_json_when_requested() {
 }
 
 #[test]
-fn acp_server_responds_to_framed_initialize() {
+fn acp_server_responds_to_line_delimited_initialize() {
     let root = unique_temp_dir("acp-jsonrpc");
     fs::create_dir_all(&root).expect("temp dir should exist");
 
-    let acp = assert_framed_acp_command(
+    let acp = assert_line_delimited_acp_command(
         &root,
         &["--output-format", "json", "acp"],
+        &[],
         &json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -75,6 +76,73 @@ fn acp_server_responds_to_framed_initialize() {
         false
     );
     assert_eq!(acp["result"]["authMethods"], json!([]));
+}
+
+#[test]
+fn acp_server_handles_session_prompt_for_local_slash_command() {
+    let root = unique_temp_dir("acp-slash-prompt");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let (initialize, new_session, update, prompt_response) = assert_line_delimited_acp_slash_prompt(
+        &root,
+        &["--output-format", "json", "acp"],
+        &[],
+        "/help",
+    );
+
+    assert_eq!(initialize["id"], 1);
+    assert_eq!(new_session["id"], 2);
+    assert!(new_session["result"]["sessionId"].as_str().is_some());
+    assert_eq!(update["method"], "session/update");
+    assert_eq!(
+        update["params"]["update"]["sessionUpdate"],
+        "agent_message_chunk"
+    );
+    assert!(update["params"]["update"]["content"]["text"]
+        .as_str()
+        .expect("slash prompt text")
+        .contains("Slash commands"));
+    assert_eq!(prompt_response["id"], 3);
+    assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
+}
+
+#[test]
+fn acp_server_lists_created_sessions() {
+    let root = unique_temp_dir("acp-session-list");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let (first_session_id, second_session_id, session_list) =
+        assert_line_delimited_acp_session_list(&root, &["--output-format", "json", "acp"], &[]);
+
+    let listed_ids = session_list["result"]["sessions"]
+        .as_array()
+        .expect("sessions should be an array")
+        .iter()
+        .filter_map(|session| session["sessionId"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(listed_ids.contains(&first_session_id.as_str()));
+    assert!(listed_ids.contains(&second_session_id.as_str()));
+}
+
+#[test]
+fn acp_server_reports_unknown_slash_commands_as_not_supported() {
+    let root = unique_temp_dir("acp-unknown-slash");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let (_initialize, _new_session, update, prompt_response) =
+        assert_line_delimited_acp_slash_prompt(
+            &root,
+            &["--output-format", "json", "acp"],
+            &[],
+            "/nonexistent",
+        );
+
+    assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
+    assert!(update["params"]["update"]["content"]["text"]
+        .as_str()
+        .expect("unknown slash text")
+        .contains("not supported"));
 }
 
 #[test]
@@ -421,52 +489,234 @@ fn run_scode(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output
     command.output().expect("scode should launch")
 }
 
-fn assert_framed_acp_command(current_dir: &Path, args: &[&str], request: &Value) -> Value {
-    let request = serde_json::to_vec(request).expect("request should serialize");
-    let frame = format!("Content-Length: {}\r\n\r\n", request.len());
+fn assert_line_delimited_acp_command(
+    current_dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    request: &Value,
+) -> Value {
+    let request = serde_json::to_string(request).expect("request should serialize");
     let mut child = Command::new(env!("CARGO_BIN_EXE_scode"))
         .current_dir(current_dir)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .envs(envs.iter().copied())
         .spawn()
         .expect("scode should launch");
     {
         let stdin = child.stdin.as_mut().expect("stdin should be piped");
         stdin
-            .write_all(frame.as_bytes())
-            .expect("frame header should write");
-        stdin.write_all(&request).expect("frame body should write");
+            .write_all(request.as_bytes())
+            .expect("request line should write");
+        stdin.write_all(b"\n").expect("newline should write");
     }
     drop(child.stdin.take());
-    let output = child.wait_with_output().expect("scode should exit");
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\n\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    parse_framed_json(&output.stdout)
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout should be piped"));
+    let mut stderr = child.stderr.take().expect("stderr should be piped");
+    let mut response_line = String::new();
+    stdout
+        .read_line(&mut response_line)
+        .expect("response line should read");
+    if response_line.trim().is_empty() {
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut stderr_output = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut stderr_output);
+        panic!("stdout did not contain a JSON-RPC response line\n\nstderr:\n{stderr_output}");
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    serde_json::from_str(&response_line).expect("response line should be valid json")
 }
 
-fn parse_framed_json(stdout: &[u8]) -> Value {
-    let header_end = stdout
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .expect("stdout should contain JSON-RPC frame headers");
-    let headers = std::str::from_utf8(&stdout[..header_end]).expect("headers should be utf8");
-    let content_length = headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("Content-Length")
-                .then(|| value.trim().parse::<usize>().expect("valid content length"))
-        })
-        .expect("Content-Length header should exist");
-    let body_start = header_end + 4;
-    let body_end = body_start + content_length;
-    serde_json::from_slice(&stdout[body_start..body_end]).expect("body should be valid json")
+fn assert_line_delimited_acp_slash_prompt(
+    current_dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    prompt: &str,
+) -> (Value, Value, Value, Value) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_scode"))
+        .current_dir(current_dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .envs(envs.iter().copied())
+        .spawn()
+        .expect("scode should launch");
+    let mut stdin = child.stdin.take().expect("stdin should be piped");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout should be piped"));
+    let mut stderr = child.stderr.take().expect("stderr should be piped");
+
+    let read_json_line = |stdout: &mut std::io::BufReader<_>,
+                          stderr: &mut _,
+                          child: &mut std::process::Child|
+     -> Value {
+        let mut line = String::new();
+        stdout
+            .read_line(&mut line)
+            .expect("response line should read");
+        if line.trim().is_empty() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let mut stderr_output = String::new();
+            let _ = std::io::Read::read_to_string(stderr, &mut stderr_output);
+            panic!("stdout did not contain a JSON-RPC response line\n\nstderr:\n{stderr_output}");
+        }
+        serde_json::from_str(&line).expect("response line should be valid json")
+    };
+
+    for request in [
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": 9 },
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/new",
+            "params": {
+                "cwd": current_dir,
+                "mcpServers": [],
+            },
+        }),
+    ] {
+        let request = serde_json::to_string(&request).expect("request should serialize");
+        stdin
+            .write_all(request.as_bytes())
+            .expect("request line should write");
+        stdin.write_all(b"\n").expect("newline should write");
+    }
+
+    let initialize: Value = read_json_line(&mut stdout, &mut stderr, &mut child);
+    let new_session: Value = read_json_line(&mut stdout, &mut stderr, &mut child);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .expect("session/new should return sessionId");
+    let prompt_request = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": prompt }],
+        },
+    }))
+    .expect("prompt request should serialize");
+    stdin
+        .write_all(prompt_request.as_bytes())
+        .expect("prompt request should write");
+    stdin.write_all(b"\n").expect("newline should write");
+
+    let update: Value = read_json_line(&mut stdout, &mut stderr, &mut child);
+    let prompt_response: Value = read_json_line(&mut stdout, &mut stderr, &mut child);
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    (initialize, new_session, update, prompt_response)
+}
+
+fn assert_line_delimited_acp_session_list(
+    current_dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (String, String, Value) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_scode"))
+        .current_dir(current_dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .envs(envs.iter().copied())
+        .spawn()
+        .expect("scode should launch");
+    let mut stdin = child.stdin.take().expect("stdin should be piped");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout should be piped"));
+    let mut stderr = child.stderr.take().expect("stderr should be piped");
+
+    let read_json_line = |stdout: &mut std::io::BufReader<_>,
+                          stderr: &mut _,
+                          child: &mut std::process::Child|
+     -> Value {
+        let mut line = String::new();
+        stdout
+            .read_line(&mut line)
+            .expect("response line should read");
+        if line.trim().is_empty() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let mut stderr_output = String::new();
+            let _ = std::io::Read::read_to_string(stderr, &mut stderr_output);
+            panic!("stdout did not contain a JSON-RPC response line\n\nstderr:\n{stderr_output}");
+        }
+        serde_json::from_str(&line).expect("response line should be valid json")
+    };
+
+    for request in [
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": 9 },
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/new",
+            "params": {
+                "cwd": current_dir,
+                "mcpServers": [],
+            },
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/new",
+            "params": {
+                "cwd": current_dir,
+                "mcpServers": [],
+            },
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "session/list",
+            "params": {},
+        }),
+    ] {
+        let request = serde_json::to_string(&request).expect("request should serialize");
+        stdin
+            .write_all(request.as_bytes())
+            .expect("request line should write");
+        stdin.write_all(b"\n").expect("newline should write");
+    }
+
+    let _initialize: Value = read_json_line(&mut stdout, &mut stderr, &mut child);
+    let first_session: Value = read_json_line(&mut stdout, &mut stderr, &mut child);
+    let second_session: Value = read_json_line(&mut stdout, &mut stderr, &mut child);
+    let session_list: Value = read_json_line(&mut stdout, &mut stderr, &mut child);
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    (
+        first_session["result"]["sessionId"]
+            .as_str()
+            .expect("first session id should exist")
+            .to_string(),
+        second_session["result"]["sessionId"]
+            .as_str()
+            .expect("second session id should exist")
+            .to_string(),
+        session_list,
+    )
 }
 
 fn write_upstream_fixture(root: &Path) -> PathBuf {

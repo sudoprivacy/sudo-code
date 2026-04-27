@@ -52,8 +52,8 @@ mod usage;
 pub mod worker_boot;
 
 pub use acp_server::{
-    run_acp_server_with_io, run_acp_stdio_server, AcpAgent, AcpError, AcpServerError,
-    AcpServerOptions, AcpSessionUpdateObserver,
+    run_acp_stdio_server, AcpAgent, AcpError, AcpServerError, AcpServerOptions, AcpSessionInfo,
+    AcpSessionUpdateObserver,
 };
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
