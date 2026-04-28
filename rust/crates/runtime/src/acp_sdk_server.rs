@@ -236,19 +236,6 @@ pub(crate) fn extract_content_from_blocks(
     Ok((texts.join("\n"), images))
 }
 
-/// Backward-compatible helper that extracts only text.
-pub(crate) fn extract_text_from_content_blocks(
-    blocks: &[ContentBlock],
-) -> Result<String, AcpError> {
-    let (text, _images) = extract_content_from_blocks(blocks)?;
-    if text.is_empty() {
-        return Err(AcpError::invalid_params(
-            "prompt must include at least one non-empty text content block",
-        ));
-    }
-    Ok(text)
-}
-
 /// Re-export `StopReason` so the CLI crate doesn't need a direct dep on
 /// the schema crate.
 pub use agent_client_protocol_schema::StopReason as AcpStopReason;
@@ -452,13 +439,22 @@ pub async fn run_sdk_acp_server(
                 async move |req: PromptRequest,
                             responder: Responder<PromptResponse>,
                             cx: ConnectionTo<Client>| {
-                    let prompt_text = match extract_text_from_content_blocks(&req.prompt) {
-                        Ok(t) => t,
+                    let (prompt_text, images) = match extract_content_from_blocks(&req.prompt) {
+                        Ok(r) => r,
                         Err(e) => {
                             responder.respond_with_error(acp_error_to_sdk(&e))?;
                             return Ok(());
                         }
                     };
+                    // Text is required (images alone aren't enough to drive a turn).
+                    if prompt_text.is_empty() {
+                        responder.respond_with_error(acp_error_to_sdk(
+                            &AcpError::invalid_params(
+                                "prompt must include at least one non-empty text content block",
+                            ),
+                        ))?;
+                        return Ok(());
+                    }
 
                     let d = Arc::clone(&delegate);
                     let sid = req.session_id.to_string();
@@ -478,6 +474,12 @@ pub async fn run_sdk_acp_server(
                             let mut bridge = AcpPermissionBridge { tx: bridge_tx };
                             let mut delegate =
                                 d.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+                            // Push image content blocks into the session before
+                            // running the prompt so the API client includes them.
+                            if !images.is_empty() {
+                                let _ = delegate.push_images(&sid_for_blocking, &images);
+                            }
 
                             let stop = if prompt_text.starts_with('/') {
                                 delegate
