@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::role::acp::{Agent, Client};
 use agent_client_protocol::{
-    on_receive_dispatch, on_receive_notification, on_receive_request, ConnectionTo, Dispatch,
-    Error, Responder,
+    on_receive_dispatch, on_receive_notification, on_receive_request, ConnectTo, ConnectionTo,
+    Dispatch, Error, Responder,
 };
 use agent_client_protocol_schema::{
     AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse, ContentBlock,
@@ -274,29 +274,6 @@ pub use agent_client_protocol_schema::StopReason as AcpStopReason;
 /// Thread-safe handle to a delegate, shared across async handlers.
 pub type SharedDelegate = Arc<Mutex<Box<dyn SdkAcpDelegate>>>;
 
-/// Run a prompt through the delegate (blocking), returning the stop reason
-/// and buffered notifications. Handles slash-command dispatch internally.
-pub(crate) fn run_delegate_prompt(
-    delegate: &SharedDelegate,
-    session_id: &str,
-    prompt: String,
-) -> (StopReason, Vec<SessionNotification>) {
-    let mut observer = SdkSessionObserver::new(session_id);
-    let mut delegate = delegate
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let stop = if prompt.starts_with('/') {
-        delegate
-            .handle_slash_command(session_id, &prompt, &mut observer)
-            .map(|()| StopReason::EndTurn)
-    } else {
-        delegate.run_prompt(session_id, prompt, &mut observer)
-    };
-    let notifications = observer.drain();
-    let reason = stop.unwrap_or(StopReason::EndTurn);
-    (reason, notifications)
-}
-
 /// A permission prompter that bridges to the ACP client over channels.
 ///
 /// From inside the blocking `spawn_blocking` context, `decide()` sends
@@ -397,13 +374,26 @@ fn uuid_v4() -> String {
 // ---------------------------------------------------------------------------
 
 /// Run the SDK-based ACP server on stdin/stdout.
-#[allow(clippy::too_many_lines)]
 pub async fn run_sdk_acp_server(
     config: SdkAcpConfig,
     delegate: Box<dyn SdkAcpDelegate>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let agent_version = config.agent_version.clone();
     let delegate: SharedDelegate = Arc::new(Mutex::new(delegate));
+    run_acp_on_transport(&config, delegate, Stdio::new()).await
+}
+
+/// Run the ACP agent handler chain on an arbitrary transport.
+///
+/// This is the shared core used by both the stdio server and the WebSocket
+/// server. The transport must implement `ConnectTo<Agent>` (e.g. `Stdio` or
+/// `Lines`).
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn run_acp_on_transport(
+    config: &SdkAcpConfig,
+    delegate: SharedDelegate,
+    transport: impl ConnectTo<Agent>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let agent_version = config.agent_version.clone();
 
     Agent
         .builder()
@@ -725,7 +715,7 @@ pub async fn run_sdk_acp_server(
             },
             on_receive_dispatch!(),
         )
-        .connect_to(Stdio::new())
+        .connect_to(transport)
         .await?;
 
     Ok(())

@@ -2051,6 +2051,7 @@ dependencies = [
  "agent-client-protocol-schema",
  "agent-client-protocol-tokio",
  "axum",
+ "futures",
  "glob",
  "keyring",
  "plugins",
