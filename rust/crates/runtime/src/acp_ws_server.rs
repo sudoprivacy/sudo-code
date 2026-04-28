@@ -1,10 +1,10 @@
 //! WebSocket-based ACP server using axum.
 //!
-//! Provides a browser-accessible endpoint that wraps the same `DelegateProxy`
-//! + `spawn_delegate_worker` pattern used by the stdio server.
+//! Provides a browser-accessible endpoint that shares the same
+//! `SharedDelegate` pattern used by the stdio server.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
@@ -14,14 +14,14 @@ use axum::Router;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
-use crate::acp_sdk_server::{spawn_delegate_worker, DelegateProxy, SdkAcpConfig, SdkAcpDelegate};
+use crate::acp_sdk_server::{run_delegate_prompt, SdkAcpConfig, SdkAcpDelegate, SharedDelegate};
 
 static WEB_UI_HTML: &str = include_str!("acp_web_ui.html");
 
 #[derive(Clone)]
 struct AppState {
     config: SdkAcpConfig,
-    proxy: Arc<DelegateProxy>,
+    delegate: SharedDelegate,
 }
 
 /// Run an ACP server over WebSocket + serve the embedded web UI.
@@ -29,18 +29,14 @@ struct AppState {
 /// # Errors
 ///
 /// Returns an error if the TCP listener or axum server fails.
-pub async fn run_acp_ws_server<F>(
+pub async fn run_acp_ws_server(
     config: SdkAcpConfig,
-    delegate_factory: F,
+    delegate: Box<dyn SdkAcpDelegate>,
     port: u16,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    F: FnOnce() -> Box<dyn SdkAcpDelegate> + Send + 'static,
-{
-    let proxy = spawn_delegate_worker(delegate_factory);
+) -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         config,
-        proxy: Arc::new(proxy),
+        delegate: Arc::new(Mutex::new(delegate)),
     };
     let app = Router::new()
         .route("/", get(serve_html))
@@ -143,10 +139,15 @@ async fn handle_session_new(socket: &mut WebSocket, state: &AppState, id: &Value
         PathBuf::from,
     );
 
-    let proxy = Arc::clone(&state.proxy);
-    let result = tokio::task::spawn_blocking(move || proxy.new_session(cwd))
-        .await
-        .unwrap_or_else(|e| Err(crate::acp_sdk_server::AcpError::internal(e.to_string())));
+    let delegate = Arc::clone(&state.delegate);
+    let result = tokio::task::spawn_blocking(move || {
+        delegate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .new_session(cwd)
+    })
+    .await
+    .unwrap_or_else(|e| Err(crate::acp_sdk_server::AcpError::internal(e.to_string())));
 
     let resp = match result {
         Ok((session_id, _cwd)) => json!({
@@ -181,10 +182,10 @@ async fn handle_session_prompt(
         return;
     };
 
-    let proxy = Arc::clone(&state.proxy);
+    let delegate = Arc::clone(&state.delegate);
     let sid = session_id.clone();
     let (stop_reason, notifications) =
-        tokio::task::spawn_blocking(move || proxy.prompt(sid, prompt_text))
+        tokio::task::spawn_blocking(move || run_delegate_prompt(&delegate, &sid, prompt_text))
             .await
             .unwrap_or_else(|_| {
                 (
@@ -215,10 +216,15 @@ async fn handle_session_prompt(
 }
 
 async fn handle_session_list(socket: &mut WebSocket, state: &AppState, id: &Value) {
-    let proxy = Arc::clone(&state.proxy);
-    let sessions = tokio::task::spawn_blocking(move || proxy.list_sessions())
-        .await
-        .unwrap_or_default();
+    let delegate = Arc::clone(&state.delegate);
+    let sessions = tokio::task::spawn_blocking(move || {
+        delegate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .list_sessions()
+    })
+    .await
+    .unwrap_or_default();
 
     let infos: Vec<Value> = sessions
         .into_iter()

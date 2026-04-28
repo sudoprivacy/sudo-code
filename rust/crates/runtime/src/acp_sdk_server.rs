@@ -5,7 +5,7 @@
 //! compliance. It is feature-gated behind `acp-sdk`.
 
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::role::acp::{Agent, Client};
 use agent_client_protocol::{
@@ -67,10 +67,7 @@ pub struct SdkAcpConfig {
 /// Callback trait that the CLI crate implements to provide session
 /// construction and prompt execution, keeping runtime/provider deps out of
 /// this crate.
-///
-/// All methods are called on a dedicated worker thread, so implementations
-/// do not need to be `Send`.
-pub trait SdkAcpDelegate: 'static {
+pub trait SdkAcpDelegate: Send + 'static {
     /// Create a new session for the given working directory, returning
     /// `(session_id, cwd)` on success.
     fn new_session(&mut self, cwd: PathBuf) -> Result<(String, PathBuf), AcpError>;
@@ -204,111 +201,30 @@ pub(crate) fn extract_text_from_content_blocks(
 /// the schema crate.
 pub use agent_client_protocol_schema::StopReason as AcpStopReason;
 
-// ---------------------------------------------------------------------------
-// Channel-based delegate proxy
-// ---------------------------------------------------------------------------
+/// Thread-safe handle to a delegate, shared across async handlers.
+pub type SharedDelegate = Arc<Mutex<Box<dyn SdkAcpDelegate>>>;
 
-/// Commands sent from async handlers to the dedicated delegate worker thread.
-pub(crate) enum DelegateCmd {
-    NewSession {
-        cwd: PathBuf,
-        reply: mpsc::Sender<Result<(String, PathBuf), AcpError>>,
-    },
-    Prompt {
-        session_id: String,
-        prompt: String,
-        reply: mpsc::Sender<(StopReason, Vec<SessionNotification>)>,
-    },
-    ListSessions {
-        reply: mpsc::Sender<Vec<(String, PathBuf)>>,
-    },
-}
-
-/// A `Send + Sync` handle that async handlers use to invoke the delegate
-/// on its dedicated thread via channels.
-#[derive(Clone)]
-pub(crate) struct DelegateProxy {
-    cmd_tx: mpsc::Sender<DelegateCmd>,
-}
-
-impl DelegateProxy {
-    pub(crate) fn new_session(&self, cwd: PathBuf) -> Result<(String, PathBuf), AcpError> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        let _ = self.cmd_tx.send(DelegateCmd::NewSession {
-            cwd,
-            reply: reply_tx,
-        });
-        reply_rx
-            .recv()
-            .unwrap_or_else(|_| Err(AcpError::internal("delegate worker gone")))
-    }
-
-    pub(crate) fn prompt(
-        &self,
-        session_id: String,
-        prompt: String,
-    ) -> (StopReason, Vec<SessionNotification>) {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        let _ = self.cmd_tx.send(DelegateCmd::Prompt {
-            session_id,
-            prompt,
-            reply: reply_tx,
-        });
-        reply_rx.recv().unwrap_or((StopReason::EndTurn, Vec::new()))
-    }
-
-    pub(crate) fn list_sessions(&self) -> Vec<(String, PathBuf)> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        let _ = self
-            .cmd_tx
-            .send(DelegateCmd::ListSessions { reply: reply_tx });
-        reply_rx.recv().unwrap_or_default()
-    }
-}
-
-/// Spawn a dedicated OS thread that owns the (non-Send) delegate and
-/// processes commands from the channel.
-///
-/// The delegate factory is called on the worker thread so the delegate
-/// itself never needs to be `Send`.
-pub(crate) fn spawn_delegate_worker<F>(factory: F) -> DelegateProxy
-where
-    F: FnOnce() -> Box<dyn SdkAcpDelegate> + Send + 'static,
-{
-    let (cmd_tx, cmd_rx) = mpsc::channel::<DelegateCmd>();
-
-    std::thread::spawn(move || {
-        let mut delegate = factory();
-        while let Ok(cmd) = cmd_rx.recv() {
-            match cmd {
-                DelegateCmd::NewSession { cwd, reply } => {
-                    let _ = reply.send(delegate.new_session(cwd));
-                }
-                DelegateCmd::Prompt {
-                    session_id,
-                    prompt,
-                    reply,
-                } => {
-                    let mut observer = SdkSessionObserver::new(&session_id);
-                    let stop = if prompt.starts_with('/') {
-                        delegate
-                            .handle_slash_command(&session_id, &prompt, &mut observer)
-                            .map(|()| StopReason::EndTurn)
-                    } else {
-                        delegate.run_prompt(&session_id, prompt, &mut observer)
-                    };
-                    let notifications = observer.drain();
-                    let reason = stop.unwrap_or(StopReason::EndTurn);
-                    let _ = reply.send((reason, notifications));
-                }
-                DelegateCmd::ListSessions { reply } => {
-                    let _ = reply.send(delegate.list_sessions());
-                }
-            }
-        }
-    });
-
-    DelegateProxy { cmd_tx }
+/// Run a prompt through the delegate (blocking), returning the stop reason
+/// and buffered notifications. Handles slash-command dispatch internally.
+pub(crate) fn run_delegate_prompt(
+    delegate: &SharedDelegate,
+    session_id: &str,
+    prompt: String,
+) -> (StopReason, Vec<SessionNotification>) {
+    let mut observer = SdkSessionObserver::new(session_id);
+    let mut delegate = delegate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stop = if prompt.starts_with('/') {
+        delegate
+            .handle_slash_command(session_id, &prompt, &mut observer)
+            .map(|()| StopReason::EndTurn)
+    } else {
+        delegate.run_prompt(session_id, prompt, &mut observer)
+    };
+    let notifications = observer.drain();
+    let reason = stop.unwrap_or(StopReason::EndTurn);
+    (reason, notifications)
 }
 
 // ---------------------------------------------------------------------------
@@ -316,20 +232,13 @@ where
 // ---------------------------------------------------------------------------
 
 /// Run the SDK-based ACP server on stdin/stdout.
-///
-/// The `delegate_factory` is called on a dedicated OS thread to create the
-/// delegate, so the delegate itself does not need to be `Send`. The factory
-/// closure *does* need to be `Send`.
 #[allow(clippy::too_many_lines)]
-pub async fn run_sdk_acp_server<F>(
+pub async fn run_sdk_acp_server(
     config: SdkAcpConfig,
-    delegate_factory: F,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    F: FnOnce() -> Box<dyn SdkAcpDelegate> + Send + 'static,
-{
+    delegate: Box<dyn SdkAcpDelegate>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let agent_version = config.agent_version.clone();
-    let proxy = spawn_delegate_worker(delegate_factory);
+    let delegate: SharedDelegate = Arc::new(Mutex::new(delegate));
 
     Agent
         .builder()
@@ -355,15 +264,19 @@ where
         // --- session/new ---
         .on_receive_request(
             {
-                let proxy = proxy.clone();
+                let delegate = Arc::clone(&delegate);
                 async move |req: NewSessionRequest,
                             responder: Responder<NewSessionResponse>,
                             cx: ConnectionTo<Client>| {
-                    let p = proxy.clone();
+                    let d = Arc::clone(&delegate);
                     cx.spawn(async move {
-                        let result = tokio::task::spawn_blocking(move || p.new_session(req.cwd))
-                            .await
-                            .unwrap_or_else(|e| Err(AcpError::internal(e.to_string())));
+                        let result = tokio::task::spawn_blocking(move || {
+                            d.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .new_session(req.cwd)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(AcpError::internal(e.to_string())));
 
                         match result {
                             Ok((session_id, _cwd)) => {
@@ -383,11 +296,10 @@ where
         // --- session/prompt ---
         .on_receive_request(
             {
-                let proxy = proxy.clone();
+                let delegate = Arc::clone(&delegate);
                 async move |req: PromptRequest,
                             responder: Responder<PromptResponse>,
                             cx: ConnectionTo<Client>| {
-                    let session_id = req.session_id.to_string();
                     let prompt_text = match extract_text_from_content_blocks(&req.prompt) {
                         Ok(t) => t,
                         Err(e) => {
@@ -396,17 +308,16 @@ where
                         }
                     };
 
-                    // Spawn blocking work off the dispatch loop.
-                    let p = proxy.clone();
-                    let sid = session_id.clone();
+                    let d = Arc::clone(&delegate);
+                    let sid = req.session_id.to_string();
                     let cx_inner = cx.clone();
                     cx.spawn(async move {
-                        let (stop_reason, notifications) =
-                            tokio::task::spawn_blocking(move || p.prompt(sid, prompt_text))
-                                .await
-                                .unwrap_or((StopReason::EndTurn, Vec::new()));
+                        let (stop_reason, notifications) = tokio::task::spawn_blocking(move || {
+                            run_delegate_prompt(&d, &sid, prompt_text)
+                        })
+                        .await
+                        .unwrap_or((StopReason::EndTurn, Vec::new()));
 
-                        // Send all buffered session update notifications.
                         for notif in notifications {
                             cx_inner.send_notification(notif)?;
                         }
@@ -435,14 +346,16 @@ where
         // --- session/list ---
         .on_receive_request(
             {
-                let proxy = proxy.clone();
+                let delegate = Arc::clone(&delegate);
                 async move |_req: ListSessionsRequest,
                             responder: Responder<ListSessionsResponse>,
                             cx: ConnectionTo<Client>| {
-                    let p = proxy.clone();
+                    let d = Arc::clone(&delegate);
                     cx.spawn(async move {
                         let infos = tokio::task::spawn_blocking(move || {
-                            p.list_sessions()
+                            d.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .list_sessions()
                                 .into_iter()
                                 .map(|(id, cwd)| SessionInfo::new(id, cwd))
                                 .collect::<Vec<_>>()

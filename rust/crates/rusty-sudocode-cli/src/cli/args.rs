@@ -777,22 +777,6 @@ pub(crate) fn parse_acp_args(
             auth_mode,
             ws_port: Some(8080),
         }),
-        [sub, port_flag] if sub == "serve" && port_flag.starts_with("--port=") => {
-            let port = port_flag
-                .strip_prefix("--port=")
-                .unwrap()
-                .parse::<u16>()
-                .map_err(|_| "invalid port number for --port".to_string())?;
-            Ok(CliAction::Acp {
-                model,
-                model_flag_raw,
-                allowed_tools,
-                permission_mode_override,
-                reasoning_effort,
-                auth_mode,
-                ws_port: Some(port),
-            })
-        }
         [sub, flag, port_str] if sub == "serve" && flag == "--port" => {
             let port = port_str
                 .parse::<u16>()
@@ -808,7 +792,7 @@ pub(crate) fn parse_acp_args(
             })
         }
         _ => Err(String::from(
-            "unsupported ACP invocation. Use `scode acp`, `scode acp serve [--port N]`, `scode --acp`, or `scode -acp`.",
+            "unsupported ACP invocation. Usage: `scode acp` or `scode acp serve [--port N]`",
         )),
     }
 }
