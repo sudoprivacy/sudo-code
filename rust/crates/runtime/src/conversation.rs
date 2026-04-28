@@ -51,7 +51,7 @@ pub struct PromptCacheEvent {
 }
 
 /// Minimal streaming API contract required by [`ConversationRuntime`].
-pub trait ApiClient {
+pub trait ApiClient: Send {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
 }
 
@@ -72,7 +72,7 @@ pub trait RuntimeObserver {
 }
 
 /// Trait implemented by tool dispatchers that execute model-requested tools.
-pub trait ToolExecutor {
+pub trait ToolExecutor: Send {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
 }
 
@@ -151,7 +151,7 @@ pub struct ConversationRuntime<C, T> {
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
     hook_abort_signal: HookAbortSignal,
-    hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
+    hook_progress_reporter: Option<Box<dyn HookProgressReporter + Send>>,
     session_tracer: Option<SessionTracer>,
 }
 
@@ -226,7 +226,7 @@ where
     #[must_use]
     pub fn with_hook_progress_reporter(
         mut self,
-        hook_progress_reporter: Box<dyn HookProgressReporter>,
+        hook_progress_reporter: Box<dyn HookProgressReporter + Send>,
     ) -> Self {
         self.hook_progress_reporter = Some(hook_progress_reporter);
         self
@@ -856,7 +856,7 @@ fn merge_hook_feedback(messages: &[String], output: String, is_error: bool) -> S
     sections.join("\n\n")
 }
 
-type ToolHandler = Box<dyn FnMut(&str) -> Result<String, ToolError>>;
+type ToolHandler = Box<dyn FnMut(&str) -> Result<String, ToolError> + Send>;
 
 /// Simple in-memory tool executor for tests and lightweight integrations.
 #[derive(Default)]
@@ -874,7 +874,7 @@ impl StaticToolExecutor {
     pub fn register(
         mut self,
         tool_name: impl Into<String>,
-        handler: impl FnMut(&str) -> Result<String, ToolError> + 'static,
+        handler: impl FnMut(&str) -> Result<String, ToolError> + Send + 'static,
     ) -> Self {
         self.handlers.insert(tool_name.into(), Box::new(handler));
         self
@@ -2050,6 +2050,12 @@ mod tests {
         assert!(error
             .to_string()
             .contains("conversation loop exceeded the maximum number of iterations"));
+    }
+
+    #[test]
+    fn conversation_runtime_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ConversationRuntime<ScriptedApiClient, StaticToolExecutor>>();
     }
 
     #[test]
