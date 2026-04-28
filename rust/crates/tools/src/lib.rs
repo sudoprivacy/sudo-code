@@ -4,7 +4,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, resolve_provider_from_config, ApiError, ContentBlockDelta,
+    max_tokens_for_model, resolve_provider_from_config, ApiError, ContentBlockDelta, ImageSource,
     InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
     ProviderClient, StreamEvent as ApiStreamEvent, SudoCodeConfig, ToolChoice, ToolDefinition,
     ToolResultContentBlock,
@@ -4776,6 +4776,13 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Image { data, mime_type } => InputContentBlock::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: mime_type.clone(),
+                            data: data.clone(),
+                        },
+                    },
                     ContentBlock::ToolUse {
                         id,
                         name,

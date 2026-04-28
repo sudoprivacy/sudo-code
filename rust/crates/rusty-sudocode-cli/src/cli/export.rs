@@ -70,6 +70,10 @@ pub(crate) fn render_session_markdown(
                         lines.push(String::new());
                     }
                 }
+                ContentBlock::Image { mime_type, .. } => {
+                    lines.push(format!("![image]({mime_type})"));
+                    lines.push(String::new());
+                }
                 ContentBlock::ToolUse {
                     id, name, input, ..
                 } => {
@@ -256,6 +260,9 @@ pub(crate) fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::Image { mime_type, .. } => {
+                    lines.push(format!("[image mime_type={mime_type}]"));
+                }
                 ContentBlock::ToolUse {
                     id, name, input, ..
                 } => {

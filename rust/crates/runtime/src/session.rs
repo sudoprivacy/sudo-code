@@ -30,6 +30,12 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    Image {
+        /// Base64-encoded image data.
+        data: String,
+        /// MIME type, e.g. `image/png`, `image/jpeg`.
+        mime_type: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -738,6 +744,14 @@ impl ContentBlock {
                 object.insert("type".to_string(), JsonValue::String("text".to_string()));
                 object.insert("text".to_string(), JsonValue::String(text.clone()));
             }
+            Self::Image { data, mime_type } => {
+                object.insert("type".to_string(), JsonValue::String("image".to_string()));
+                object.insert("data".to_string(), JsonValue::String(data.clone()));
+                object.insert(
+                    "mime_type".to_string(),
+                    JsonValue::String(mime_type.clone()),
+                );
+            }
             Self::ToolUse {
                 id,
                 name,
@@ -794,6 +808,10 @@ impl ContentBlock {
         {
             "text" => Ok(Self::Text {
                 text: required_string(object, "text")?,
+            }),
+            "image" => Ok(Self::Image {
+                data: required_string(object, "data")?,
+                mime_type: required_string(object, "mime_type")?,
             }),
             "tool_use" => Ok(Self::ToolUse {
                 id: required_string(object, "id")?,
@@ -1273,6 +1291,24 @@ mod tests {
 
         assert_eq!(restored.messages.len(), 2);
         assert_eq!(restored.messages[0], ConversationMessage::user_text("hi"));
+    }
+
+    #[test]
+    fn persists_and_restores_image_blocks() {
+        let path = temp_session_path("image");
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Image {
+                data: "ZmFrZQ==".to_string(),
+                mime_type: "image/png".to_string(),
+            }]))
+            .expect("image message should append");
+
+        session.save_to_path(&path).expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(restored.messages, session.messages);
     }
 
     #[test]

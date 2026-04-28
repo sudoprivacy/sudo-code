@@ -331,11 +331,50 @@ where
     pub fn run_turn(
         &mut self,
         user_input: impl Into<String>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+        observer: Option<&mut dyn RuntimeObserver>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        let user_input = user_input.into();
+        let user_message = ConversationMessage {
+            role: crate::session::MessageRole::User,
+            blocks: vec![ContentBlock::Text {
+                text: user_input.clone(),
+            }],
+            usage: None,
+        };
+        self.run_turn_impl(user_input, user_message, prompter, observer)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn run_turn_with_user_blocks(
+        &mut self,
+        user_blocks: Vec<ContentBlock>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+        observer: Option<&mut dyn RuntimeObserver>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        if user_blocks.is_empty() {
+            return Err(RuntimeError::new(
+                "user prompt must include at least one content block",
+            ));
+        }
+
+        let user_input = summarize_user_blocks(&user_blocks);
+        let user_message = ConversationMessage {
+            role: crate::session::MessageRole::User,
+            blocks: user_blocks,
+            usage: None,
+        };
+        self.run_turn_impl(user_input, user_message, prompter, observer)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn run_turn_impl(
+        &mut self,
+        user_input: String,
+        user_message: ConversationMessage,
         mut prompter: Option<&mut dyn PermissionPrompter>,
         mut observer: Option<&mut dyn RuntimeObserver>,
     ) -> Result<TurnSummary, RuntimeError> {
-        let user_input = user_input.into();
-
         // ROADMAP #38: Session-health canary - probe if context was compacted
         if self.session.compaction.is_some() {
             if let Err(error) = self.run_session_health_probe() {
@@ -349,7 +388,7 @@ where
 
         self.record_turn_started(&user_input);
         self.session
-            .push_user_text(user_input)
+            .push_message(user_message)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
 
         let mut assistant_messages = Vec::new();
@@ -358,6 +397,10 @@ where
         let mut iterations = 0;
 
         loop {
+            if self.hook_abort_signal.is_aborted() {
+                return Err(RuntimeError::new("turn cancelled by abort signal"));
+            }
+
             iterations += 1;
             if iterations > self.max_iterations {
                 let error = RuntimeError::new(
@@ -462,6 +505,10 @@ where
                     )
                 };
 
+                if self.hook_abort_signal.is_aborted() {
+                    return Err(RuntimeError::new("turn cancelled by abort signal"));
+                }
+
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
                         self.record_tool_started(iterations, &tool_name);
@@ -549,12 +596,27 @@ where
     }
 
     #[must_use]
+    pub fn permission_policy(&self) -> &PermissionPolicy {
+        &self.permission_policy
+    }
+
+    #[must_use]
     pub fn session(&self) -> &Session {
         &self.session
     }
 
     pub fn api_client_mut(&mut self) -> &mut C {
         &mut self.api_client
+    }
+
+    pub fn permission_policy_mut(&mut self) -> &mut PermissionPolicy {
+        &mut self.permission_policy
+    }
+
+    /// Access the hook abort signal for external cancellation.
+    #[must_use]
+    pub fn hook_abort_signal(&self) -> &HookAbortSignal {
+        &self.hook_abort_signal
     }
 
     pub fn tool_executor_mut(&mut self) -> &mut T {
@@ -822,6 +884,32 @@ fn runtime_observer_mut<'a>(
         .map(|observer| &mut **observer as &mut dyn RuntimeObserver)
 }
 
+fn summarize_user_blocks(blocks: &[ContentBlock]) -> String {
+    let mut summary = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.trim()),
+            ContentBlock::Text { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::Image { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let image_count = blocks
+        .iter()
+        .filter(|block| matches!(block, ContentBlock::Image { .. }))
+        .count();
+    if image_count > 0 {
+        if !summary.is_empty() {
+            summary.push('\n');
+        }
+        summary.push_str(&format!("[{image_count} image attachment(s)]"));
+    }
+    summary
+}
+
 fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !text.is_empty() {
         blocks.push(ContentBlock::Text {
@@ -899,6 +987,7 @@ mod tests {
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::hooks::HookAbortSignal;
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
@@ -2087,5 +2176,125 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+    }
+
+    #[test]
+    fn run_turn_with_user_blocks_preserves_image_blocks_in_session_and_api_request() {
+        struct ImageAwareApi;
+
+        impl ApiClient for ImageAwareApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let user_message = request
+                    .messages
+                    .iter()
+                    .find(|message| message.role == MessageRole::User)
+                    .expect("user message should be present");
+                assert!(user_message.blocks.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::Image { mime_type, .. } if mime_type == "image/png"
+                )));
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ImageAwareApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn_with_user_blocks(
+                vec![
+                    ContentBlock::Text {
+                        text: "inspect this".to_string(),
+                    },
+                    ContentBlock::Image {
+                        data: "ZmFrZQ==".to_string(),
+                        mime_type: "image/png".to_string(),
+                    },
+                ],
+                None,
+                None,
+            )
+            .expect("image prompt should succeed");
+
+        let user_message = runtime
+            .session()
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::User)
+            .expect("user message should be stored");
+        assert!(user_message.blocks.iter().any(|block| matches!(
+            block,
+            ContentBlock::Image { mime_type, .. } if mime_type == "image/png"
+        )));
+    }
+
+    #[test]
+    fn run_turn_cancels_after_permission_prompt_abort_signal() {
+        struct ToolCallingApi;
+
+        impl ApiClient for ToolCallingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "dangerous".to_string(),
+                        input: "{}".to_string(),
+                        thought_signature: None,
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        struct AbortDuringPrompt {
+            abort_signal: HookAbortSignal,
+        }
+
+        impl PermissionPrompter for AbortDuringPrompt {
+            fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
+                self.abort_signal.abort();
+                PermissionPromptDecision::Deny {
+                    reason: "cancelled".to_string(),
+                }
+            }
+        }
+
+        let abort_signal = HookAbortSignal::new();
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ToolCallingApi,
+            StaticToolExecutor::new()
+                .register("dangerous", |_input| Ok("should not run".to_string())),
+            PermissionPolicy::new(PermissionMode::Prompt)
+                .with_tool_requirement("dangerous", PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_hook_abort_signal(abort_signal.clone());
+        let mut prompter = AbortDuringPrompt { abort_signal };
+
+        let error = runtime
+            .run_turn("cancel me", Some(&mut prompter), None)
+            .expect_err("abort signal should cancel the turn");
+
+        assert_eq!(error.to_string(), "turn cancelled by abort signal");
+        assert!(
+            runtime
+                .session()
+                .messages
+                .iter()
+                .all(|message| message.role != MessageRole::Tool),
+            "cancelled turns should not append tool results"
+        );
     }
 }

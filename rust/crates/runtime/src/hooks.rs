@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use tokio::sync::watch;
 
 use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
 use crate::permissions::PermissionOverride;
@@ -59,9 +60,20 @@ pub trait HookProgressReporter: Send {
     fn on_event(&mut self, event: &HookProgressEvent);
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HookAbortSignal {
     aborted: Arc<AtomicBool>,
+    state_tx: watch::Sender<bool>,
+}
+
+impl Default for HookAbortSignal {
+    fn default() -> Self {
+        let (state_tx, _state_rx) = watch::channel(false);
+        Self {
+            aborted: Arc::new(AtomicBool::new(false)),
+            state_tx,
+        }
+    }
 }
 
 impl HookAbortSignal {
@@ -72,11 +84,35 @@ impl HookAbortSignal {
 
     pub fn abort(&self) {
         self.aborted.store(true, Ordering::SeqCst);
+        let _ = self.state_tx.send(true);
+    }
+
+    /// Clear the abort flag so a new turn can run.
+    pub fn reset(&self) {
+        self.aborted.store(false, Ordering::SeqCst);
+        let _ = self.state_tx.send(false);
     }
 
     #[must_use]
     pub fn is_aborted(&self) -> bool {
         self.aborted.load(Ordering::SeqCst)
+    }
+
+    pub async fn wait_for_abort(&self) {
+        if self.is_aborted() {
+            return;
+        }
+
+        let mut state_rx = self.state_tx.subscribe();
+        if *state_rx.borrow() {
+            return;
+        }
+
+        while state_rx.changed().await.is_ok() {
+            if *state_rx.borrow() {
+                return;
+            }
+        }
     }
 }
 

@@ -2,13 +2,13 @@ use std::io::{self, Write};
 
 use api::{
     resolve_startup_auth_source, AnthropicClient, AuthMode, AuthSource, ContentBlockDelta,
-    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
-    PromptCache, ProviderClient as ApiProviderClient, StreamEvent as ApiStreamEvent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock,
+    ImageSource, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use runtime::{
-    ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
-    PromptCacheEvent, RuntimeError, TokenUsage,
+    ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, HookAbortSignal,
+    MessageRole, PromptCacheEvent, RuntimeError, TokenUsage,
 };
 use tools::GlobalToolRegistry;
 
@@ -41,6 +41,7 @@ pub(crate) struct AnthropicRuntimeClient {
     /// Shared flag from the Spinner. Set to `true` before writing output to
     /// pause the spinner animation, `false` after to let it resume.
     pub(crate) spinner_pause: Option<Arc<AtomicBool>>,
+    pub(crate) abort_signal: Option<HookAbortSignal>,
 }
 
 impl AnthropicRuntimeClient {
@@ -71,6 +72,7 @@ impl AnthropicRuntimeClient {
             progress_reporter: config.progress_reporter.clone(),
             reasoning_effort: None,
             spinner_pause: None,
+            abort_signal: None,
         })
     }
 
@@ -99,6 +101,10 @@ impl AnthropicRuntimeClient {
 
     pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+
+    pub(crate) fn set_abort_signal(&mut self, abort_signal: HookAbortSignal) {
+        self.abort_signal = Some(abort_signal);
     }
 }
 
@@ -169,13 +175,26 @@ impl AnthropicRuntimeClient {
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut stream = self
-            .client
-            .stream_message(message_request)
-            .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
+        let mut stream = if let Some(abort_signal) = &self.abort_signal {
+            tokio::select! {
+                biased;
+                _ = abort_signal.wait_for_abort() => {
+                    return Err(RuntimeError::new("turn cancelled by abort signal"));
+                }
+                result = self.client.stream_message(message_request) => {
+                    result.map_err(|error| {
+                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                    })?
+                }
+            }
+        } else {
+            self.client
+                .stream_message(message_request)
+                .await
+                .map_err(|error| {
+                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                })?
+        };
         let mut stdout = io::stdout();
         let mut sink = io::sink();
         let out: &mut dyn Write = if self.emit_output {
@@ -194,14 +213,50 @@ impl AnthropicRuntimeClient {
 
         loop {
             let next = if apply_stall_timeout && !received_any_event {
-                match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
-                    Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                    })?,
-                    Err(_elapsed) => {
-                        return Err(RuntimeError::new(
-                            "post-tool stall: model did not respond within timeout",
-                        ));
+                if let Some(abort_signal) = &self.abort_signal {
+                    tokio::select! {
+                        biased;
+                        _ = abort_signal.wait_for_abort() => {
+                            return Err(RuntimeError::new("turn cancelled by abort signal"));
+                        }
+                        result = tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()) => {
+                            match result {
+                                Ok(inner) => inner.map_err(|error| {
+                                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                                })?,
+                                Err(_elapsed) => {
+                                    return Err(RuntimeError::new(
+                                        "post-tool stall: model did not respond within timeout",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
+                        Ok(inner) => inner.map_err(|error| {
+                            RuntimeError::new(format_user_visible_api_error(
+                                &self.session_id,
+                                &error,
+                            ))
+                        })?,
+                        Err(_elapsed) => {
+                            return Err(RuntimeError::new(
+                                "post-tool stall: model did not respond within timeout",
+                            ));
+                        }
+                    }
+                }
+            } else if let Some(abort_signal) = &self.abort_signal {
+                tokio::select! {
+                    biased;
+                    _ = abort_signal.wait_for_abort() => {
+                        return Err(RuntimeError::new("turn cancelled by abort signal"));
+                    }
+                    result = stream.next_event() => {
+                        result.map_err(|error| {
+                            RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                        })?
                     }
                 }
             } else {
@@ -332,16 +387,30 @@ impl AnthropicRuntimeClient {
             return Ok(events);
         }
 
-        let response = self
-            .client
-            .send_message(&MessageRequest {
-                stream: false,
-                ..message_request.clone()
-            })
-            .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
+        let response_request = MessageRequest {
+            stream: false,
+            ..message_request.clone()
+        };
+        let response = if let Some(abort_signal) = &self.abort_signal {
+            tokio::select! {
+                biased;
+                _ = abort_signal.wait_for_abort() => {
+                    return Err(RuntimeError::new("turn cancelled by abort signal"));
+                }
+                result = self.client.send_message(&response_request) => {
+                    result.map_err(|error| {
+                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                    })?
+                }
+            }
+        } else {
+            self.client
+                .send_message(&response_request)
+                .await
+                .map_err(|error| {
+                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                })?
+        };
         let mut events = response_to_events(response, out)?;
         push_prompt_cache_record(&self.client, &mut events);
         Ok(events)
@@ -677,6 +746,13 @@ pub(crate) fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMes
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Image { data, mime_type } => InputContentBlock::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: mime_type.clone(),
+                            data: data.clone(),
+                        },
+                    },
                     ContentBlock::ToolUse {
                         id,
                         name,

@@ -82,7 +82,7 @@ impl PermissionEnforcer {
         let active_mode = self.policy.active_mode();
 
         // Check if active mode meets the dynamically determined required mode
-        if active_mode >= required_mode {
+        if active_mode.auto_allows(required_mode) {
             return EnforcementResult::Allowed;
         }
 

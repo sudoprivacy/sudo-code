@@ -472,6 +472,9 @@ fn translate_input_message(message: &InputMessage, contents: &mut Vec<Value>) {
                     }]
                 }));
             }
+            InputContentBlock::Image { .. } => {
+                // Image support is only guaranteed on the Anthropic path today.
+            }
         }
     }
 

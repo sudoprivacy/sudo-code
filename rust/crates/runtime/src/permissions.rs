@@ -25,6 +25,20 @@ impl PermissionMode {
             Self::Allow => "allow",
         }
     }
+
+    #[must_use]
+    pub fn auto_allows(self, required: PermissionMode) -> bool {
+        match self {
+            Self::Allow => true,
+            Self::DangerFullAccess => matches!(
+                required,
+                Self::ReadOnly | Self::WorkspaceWrite | Self::DangerFullAccess
+            ),
+            Self::WorkspaceWrite => matches!(required, Self::ReadOnly | Self::WorkspaceWrite),
+            Self::ReadOnly => matches!(required, Self::ReadOnly),
+            Self::Prompt => false,
+        }
+    }
 }
 
 /// Hook-provided override applied before standard permission evaluation.
@@ -152,6 +166,11 @@ impl PermissionPolicy {
         self.active_mode
     }
 
+    /// Change the active permission mode at runtime.
+    pub fn set_active_mode(&mut self, mode: PermissionMode) {
+        self.active_mode = mode;
+    }
+
     #[must_use]
     pub fn required_mode_for(&self, tool_name: &str) -> PermissionMode {
         self.tool_requirements
@@ -233,7 +252,7 @@ impl PermissionPolicy {
                 }
                 if allow_rule.is_some()
                     || current_mode == PermissionMode::Allow
-                    || current_mode >= required_mode
+                    || current_mode.auto_allows(required_mode)
                 {
                     return PermissionOutcome::Allow;
                 }
@@ -258,7 +277,7 @@ impl PermissionPolicy {
 
         if allow_rule.is_some()
             || current_mode == PermissionMode::Allow
-            || current_mode >= required_mode
+            || current_mode.auto_allows(required_mode)
         {
             return PermissionOutcome::Allow;
         }
@@ -563,6 +582,27 @@ mod tests {
             policy.authorize("bash", "echo hi", Some(&mut prompter)),
             PermissionOutcome::Deny { reason } if reason == "not now"
         ));
+    }
+
+    #[test]
+    fn prompt_mode_requires_interactive_approval() {
+        let policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+        let mut prompter = RecordingPrompter {
+            seen: Vec::new(),
+            allow: false,
+        };
+
+        assert!(matches!(
+            policy.authorize("bash", "echo hi", Some(&mut prompter)),
+            PermissionOutcome::Deny { reason } if reason == "not now"
+        ));
+        assert_eq!(prompter.seen.len(), 1);
+        assert_eq!(prompter.seen[0].current_mode, PermissionMode::Prompt);
+        assert_eq!(
+            prompter.seen[0].required_mode,
+            PermissionMode::DangerFullAccess
+        );
     }
 
     #[test]
