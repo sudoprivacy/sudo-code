@@ -125,6 +125,13 @@ pub trait SdkAcpDelegate: Send + 'static {
         session_id: &str,
         mode: PermissionMode,
     ) -> Result<(), AcpError>;
+
+    /// Push image content blocks into a session before running a prompt.
+    fn push_images(
+        &mut self,
+        session_id: &str,
+        images: &[(String, String)],
+    ) -> Result<(), AcpError>;
 }
 
 /// Observer that collects session update notifications to be forwarded to

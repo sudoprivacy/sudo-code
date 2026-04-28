@@ -1924,6 +1924,32 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
         }
         Ok(())
     }
+
+    fn push_images(
+        &mut self,
+        session_id: &str,
+        images: &[(String, String)],
+    ) -> Result<(), runtime::AcpError> {
+        let session = self.inner.sessions.get_mut(session_id).ok_or_else(|| {
+            runtime::AcpError::invalid_params(format!("unknown sessionId: {session_id}"))
+        })?;
+        for (data, mime_type) in images {
+            let msg = runtime::ConversationMessage {
+                role: runtime::MessageRole::User,
+                blocks: vec![runtime::ContentBlock::Image {
+                    data: data.clone(),
+                    mime_type: mime_type.clone(),
+                }],
+                usage: None,
+            };
+            session
+                .runtime
+                .session_mut()
+                .push_message(msg)
+                .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 impl AcpSdkDelegate {

@@ -195,8 +195,18 @@ async fn handle_session_prompt(
         return;
     };
 
+    let images = extract_images(params);
+
     let delegate = Arc::clone(&state.delegate);
     let (stop_reason, notifications) = tokio::task::spawn_blocking(move || {
+        // Push images into the session before running the prompt.
+        if !images.is_empty() {
+            let mut d = delegate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = d.push_images(&session_id, &images);
+            drop(d);
+        }
         run_delegate_prompt(&delegate, &session_id, prompt_text)
     })
     .await
@@ -424,6 +434,28 @@ fn extract_prompt_text(params: &Value) -> Option<String> {
         return Some(texts.join("\n"));
     }
     None
+}
+
+/// Extract `(base64_data, mime_type)` pairs from image blocks in the prompt.
+fn extract_images(params: &Value) -> Vec<(String, String)> {
+    let Some(arr) = params.get("prompt").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|block| {
+            if block.get("type")?.as_str()? == "image" {
+                let data = block.get("data")?.as_str()?.to_owned();
+                let mime = block
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("image/png")
+                    .to_owned();
+                Some((data, mime))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn json_rpc_error(id: &Value, code: i32, message: &str) -> Value {
