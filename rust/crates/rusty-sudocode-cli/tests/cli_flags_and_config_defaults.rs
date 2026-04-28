@@ -243,16 +243,21 @@ fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
         .output()
         .expect("status help should launch");
 
+    // clap handles --help: it prints to stdout and exits 0.
     assert_success(&doctor_help);
     let doctor_stdout = String::from_utf8(doctor_help.stdout).expect("stdout should be utf8");
-    assert!(doctor_stdout.contains("Usage            scode doctor"));
-    assert!(doctor_stdout.contains("local-only health report"));
+    assert!(
+        doctor_stdout.contains("local-only health report"),
+        "doctor --help should contain subcommand description: {doctor_stdout}"
+    );
     assert!(!doctor_stdout.contains("Thinking"));
 
     assert_success(&status_help);
     let status_stdout = String::from_utf8(status_help.stdout).expect("stdout should be utf8");
-    assert!(status_stdout.contains("Usage            scode status"));
-    assert!(status_stdout.contains("local workspace snapshot"));
+    assert!(
+        status_stdout.contains("workspace status snapshot"),
+        "status --help should contain subcommand description: {status_stdout}"
+    );
     assert!(!status_stdout.contains("Thinking"));
 
     let doctor_stderr = String::from_utf8(doctor_help.stderr).expect("stderr should be utf8");
