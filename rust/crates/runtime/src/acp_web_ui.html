@@ -215,10 +215,10 @@ body { display: flex; flex-direction: column; }
   function handleSessionUpdate(params) {
     if (!params || !params.update) return;
     const update = params.update;
+    const kind = update.sessionUpdate;
 
-    if (update.agentMessageChunk) {
-      const chunk = update.agentMessageChunk;
-      const text = (chunk.content && chunk.content.text) || '';
+    if (kind === 'agent_message_chunk') {
+      const text = (update.content && update.content.text) || '';
       if (text) {
         if (!agentMsgEl) {
           agentMsgEl = addChatMsg('agent', '');
@@ -226,13 +226,12 @@ body { display: flex; flex-direction: column; }
         agentMsgEl.querySelector('.msg-body').textContent += text;
         scrollChat();
       }
-    } else if (update.toolCall) {
-      const tc = update.toolCall;
-      const inputStr = tc.rawInput ? JSON.stringify(tc.rawInput, null, 2) : '';
-      const label = tc.name + '(' + (inputStr.length > 200 ? inputStr.substring(0, 200) + '...' : inputStr) + ')';
+    } else if (kind === 'tool_call') {
+      const inputStr = update.rawInput ? JSON.stringify(update.rawInput, null, 2) : '';
+      const label = (update.name || 'tool') + '(' + (inputStr.length > 200 ? inputStr.substring(0, 200) + '...' : inputStr) + ')';
       const el = addChatMsg('tool', label);
       el.querySelector('.msg-body').classList.add('collapsed');
-      el.querySelector('.msg-body').dataset.full = tc.name + '\n' + inputStr;
+      el.querySelector('.msg-body').dataset.full = (update.name || 'tool') + '\n' + inputStr;
       el.querySelector('.msg-body').addEventListener('click', function() {
         if (this.classList.contains('collapsed')) {
           this.classList.remove('collapsed');
@@ -242,10 +241,10 @@ body { display: flex; flex-direction: column; }
           this.textContent = label;
         }
       });
-    } else if (update.toolCallUpdate) {
-      const tcu = update.toolCallUpdate;
-      if (tcu.fields && tcu.fields.rawOutput) {
-        const outputStr = JSON.stringify(tcu.fields.rawOutput, null, 2);
+    } else if (kind === 'tool_call_update') {
+      const fields = update.fields || {};
+      if (fields.rawOutput) {
+        const outputStr = JSON.stringify(fields.rawOutput, null, 2);
         const summary = 'Tool result: ' + (outputStr.length > 300 ? outputStr.substring(0, 300) + '...' : outputStr);
         const el = addChatMsg('tool', summary);
         el.querySelector('.msg-body').classList.add('collapsed');
