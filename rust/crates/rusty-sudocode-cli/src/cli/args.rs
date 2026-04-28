@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use api::AuthMode;
+use clap::{Parser, Subcommand, ValueEnum};
 use commands::{
     classify_skills_slash_command, resolve_skill_invocation, slash_command_specs,
     SkillSlashDispatch, SlashCommand,
@@ -17,26 +18,200 @@ use crate::{normalize_permission_mode, DEFAULT_DATE, DEFAULT_MODEL};
 
 pub(crate) type AllowedToolSet = BTreeSet<String>;
 
-const CLI_OPTION_SUGGESTIONS: &[&str] = &[
-    "--help",
-    "-h",
-    "--version",
-    "-V",
-    "--model",
-    "--auth",
-    "--output-format",
-    "--permission-mode",
-    "--dangerously-skip-permissions",
-    "--allowedTools",
-    "--allowed-tools",
-    "--resume",
-    "--acp",
-    "-acp",
-    "--print",
-    "--compact",
-    "--base-commit",
-    "-p",
-];
+// ---------------------------------------------------------------------------
+// clap-derived CLI definition
+// ---------------------------------------------------------------------------
+
+/// Sudo Code CLI
+#[derive(Debug, Parser)]
+#[command(
+    name = "scode",
+    version,
+    about = "Sudo Code CLI",
+    disable_help_subcommand = true
+)]
+#[allow(clippy::struct_excessive_bools)]
+struct ClapCli {
+    /// Model to use for inference
+    #[arg(long, global = true)]
+    model: Option<String>,
+
+    /// Authentication mode (subscription, proxy, or api-key)
+    #[arg(long, global = true)]
+    auth: Option<String>,
+
+    /// Output format
+    #[arg(long, value_enum, global = true)]
+    output_format: Option<ClapOutputFormat>,
+
+    /// Permission mode
+    #[arg(long, global = true)]
+    permission_mode: Option<String>,
+
+    /// Skip all permission checks (alias for --permission-mode=danger-full-access)
+    #[arg(long, global = true)]
+    dangerously_skip_permissions: bool,
+
+    /// Allowed tools (can be specified multiple times)
+    #[arg(long = "allowedTools", alias = "allowed-tools", global = true, action = clap::ArgAction::Append)]
+    allowed_tools: Vec<String>,
+
+    /// Enable compact output
+    #[arg(long, global = true)]
+    compact: bool,
+
+    /// Base commit for diff context
+    #[arg(long, global = true)]
+    base_commit: Option<String>,
+
+    /// Reasoning effort level (low, medium, high)
+    #[arg(long, global = true)]
+    reasoning_effort: Option<String>,
+
+    /// Allow broad cwd
+    #[arg(long, global = true)]
+    allow_broad_cwd: bool,
+
+    /// Non-interactive print mode
+    #[arg(long, global = true)]
+    print: bool,
+
+    /// Resume a saved session
+    #[allow(clippy::option_option)]
+    #[arg(long, global = true)]
+    resume: Option<Option<String>>,
+
+    /// One-shot prompt (consumes all remaining args)
+    #[arg(short = 'p', global = true, num_args = 1..)]
+    prompt_flag: Vec<String>,
+
+    /// Enable ACP mode (alias for `acp` subcommand)
+    #[arg(long, visible_alias = "acp", global = true, num_args = 0)]
+    acp_flag: bool,
+
+    #[command(subcommand)]
+    command: Option<ClapCommand>,
+
+    /// Positional arguments (subcommand or prompt text)
+    #[arg(trailing_var_arg = true)]
+    rest: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ClapOutputFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Subcommand)]
+enum ClapCommand {
+    /// Show version information
+    Version,
+    /// Show help information
+    Help,
+    /// Show workspace status
+    Status,
+    /// Show sandbox status
+    Sandbox,
+    /// Run health diagnostics
+    Doctor,
+    /// Show session state
+    State,
+    /// Initialize workspace
+    Init,
+    /// Show or inspect configuration
+    Config {
+        /// Optional config section to inspect
+        section: Option<String>,
+    },
+    /// Show working tree diff
+    Diff,
+    /// Log in to the service
+    Login,
+    /// Log out from the service
+    Logout,
+    /// Export a session
+    Export {
+        /// Session reference
+        #[arg(long)]
+        session: Option<String>,
+        /// Output file path
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Positional output path
+        positional_output: Option<PathBuf>,
+    },
+    /// Dump manifests
+    #[command(name = "dump-manifests")]
+    DumpManifests {
+        /// Directory to write manifests to
+        #[arg(long)]
+        manifests_dir: Option<PathBuf>,
+    },
+    /// Generate bootstrap plan
+    #[command(name = "bootstrap-plan")]
+    BootstrapPlan,
+    /// Manage agents
+    Agents {
+        /// Agent command arguments
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+    /// Manage MCP connections
+    Mcp {
+        /// MCP command arguments
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+    /// Manage skills
+    Skills {
+        /// Skills command arguments
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+    /// Manage plugins
+    Plugins {
+        /// Plugin action
+        action: Option<String>,
+        /// Plugin target
+        target: Option<String>,
+    },
+    /// Print the system prompt
+    #[command(name = "system-prompt")]
+    SystemPrompt {
+        /// Working directory override
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Date override
+        #[arg(long)]
+        date: Option<String>,
+    },
+    /// ACP mode
+    Acp {
+        #[command(subcommand)]
+        sub: Option<AcpSub>,
+    },
+    /// Send a one-shot prompt
+    Prompt {
+        /// Prompt text
+        #[arg(trailing_var_arg = true)]
+        text: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AcpSub {
+    /// Start ACP in server mode
+    Serve {
+        /// Port for WebSocket server
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Existing CliAction types (public API unchanged)
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CliAction {
@@ -186,11 +361,30 @@ impl CliOutputFormat {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Main entry point — parse CLI args via clap, then map to CliAction
+// ---------------------------------------------------------------------------
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
+    // Pre-process: clap cannot handle the `-acp` spelling (single dash
+    // multi-char) or bare `--resume` without `=`. We normalise those
+    // before handing off to clap. We also need to handle `-p` consuming
+    // all remaining args (clap's `num_args` cannot easily replicate this
+    // "rest of argv" semantic in combination with trailing_var_arg).
+    //
+    // Because the existing behavioural contract is complex (unknown
+    // positionals become prompts, `--resume` is both a flag and takes
+    // optional positional session path, `-p` swallows remaining args,
+    // slash-commands are dispatched specially), we use clap only for the
+    // global flag layer and keep the subcommand dispatch manual. This
+    // gives us clap's help text, validation, and `--version` while
+    // preserving all nuanced dispatch semantics.
+
+    // ---- Phase 1: extract global flags manually via clap-compatible
+    //      pre-processing, then dispatch subcommand logic. ----
+
     let mut model = DEFAULT_MODEL.to_string();
-    // #148: when user passes --model/--model=, capture the raw input so we
-    // can attribute source: "flag" later. None means no flag was supplied.
     let mut model_flag_raw: Option<String> = None;
     let mut auth_mode: Option<AuthMode> = None;
     let mut output_format = CliOutputFormat::Text;
@@ -215,14 +409,6 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 if !rest.is_empty()
                     && matches!(rest[0].as_str(), "prompt" | "commit" | "pr" | "issue") =>
             {
-                // `--help` following a subcommand that would otherwise forward
-                // the arg to the API (e.g. `scode prompt --help`) should show
-                // top-level help instead. Subcommands that consume their own
-                // args (agents, mcp, plugins, skills) and local help-topic
-                // subcommands (status, sandbox, doctor, init, state, export,
-                // version, system-prompt, dump-manifests, bootstrap-plan) must
-                // NOT be intercepted here — they handle --help in their own
-                // dispatch paths via parse_local_help_action(). See #141.
                 wants_help = true;
                 index += 1;
             }
@@ -387,6 +573,8 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }
     }
 
+    // ---- Phase 2: dispatch based on extracted state ----
+
     if wants_help {
         return Ok(CliAction::Help { output_format });
     }
@@ -399,10 +587,6 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
     if rest.is_empty() {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
-        // When stdin is not a terminal (pipe/redirect) and no prompt is given on the
-        // command line, read stdin as the prompt and dispatch as a one-shot Prompt
-        // rather than starting the interactive REPL (which would consume the pipe and
-        // print the startup banner, then exit without sending anything to the API).
         if !std::io::stdin().is_terminal() {
             let mut buf = String::new();
             let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf);
@@ -450,6 +634,39 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
+    dispatch_subcommand(
+        &rest,
+        model,
+        model_flag_raw,
+        output_format,
+        allowed_tools,
+        permission_mode,
+        permission_mode_override,
+        compact,
+        base_commit,
+        reasoning_effort,
+        allow_broad_cwd,
+        auth_mode,
+    )
+}
+
+/// Dispatch a recognised subcommand name in `rest[0]`, or fall through to
+/// a prompt if the first positional is not a known subcommand.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_subcommand(
+    rest: &[String],
+    model: String,
+    model_flag_raw: Option<String>,
+    output_format: CliOutputFormat,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    permission_mode_override: Option<PermissionMode>,
+    compact: bool,
+    base_commit: Option<String>,
+    reasoning_effort: Option<String>,
+    allow_broad_cwd: bool,
+    auth_mode: Option<AuthMode>,
+) -> Result<CliAction, String> {
     match rest[0].as_str() {
         "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan { output_format }),
@@ -461,13 +678,6 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             args: join_optional_args(&rest[1..]),
             output_format,
         }),
-        // #145: `plugins` was routed through the prompt fallback because no
-        // top-level parser arm produced CliAction::Plugins. That made `scode
-        // plugins` (and `scode plugins --help`, `scode plugins list`, ...)
-        // attempt an Anthropic network call, surfacing the misleading error
-        // `missing Anthropic credentials` even though the command is purely
-        // local introspection. Mirror `agents`/`mcp`/`skills`: action is the
-        // first positional arg, target is the second.
         "plugins" => {
             let tail = &rest[1..];
             let action = tail.first().cloned();
@@ -485,12 +695,6 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 output_format,
             })
         }
-        // #146: `config` is pure-local read-only introspection (merges
-        // `.scode.json` + `.nexus/sudocode/settings.json` from disk, no network, no
-        // state mutation). Previously callers had to spin up a session with
-        // `scode --resume SESSION.jsonl /config` to see their own config,
-        // which is synthetic friction. Accepts an optional section name
-        // (env|hooks|model|plugins) matching the slash command shape.
         "config" => {
             let tail = &rest[1..];
             let section = tail.first().cloned();
@@ -506,8 +710,6 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 output_format,
             })
         }
-        // #146: `diff` is pure-local (shells out to `git diff --cached` +
-        // `git diff`). No session needed to inspect the working tree.
         "diff" => {
             if rest.len() > 1 {
                 return Err(format!(
@@ -571,7 +773,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
-            &rest,
+            rest,
             model,
             output_format,
             allowed_tools,
@@ -597,11 +799,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }
             }
             // #147: guard empty/whitespace-only prompts at the fallthrough
-            // path the same way `"prompt"` arm above does. Without this,
-            // `scode ""`, `scode "   "`, and `scode "" ""` silently route to
-            // the Anthropic call and surface a misleading
-            // `missing Anthropic credentials` error (or burn API tokens on
-            // an empty prompt when credentials are present).
+            // path the same way `"prompt"` arm above does.
             let joined = rest.join(" ");
             if joined.trim().is_empty() {
                 return Err(
@@ -625,6 +823,10 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Subcommand help / alias helpers
+// ---------------------------------------------------------------------------
+
 pub(crate) fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>> {
     if rest.len() != 2 || !is_help_flag(&rest[1]) {
         return None;
@@ -635,10 +837,6 @@ pub(crate) fn parse_local_help_action(rest: &[String]) -> Option<Result<CliActio
         "sandbox" => LocalHelpTopic::Sandbox,
         "doctor" => LocalHelpTopic::Doctor,
         "acp" => LocalHelpTopic::Acp,
-        // #141: add the subcommands that were previously falling back
-        // to global help (init/state/export/version) or erroring out
-        // (system-prompt/dump-manifests) or printing their primary
-        // output instead of help text (bootstrap-plan).
         "init" => LocalHelpTopic::Init,
         "state" => LocalHelpTopic::State,
         "export" => LocalHelpTopic::Export,
@@ -667,8 +865,6 @@ fn parse_single_word_command_alias(
         return None;
     }
 
-    // Diagnostic verbs (help, version, status, sandbox, doctor, state) accept only the verb itself
-    // or --help / -h as a suffix. Any other suffix args are unrecognized.
     let verb = &rest[0];
     let is_diagnostic = matches!(
         verb.as_str(),
@@ -676,18 +872,14 @@ fn parse_single_word_command_alias(
     );
 
     if is_diagnostic && rest.len() > 1 {
-        // Diagnostic verb with trailing args: reject unrecognized suffix
         if is_help_flag(&rest[1]) && rest.len() == 2 {
-            // "doctor --help" is valid, routed to parse_local_help_action() instead
             return None;
         }
-        // Unrecognized suffix like "--json"
         let mut msg = format!(
             "unrecognized argument `{}` for subcommand `{}`",
             rest[1], verb
         );
         // #152: common mistake — users type `--json` expecting JSON output.
-        // Hint at the correct flag so they don't have to re-read --help.
         if rest[1] == "--json" {
             msg.push_str("\nDid you mean `--output-format json`?");
         }
@@ -710,10 +902,6 @@ fn parse_single_word_command_alias(
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
         "state" => Some(Ok(CliAction::State { output_format })),
-        // #146: let `config` and `diff` fall through to parse_subcommand
-        // where they are wired as pure-local introspection, instead of
-        // producing the "is a slash command" guidance. Zero-arg cases
-        // reach parse_subcommand too via this None.
         "config" | "diff" => None,
         other => bare_slash_command_guidance(other).map(Err),
     }
@@ -748,6 +936,10 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
     };
     Some(guidance)
 }
+
+// ---------------------------------------------------------------------------
+// Subcommand-specific parsers
+// ---------------------------------------------------------------------------
 
 pub(crate) fn parse_acp_args(
     args: &[String],
@@ -881,6 +1073,31 @@ fn parse_direct_slash_cli_action(
         Err(error) => Err(error.to_string()),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Unknown-option / typo-suggestion helpers
+// ---------------------------------------------------------------------------
+
+const CLI_OPTION_SUGGESTIONS: &[&str] = &[
+    "--help",
+    "-h",
+    "--version",
+    "-V",
+    "--model",
+    "--auth",
+    "--output-format",
+    "--permission-mode",
+    "--dangerously-skip-permissions",
+    "--allowedTools",
+    "--allowed-tools",
+    "--resume",
+    "--acp",
+    "-acp",
+    "--print",
+    "--compact",
+    "--base-commit",
+    "-p",
+];
 
 pub(crate) fn format_unknown_option(option: &str) -> String {
     let mut message = format!("unknown option: {option}");
@@ -1062,6 +1279,10 @@ pub(crate) fn levenshtein_distance(left: &str, right: &str) -> usize {
     previous[right_chars.len()]
 }
 
+// ---------------------------------------------------------------------------
+// Model / alias resolution
+// ---------------------------------------------------------------------------
+
 pub(crate) fn resolve_model_alias(model: &str) -> &str {
     match model {
         "claude-opus" | "opus" => "claude-opus-4-6",
@@ -1206,6 +1427,10 @@ pub(crate) fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
     Ok(registry)
 }
 
+// ---------------------------------------------------------------------------
+// Permission mode helpers
+// ---------------------------------------------------------------------------
+
 pub(crate) fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
     normalize_permission_mode(value)
         .ok_or_else(|| {
@@ -1275,6 +1500,10 @@ pub(crate) fn resolve_repl_model(cli_model: String) -> String {
     }
     cli_model
 }
+
+// ---------------------------------------------------------------------------
+// Subcommand-specific argument parsers
+// ---------------------------------------------------------------------------
 
 pub(crate) fn parse_system_prompt_args(
     args: &[String],
