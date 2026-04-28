@@ -1629,14 +1629,11 @@ impl AcpCliAgent {
         observer: &mut AcpSessionUpdateObserver<'_>,
     ) -> Result<(), AcpError> {
         use runtime::RuntimeObserver as _;
-        let command = match SlashCommand::parse(input) {
-            Ok(Some(cmd)) => cmd,
-            Ok(None) | Err(_) => {
-                observer.on_text_delta(&format!(
-                    "Unknown slash command: `{input}`. Type `/help` for available commands."
-                ));
-                return Ok(());
-            }
+        let Ok(Some(command)) = SlashCommand::parse(input) else {
+            observer.on_text_delta(&format!(
+                "Unknown slash command: `{input}`. Type `/help` for available commands."
+            ));
+            return Ok(());
         };
 
         let response = match &command {
