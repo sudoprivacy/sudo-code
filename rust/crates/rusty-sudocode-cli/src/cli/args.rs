@@ -111,6 +111,7 @@ pub(crate) enum CliAction {
         permission_mode_override: Option<PermissionMode>,
         reasoning_effort: Option<String>,
         auth_mode: Option<AuthMode>,
+        ws_port: Option<u16>,
     },
     State {
         output_format: CliOutputFormat,
@@ -765,17 +766,33 @@ pub(crate) fn parse_acp_args(
             permission_mode_override,
             reasoning_effort,
             auth_mode,
+            ws_port: None,
         }),
-        [subcommand] if subcommand == "serve" => Ok(CliAction::Acp {
+        [sub] if sub == "serve" => Ok(CliAction::Acp {
             model,
             model_flag_raw,
             allowed_tools,
             permission_mode_override,
             reasoning_effort,
             auth_mode,
+            ws_port: Some(8080),
         }),
+        [sub, flag, port_str] if sub == "serve" && flag == "--port" => {
+            let port = port_str
+                .parse::<u16>()
+                .map_err(|_| "invalid port number for --port".to_string())?;
+            Ok(CliAction::Acp {
+                model,
+                model_flag_raw,
+                allowed_tools,
+                permission_mode_override,
+                reasoning_effort,
+                auth_mode,
+                ws_port: Some(port),
+            })
+        }
         _ => Err(String::from(
-            "unsupported ACP invocation. Use `scode acp`, `scode acp serve`, `scode --acp`, or `scode -acp`.",
+            "unsupported ACP invocation. Usage: `scode acp` or `scode acp serve [--port N]`",
         )),
     }
 }

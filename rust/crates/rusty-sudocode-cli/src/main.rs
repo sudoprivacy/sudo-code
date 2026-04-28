@@ -99,11 +99,11 @@ use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
     load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status, AcpError,
-    AcpSessionUpdateObserver, ApiClient, ApiRequest, AssistantEvent, CompactionConfig,
-    ConfigLoader, ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
-    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
-    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
-    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
+    ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
+    McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode, PermissionPolicy,
+    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
+    ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -445,14 +445,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode_override,
             reasoning_effort,
             auth_mode,
-        } => run_acp_server(
-            model,
-            model_flag_raw,
-            allowed_tools,
-            permission_mode_override,
-            reasoning_effort,
-            auth_mode,
-        )?,
+            ws_port,
+        } => {
+            run_acp_server(
+                model,
+                model_flag_raw,
+                allowed_tools,
+                permission_mode_override,
+                reasoning_effort,
+                auth_mode,
+                ws_port,
+            )?;
+        }
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         // #146: dispatch pure-local introspection. Text mode uses existing
@@ -1579,140 +1583,7 @@ impl AcpCliAgent {
     }
 }
 
-impl runtime::AcpAgent for AcpCliAgent {
-    fn new_session(&mut self, cwd: Option<PathBuf>) -> Result<String, AcpError> {
-        let cwd = cwd
-            .map_or_else(env::current_dir, Ok)
-            .map_err(|error| AcpError::internal(format!("failed to resolve cwd: {error}")))?;
-        let session = self.build_session(&cwd)?;
-        let session_id = session.handle.id.clone();
-        self.sessions.insert(session_id.clone(), session);
-        Ok(session_id)
-    }
-
-    fn run_prompt(
-        &mut self,
-        session_id: &str,
-        prompt: String,
-        observer: &mut AcpSessionUpdateObserver<'_>,
-    ) -> Result<(), AcpError> {
-        // Intercept slash commands — they should be handled locally, not sent to the LLM.
-        if prompt.starts_with('/') {
-            return self.handle_acp_slash_command(session_id, &prompt, observer);
-        }
-
-        let session = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or_else(|| AcpError::invalid_params(format!("unknown sessionId: {session_id}")))?;
-        let _guard = ScopedCurrentDir::change_to(&session.cwd)
-            .map_err(|error| AcpError::internal(format!("failed to enter session cwd: {error}")))?;
-        session
-            .runtime
-            .run_turn(prompt, None, Some(observer))
-            .map_err(|error| AcpError::internal(error.to_string()))?;
-        session
-            .runtime
-            .session()
-            .save_to_path(&session.handle.path)
-            .map_err(|error| AcpError::internal(format!("failed to persist session: {error}")))?;
-        Ok(())
-    }
-}
-
-// Slash command support for ACP mode.
 impl AcpCliAgent {
-    fn handle_acp_slash_command(
-        &mut self,
-        session_id: &str,
-        input: &str,
-        observer: &mut AcpSessionUpdateObserver<'_>,
-    ) -> Result<(), AcpError> {
-        use runtime::RuntimeObserver as _;
-        let Ok(Some(command)) = SlashCommand::parse(input) else {
-            observer.on_text_delta(&format!(
-                "Unknown slash command: `{input}`. Type `/help` for available commands."
-            ));
-            return Ok(());
-        };
-
-        let response = match &command {
-            SlashCommand::Model { model } => {
-                self.handle_acp_model_switch(session_id, model.clone())?
-            }
-            SlashCommand::Help => render_repl_help(),
-            SlashCommand::Status => {
-                let session = self.sessions.get(session_id)
-                    .ok_or_else(|| AcpError::invalid_params(format!("unknown sessionId: {session_id}")))?;
-                let _guard = ScopedCurrentDir::change_to(&session.cwd)
-                    .map_err(|e| AcpError::internal(e.to_string()))?;
-                let tracker = UsageTracker::from_session(session.runtime.session());
-                format_status_report(
-                    &self.model,
-                    StatusUsage {
-                        message_count: session.runtime.session().messages.len(),
-                        turns: tracker.turns(),
-                        latest: tracker.current_turn_usage(),
-                        cumulative: tracker.cumulative_usage(),
-                        estimated_tokens: 0,
-                    },
-                    default_permission_mode().as_str(),
-                    &status_context(Some(&session.handle.path))
-                        .map_err(|e| AcpError::internal(e.to_string()))?,
-                    None, // ACP mode — no flag provenance
-                )
-            }
-            SlashCommand::Cost => {
-                let session = self.sessions.get(session_id)
-                    .ok_or_else(|| AcpError::invalid_params(format!("unknown sessionId: {session_id}")))?;
-                let usage = UsageTracker::from_session(session.runtime.session())
-                    .cumulative_usage();
-                format!(
-                    "Token usage: {} input, {} output, {} cache-create, {} cache-read",
-                    usage.input_tokens, usage.output_tokens,
-                    usage.cache_creation_input_tokens, usage.cache_read_input_tokens,
-                )
-            }
-            SlashCommand::Config { section } => {
-                render_config_report(section.as_deref())
-                    .map_err(|e| AcpError::internal(e.to_string()))?
-            }
-            SlashCommand::Diff => {
-                let output = std::process::Command::new("git")
-                    .args(["diff", "--cached", "--no-color"])
-                    .output()
-                    .map_err(|e| AcpError::internal(e.to_string()))?;
-                let cached = String::from_utf8_lossy(&output.stdout);
-                let output2 = std::process::Command::new("git")
-                    .args(["diff", "--no-color"])
-                    .output()
-                    .map_err(|e| AcpError::internal(e.to_string()))?;
-                let unstaged = String::from_utf8_lossy(&output2.stdout);
-                if cached.is_empty() && unstaged.is_empty() {
-                    "No changes detected.".to_string()
-                } else {
-                    format!(
-                        "{}{}",
-                        if cached.is_empty() { String::new() }
-                        else { format!("**Staged:**\n```diff\n{cached}```\n\n") },
-                        if unstaged.is_empty() { String::new() }
-                        else { format!("**Unstaged:**\n```diff\n{unstaged}```") }
-                    )
-                }
-            }
-            SlashCommand::Doctor => render_doctor_report()
-                .map(|report| report.render())
-                .map_err(|e| AcpError::internal(e.to_string()))?,
-            _ => format!(
-                "`{}` is not supported in ACP mode. Available: /model, /status, /cost, /config, /diff, /doctor, /help",
-                input.split_whitespace().next().unwrap_or(input)
-            ),
-        };
-
-        observer.on_text_delta(&response);
-        Ok(())
-    }
-
     fn handle_acp_model_switch(
         &mut self,
         session_id: &str,
@@ -1819,17 +1690,210 @@ fn run_acp_server(
     permission_mode_override: Option<PermissionMode>,
     reasoning_effort: Option<String>,
     auth_mode: Option<AuthMode>,
+    ws_port: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let agent = AcpCliAgent::new(
+    let config = runtime::acp_sdk_server::SdkAcpConfig {
+        agent_version: VERSION.to_string(),
+        model: model.clone(),
+        model_flag_raw: model_flag_raw.clone(),
+        permission_mode_override,
+        reasoning_effort: reasoning_effort.clone(),
+    };
+    let delegate = Box::new(AcpSdkDelegate::new(
         model,
         model_flag_raw,
         allowed_tools,
         permission_mode_override,
         reasoning_effort,
         auth_mode,
-    );
-    runtime::run_acp_stdio_server(agent, &runtime::AcpServerOptions::new(VERSION))?;
-    Ok(())
+    ));
+    let rt = tokio::runtime::Runtime::new()?;
+    if let Some(port) = ws_port {
+        rt.block_on(runtime::acp_ws_server::run_acp_ws_server(
+            config, delegate, port,
+        ))
+    } else {
+        rt.block_on(runtime::acp_sdk_server::run_sdk_acp_server(
+            config, delegate,
+        ))
+    }
+}
+
+/// Delegate implementation that bridges the SDK ACP server to the existing
+/// CLI session/runtime machinery.
+struct AcpSdkDelegate {
+    inner: AcpCliAgent,
+}
+
+impl AcpSdkDelegate {
+    fn new(
+        model: String,
+        model_flag_raw: Option<String>,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode_override: Option<PermissionMode>,
+        reasoning_effort: Option<String>,
+        auth_mode: Option<AuthMode>,
+    ) -> Self {
+        Self {
+            inner: AcpCliAgent::new(
+                model,
+                model_flag_raw,
+                allowed_tools,
+                permission_mode_override,
+                reasoning_effort,
+                auth_mode,
+            ),
+        }
+    }
+}
+
+impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
+    fn new_session(&mut self, cwd: PathBuf) -> Result<(String, PathBuf), runtime::AcpError> {
+        let session = self.inner.build_session(&cwd)?;
+        let session_id = session.handle.id.clone();
+        let session_cwd = session.cwd.clone();
+        self.inner.sessions.insert(session_id.clone(), session);
+        Ok((session_id, session_cwd))
+    }
+
+    fn run_prompt(
+        &mut self,
+        session_id: &str,
+        prompt: String,
+        observer: &mut runtime::acp_sdk_server::SdkSessionObserver,
+    ) -> Result<runtime::acp_sdk_server::AcpStopReason, runtime::AcpError> {
+        let session = self.inner.sessions.get_mut(session_id).ok_or_else(|| {
+            runtime::AcpError::invalid_params(format!("unknown sessionId: {session_id}"))
+        })?;
+        let _guard = ScopedCurrentDir::change_to(&session.cwd).map_err(|e| {
+            runtime::AcpError::internal(format!("failed to enter session cwd: {e}"))
+        })?;
+        session
+            .runtime
+            .run_turn(prompt, None, Some(observer))
+            .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
+        session
+            .runtime
+            .session()
+            .save_to_path(&session.handle.path)
+            .map_err(|e| runtime::AcpError::internal(format!("failed to persist session: {e}")))?;
+        Ok(runtime::acp_sdk_server::AcpStopReason::EndTurn)
+    }
+
+    fn handle_slash_command(
+        &mut self,
+        session_id: &str,
+        input: &str,
+        observer: &mut runtime::acp_sdk_server::SdkSessionObserver,
+    ) -> Result<(), runtime::AcpError> {
+        use runtime::RuntimeObserver as _;
+        let Ok(Some(command)) = SlashCommand::parse(input) else {
+            observer.on_text_delta(&format!(
+                "Unknown slash command: `{input}`. Type `/help` for available commands."
+            ));
+            return Ok(());
+        };
+
+        let response = match &command {
+            SlashCommand::Model { model } => {
+                self.inner.handle_acp_model_switch(session_id, model.clone())?
+            }
+            SlashCommand::Help => render_repl_help(),
+            SlashCommand::Status => {
+                let session = self.inner.sessions.get(session_id).ok_or_else(|| {
+                    runtime::AcpError::invalid_params(format!(
+                        "unknown sessionId: {session_id}"
+                    ))
+                })?;
+                let _guard = ScopedCurrentDir::change_to(&session.cwd)
+                    .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
+                let tracker = UsageTracker::from_session(session.runtime.session());
+                format_status_report(
+                    &self.inner.model,
+                    StatusUsage {
+                        message_count: session.runtime.session().messages.len(),
+                        turns: tracker.turns(),
+                        latest: tracker.current_turn_usage(),
+                        cumulative: tracker.cumulative_usage(),
+                        estimated_tokens: 0,
+                    },
+                    default_permission_mode().as_str(),
+                    &status_context(Some(&session.handle.path))
+                        .map_err(|e| runtime::AcpError::internal(e.to_string()))?,
+                    None,
+                )
+            }
+            SlashCommand::Cost => {
+                let session = self.inner.sessions.get(session_id).ok_or_else(|| {
+                    runtime::AcpError::invalid_params(format!(
+                        "unknown sessionId: {session_id}"
+                    ))
+                })?;
+                let usage = UsageTracker::from_session(session.runtime.session())
+                    .cumulative_usage();
+                format!(
+                    "Token usage: {} input, {} output, {} cache-create, {} cache-read",
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_creation_input_tokens,
+                    usage.cache_read_input_tokens,
+                )
+            }
+            SlashCommand::Config { section } => render_config_report(section.as_deref())
+                .map_err(|e| runtime::AcpError::internal(e.to_string()))?,
+            SlashCommand::Diff => {
+                let output = std::process::Command::new("git")
+                    .args(["diff", "--cached", "--no-color"])
+                    .output()
+                    .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
+                let cached = String::from_utf8_lossy(&output.stdout);
+                let output2 = std::process::Command::new("git")
+                    .args(["diff", "--no-color"])
+                    .output()
+                    .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
+                let unstaged = String::from_utf8_lossy(&output2.stdout);
+                if cached.is_empty() && unstaged.is_empty() {
+                    "No changes detected.".to_string()
+                } else {
+                    format!(
+                        "{}{}",
+                        if cached.is_empty() {
+                            String::new()
+                        } else {
+                            format!("**Staged:**\n```diff\n{cached}```\n\n")
+                        },
+                        if unstaged.is_empty() {
+                            String::new()
+                        } else {
+                            format!("**Unstaged:**\n```diff\n{unstaged}```")
+                        }
+                    )
+                }
+            }
+            SlashCommand::Doctor => render_doctor_report()
+                .map(|report| report.render())
+                .map_err(|e| runtime::AcpError::internal(e.to_string()))?,
+            _ => format!(
+                "`{}` is not supported in ACP mode. Available: /model, /status, /cost, /config, /diff, /doctor, /help",
+                input.split_whitespace().next().unwrap_or(input)
+            ),
+        };
+
+        observer.on_text_delta(&response);
+        Ok(())
+    }
+
+    fn list_sessions(&self) -> Vec<(String, PathBuf)> {
+        self.inner
+            .sessions
+            .iter()
+            .map(|(id, s)| (id.clone(), s.cwd.clone()))
+            .collect()
+    }
+
+    fn close_session(&mut self, session_id: &str) -> bool {
+        self.inner.sessions.remove(session_id).is_some()
+    }
 }
 
 struct HookAbortMonitor {
