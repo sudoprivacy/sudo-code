@@ -2352,6 +2352,7 @@ dependencies = [
  "compat-harness",
  "crossterm",
  "dialoguer",
+ "futures-util",
  "mock-anthropic-service",
  "plugins",
  "pulldown-cmark",
@@ -2362,6 +2363,7 @@ dependencies = [
  "sha2",
  "syntect",
  "tokio",
+ "tokio-tungstenite",
  "tools",
 ]
 
