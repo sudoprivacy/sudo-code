@@ -132,6 +132,14 @@ pub trait SdkAcpDelegate: Send + 'static {
         session_id: &str,
         images: &[(String, String)],
     ) -> Result<(), AcpError>;
+
+    /// Load an existing persisted session by its ID and working directory,
+    /// returning `(session_id, cwd)` on success.
+    fn load_session(
+        &mut self,
+        session_id: &str,
+        cwd: PathBuf,
+    ) -> Result<(String, PathBuf), AcpError>;
 }
 
 /// Observer that collects session update notifications to be forwarded to
@@ -207,6 +215,24 @@ impl RuntimeObserver for SdkSessionObserver {
     }
 }
 
+/// Sniff the MIME type of a base64-encoded image from its leading bytes.
+///
+/// Inspects the first few characters of the base64 data to detect the format.
+/// Falls back to `image/png` when the prefix is unrecognised.
+pub(crate) fn sniff_image_mime(base64_data: &str) -> &'static str {
+    if base64_data.starts_with("iVBOR") {
+        "image/png"
+    } else if base64_data.starts_with("/9j/") {
+        "image/jpeg"
+    } else if base64_data.starts_with("R0lGO") {
+        "image/gif"
+    } else if base64_data.starts_with("UklGR") {
+        "image/webp"
+    } else {
+        "image/png"
+    }
+}
+
 /// Extract plain text from a slice of ACP `ContentBlock`s. Image blocks are
 /// tracked separately and returned as `(text, images)`.
 pub(crate) fn extract_content_from_blocks(
@@ -223,7 +249,12 @@ pub(crate) fn extract_content_from_blocks(
                 }
             }
             ContentBlock::Image(ic) => {
-                images.push((ic.data.clone(), ic.mime_type.clone()));
+                let mime = if ic.mime_type.is_empty() {
+                    sniff_image_mime(&ic.data).to_owned()
+                } else {
+                    ic.mime_type.clone()
+                };
+                images.push((ic.data.clone(), mime));
             }
             _ => {}
         }
@@ -652,15 +683,35 @@ pub async fn run_sdk_acp_server(
             },
             on_receive_request!(),
         )
-        // --- session/load (stub — not yet supported) ---
+        // --- session/load ---
         .on_receive_request(
             {
-                async move |_req: LoadSessionRequest,
+                let delegate = Arc::clone(&delegate);
+                async move |req: LoadSessionRequest,
                             responder: Responder<LoadSessionResponse>,
-                            _cx: ConnectionTo<Client>| {
-                    responder.respond_with_error(Error::internal_error().data(
-                        serde_json::Value::String("session loading not yet supported".to_string()),
-                    ))?;
+                            cx: ConnectionTo<Client>| {
+                    let d = Arc::clone(&delegate);
+                    let sid = req.session_id.to_string();
+                    let cwd = req.cwd;
+                    cx.spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            d.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .load_session(&sid, cwd)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(AcpError::internal(e.to_string())));
+
+                        match result {
+                            Ok((_session_id, _cwd)) => {
+                                responder.respond(LoadSessionResponse::new())?;
+                            }
+                            Err(e) => {
+                                responder.respond_with_error(acp_error_to_sdk(&e))?;
+                            }
+                        }
+                        Ok(())
+                    })?;
                     Ok(())
                 }
             },

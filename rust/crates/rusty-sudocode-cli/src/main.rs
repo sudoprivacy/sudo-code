@@ -1908,7 +1908,13 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
     }
 
     fn get_model_info(&self) -> (String, Vec<String>) {
-        (self.inner.model.clone(), vec![self.inner.model.clone()])
+        let config = load_sudocode_config_for_current_dir();
+        let mut models: Vec<String> = config.models.keys().cloned().collect();
+        // Ensure the current model is always present.
+        if !models.contains(&self.inner.model) {
+            models.insert(0, self.inner.model.clone());
+        }
+        (self.inner.model.clone(), models)
     }
 
     fn set_permission_mode(
@@ -1949,6 +1955,68 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
                 .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
         }
         Ok(())
+    }
+
+    fn load_session(
+        &mut self,
+        session_id: &str,
+        cwd: PathBuf,
+    ) -> Result<(String, PathBuf), runtime::AcpError> {
+        let cwd = canonical_session_cwd(&cwd)?;
+        let _guard = ScopedCurrentDir::change_to(&cwd)
+            .map_err(|e| runtime::AcpError::internal(format!("failed to enter cwd: {e}")))?;
+
+        let (handle, session) = load_session_reference(session_id)
+            .map_err(|e| runtime::AcpError::internal(format!("failed to load session: {e}")))?;
+
+        let model = self.inner.resolve_model_for_cwd(&cwd)?;
+        let permission_mode = self.inner.resolve_permission_mode_for_cwd(&cwd)?;
+        let system_prompt = build_system_prompt_for(&cwd).map_err(|e| {
+            runtime::AcpError::internal(format!("failed to build system prompt: {e}"))
+        })?;
+        let sudocode_config =
+            require_sudocode_config_for_cwd(&cwd).map_err(runtime::AcpError::internal)?;
+        let auth_mode =
+            resolve_auth_mode(&model, self.inner.auth_mode, &sudocode_config).map_err(|e| {
+                runtime::AcpError::internal(format!("failed to resolve auth mode: {e}"))
+            })?;
+
+        let mut runtime = build_runtime_for_cwd(
+            &cwd,
+            session,
+            &handle.id,
+            RuntimeConfig {
+                model,
+                system_prompt,
+                enable_tools: true,
+                emit_output: false,
+                allowed_tools: self.inner.allowed_tools.clone(),
+                permission_mode,
+                progress_reporter: None,
+                auth_mode,
+                sudocode_config,
+            },
+        )
+        .map_err(|e| runtime::AcpError::internal(format!("failed to build runtime: {e}")))?;
+
+        let abort_signal = runtime::HookAbortSignal::new();
+        runtime = runtime.with_hook_abort_signal(abort_signal.clone());
+        if let Some(rt) = runtime.runtime.as_mut() {
+            rt.api_client_mut()
+                .set_reasoning_effort(self.inner.reasoning_effort.clone());
+        }
+
+        let loaded_session_id = handle.id.clone();
+        self.inner.sessions.insert(
+            loaded_session_id.clone(),
+            AcpCliSession {
+                cwd: cwd.clone(),
+                handle,
+                runtime,
+                abort_signal,
+            },
+        );
+        Ok((loaded_session_id, cwd))
     }
 }
 

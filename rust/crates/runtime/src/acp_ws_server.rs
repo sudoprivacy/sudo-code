@@ -14,7 +14,9 @@ use axum::Router;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
-use crate::acp_sdk_server::{run_delegate_prompt, SdkAcpConfig, SdkAcpDelegate, SharedDelegate};
+use crate::acp_sdk_server::{
+    run_delegate_prompt, sniff_image_mime, SdkAcpConfig, SdkAcpDelegate, SharedDelegate,
+};
 use crate::permissions::PermissionMode;
 
 static WEB_UI_HTML: &str = include_str!("acp_web_ui.html");
@@ -104,10 +106,7 @@ async fn dispatch_method(
         "session/setPermissionMode" => {
             handle_session_set_permission_mode(socket, state, id, params).await;
         }
-        "session/load" => {
-            let resp = json_rpc_error(id, -32603, "session loading not yet supported");
-            let _ = send_json(socket, &resp).await;
-        }
+        "session/load" => handle_session_load(socket, state, id, params).await,
         "" => {
             let err = json_rpc_error(id, -32600, "Invalid Request: missing method");
             let _ = send_json(socket, &err).await;
@@ -398,6 +397,38 @@ async fn handle_session_set_permission_mode(
     let _ = send_json(socket, &resp).await;
 }
 
+async fn handle_session_load(socket: &mut WebSocket, state: &AppState, id: &Value, params: &Value) {
+    let session_id = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let cwd = params.get("cwd").and_then(Value::as_str).map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        PathBuf::from,
+    );
+
+    let delegate = Arc::clone(&state.delegate);
+    let result = tokio::task::spawn_blocking(move || {
+        delegate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .load_session(&session_id, cwd)
+    })
+    .await
+    .unwrap_or_else(|e| Err(crate::acp_sdk_server::AcpError::internal(e.to_string())));
+
+    let resp = match result {
+        Ok((_session_id, _cwd)) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {}
+        }),
+        Err(e) => json_rpc_error(id, -32603, &e.to_string()),
+    };
+    let _ = send_json(socket, &resp).await;
+}
+
 /// Extract prompt text from JSON-RPC params.
 ///
 /// Supports both:
@@ -448,7 +479,8 @@ fn extract_images(params: &Value) -> Vec<(String, String)> {
                 let mime = block
                     .get("mimeType")
                     .and_then(Value::as_str)
-                    .unwrap_or("image/png")
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| sniff_image_mime(&data))
                     .to_owned();
                 Some((data, mime))
             } else {
