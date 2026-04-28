@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use crate::acp_sdk_server::{run_delegate_prompt, SdkAcpConfig, SdkAcpDelegate, SharedDelegate};
+use crate::permissions::PermissionMode;
 
 static WEB_UI_HTML: &str = include_str!("acp_web_ui.html");
 
@@ -84,6 +85,7 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
     eprintln!("[acp-ws] client disconnected");
 }
 
+#[allow(clippy::too_many_lines)]
 async fn dispatch_method(
     socket: &mut WebSocket,
     state: &AppState,
@@ -96,6 +98,12 @@ async fn dispatch_method(
         "session/new" => handle_session_new(socket, state, id, params).await,
         "session/prompt" => handle_session_prompt(socket, state, id, params).await,
         "session/list" => handle_session_list(socket, state, id).await,
+        "session/close" => handle_session_close(socket, state, id, params).await,
+        "session/cancel" => handle_session_cancel(state, params).await,
+        "session/setModel" => handle_session_set_model(socket, state, id, params).await,
+        "session/setPermissionMode" => {
+            handle_session_set_permission_mode(socket, state, id, params).await;
+        }
         "session/load" => {
             let resp = json_rpc_error(id, -32603, "session loading not yet supported");
             let _ = send_json(socket, &resp).await;
@@ -126,7 +134,12 @@ async fn handle_initialize(socket: &mut WebSocket, state: &AppState, id: &Value,
                 "version": state.config.agent_version,
             },
             "agentCapabilities": {
-                "promptCapabilities": {}
+                "promptCapabilities": {
+                    "image": true
+                },
+                "sessionCapabilities": {
+                    "close": {}
+                }
             }
         }
     });
@@ -236,6 +249,142 @@ async fn handle_session_list(socket: &mut WebSocket, state: &AppState, id: &Valu
         "id": id,
         "result": { "sessions": infos }
     });
+    let _ = send_json(socket, &resp).await;
+}
+
+async fn handle_session_close(
+    socket: &mut WebSocket,
+    state: &AppState,
+    id: &Value,
+    params: &Value,
+) {
+    let session_id = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+
+    let delegate = Arc::clone(&state.delegate);
+    tokio::task::spawn_blocking(move || {
+        delegate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .close_session(&session_id);
+    })
+    .await
+    .ok();
+
+    let resp = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {}
+    });
+    let _ = send_json(socket, &resp).await;
+}
+
+async fn handle_session_cancel(state: &AppState, params: &Value) {
+    let session_id = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+
+    let delegate = Arc::clone(&state.delegate);
+    tokio::task::spawn_blocking(move || {
+        delegate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancel_session(&session_id);
+    })
+    .await
+    .ok();
+    // Cancel is a notification — no response.
+}
+
+async fn handle_session_set_model(
+    socket: &mut WebSocket,
+    state: &AppState,
+    id: &Value,
+    params: &Value,
+) {
+    let session_id = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let model_id = params
+        .get("modelId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+
+    let delegate = Arc::clone(&state.delegate);
+    let result = tokio::task::spawn_blocking(move || {
+        delegate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_model(&session_id, &model_id)
+    })
+    .await
+    .unwrap_or_else(|e| Err(crate::acp_sdk_server::AcpError::internal(e.to_string())));
+
+    let resp = match result {
+        Ok(_report) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {}
+        }),
+        Err(e) => json_rpc_error(id, -32603, &e.to_string()),
+    };
+    let _ = send_json(socket, &resp).await;
+}
+
+async fn handle_session_set_permission_mode(
+    socket: &mut WebSocket,
+    state: &AppState,
+    id: &Value,
+    params: &Value,
+) {
+    let session_id = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let mode_str = params
+        .get("permissionMode")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mode = match mode_str {
+        "read-only" => PermissionMode::ReadOnly,
+        "workspace-write" => PermissionMode::WorkspaceWrite,
+        "danger-full-access" => PermissionMode::DangerFullAccess,
+        "prompt" => PermissionMode::Prompt,
+        "allow" => PermissionMode::Allow,
+        _ => {
+            let err = json_rpc_error(id, -32602, &format!("unknown permission mode: {mode_str}"));
+            let _ = send_json(socket, &err).await;
+            return;
+        }
+    };
+
+    let delegate = Arc::clone(&state.delegate);
+    let result = tokio::task::spawn_blocking(move || {
+        delegate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_permission_mode(&session_id, mode)
+    })
+    .await
+    .unwrap_or_else(|e| Err(crate::acp_sdk_server::AcpError::internal(e.to_string())));
+
+    let resp = match result {
+        Ok(()) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {}
+        }),
+        Err(e) => json_rpc_error(id, -32603, &e.to_string()),
+    };
     let _ = send_json(socket, &resp).await;
 }
 

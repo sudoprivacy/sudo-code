@@ -4800,6 +4800,13 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         }],
                         is_error: *is_error,
                     },
+                    ContentBlock::Image { data, mime_type } => InputContentBlock::Image {
+                        source: api::ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: mime_type.clone(),
+                            data: data.clone(),
+                        },
+                    },
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {

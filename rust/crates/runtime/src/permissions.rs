@@ -152,6 +152,11 @@ impl PermissionPolicy {
         self.active_mode
     }
 
+    /// Change the active permission mode at runtime.
+    pub fn set_active_mode(&mut self, mode: PermissionMode) {
+        self.active_mode = mode;
+    }
+
     #[must_use]
     pub fn required_mode_for(&self, tool_name: &str) -> PermissionMode {
         self.tool_requirements

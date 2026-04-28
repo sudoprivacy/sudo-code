@@ -74,6 +74,11 @@ impl HookAbortSignal {
         self.aborted.store(true, Ordering::SeqCst);
     }
 
+    /// Clear the abort flag so a new turn can run.
+    pub fn reset(&self) {
+        self.aborted.store(false, Ordering::SeqCst);
+    }
+
     #[must_use]
     pub fn is_aborted(&self) -> bool {
         self.aborted.load(Ordering::SeqCst)

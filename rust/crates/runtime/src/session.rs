@@ -30,6 +30,12 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    Image {
+        /// Base64-encoded image data.
+        data: String,
+        /// MIME type, e.g. `image/png`, `image/jpeg`.
+        mime_type: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -738,6 +744,14 @@ impl ContentBlock {
                 object.insert("type".to_string(), JsonValue::String("text".to_string()));
                 object.insert("text".to_string(), JsonValue::String(text.clone()));
             }
+            Self::Image { data, mime_type } => {
+                object.insert("type".to_string(), JsonValue::String("image".to_string()));
+                object.insert("data".to_string(), JsonValue::String(data.clone()));
+                object.insert(
+                    "mime_type".to_string(),
+                    JsonValue::String(mime_type.clone()),
+                );
+            }
             Self::ToolUse {
                 id,
                 name,
@@ -794,6 +808,10 @@ impl ContentBlock {
         {
             "text" => Ok(Self::Text {
                 text: required_string(object, "text")?,
+            }),
+            "image" => Ok(Self::Image {
+                data: required_string(object, "data")?,
+                mime_type: required_string(object, "mime_type")?,
             }),
             "tool_use" => Ok(Self::ToolUse {
                 id: required_string(object, "id")?,

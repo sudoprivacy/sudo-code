@@ -1,8 +1,8 @@
 //! ACP server implementation using the official `agent-client-protocol` SDK.
 //!
-//! This module provides an SDK-based ACP server that replaces the custom
-//! JSON-RPC implementation with typed schema validation and full ACP 1.0
-//! compliance. It is feature-gated behind `acp-sdk`.
+//! This module provides an SDK-based ACP server with full ACP 1.0 compliance
+//! including capabilities declaration, session cancel, permission-mode switching,
+//! model switching, image input, and permission-prompt bridging (elicitation).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -13,17 +13,22 @@ use agent_client_protocol::{
     Error, Responder,
 };
 use agent_client_protocol_schema::{
-    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, SessionInfo, SessionNotification,
-    SessionUpdate, StopReason, TextContent, ToolCall, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind,
+    AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse, ContentBlock,
+    ContentChunk, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, PermissionOption, PermissionOptionId, PermissionOptionKind,
+    PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SessionCapabilities,
+    SessionCloseCapabilities, SessionInfo, SessionNotification, SessionUpdate,
+    SetSessionModelRequest, SetSessionModelResponse, StopReason, TextContent, ToolCall,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol_tokio::Stdio;
 
 use crate::conversation::RuntimeObserver;
-use crate::permissions::PermissionMode;
+use crate::permissions::{
+    PermissionMode, PermissionPromptDecision, PermissionPrompter, PermissionRequest,
+};
 
 /// Error type returned by ACP agent implementations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +86,15 @@ pub trait SdkAcpDelegate: Send + 'static {
         observer: &mut SdkSessionObserver,
     ) -> Result<StopReason, AcpError>;
 
+    /// Run a prompt with permission prompting bridged to the ACP client.
+    fn run_prompt_with_prompter(
+        &mut self,
+        session_id: &str,
+        prompt: String,
+        observer: &mut SdkSessionObserver,
+        prompter: &mut dyn PermissionPrompter,
+    ) -> Result<StopReason, AcpError>;
+
     /// Handle a slash command, returning text output.
     fn handle_slash_command(
         &mut self,
@@ -94,6 +108,23 @@ pub trait SdkAcpDelegate: Send + 'static {
 
     /// Close (drop) a session by ID. Returns true if it existed.
     fn close_session(&mut self, session_id: &str) -> bool;
+
+    /// Cancel a running prompt for the given session by setting its abort
+    /// signal. Returns true if the session exists.
+    fn cancel_session(&mut self, session_id: &str) -> bool;
+
+    /// Switch the model for a session. Returns a human-readable report.
+    fn set_model(&mut self, session_id: &str, model_id: &str) -> Result<String, AcpError>;
+
+    /// Return the current model ID and available models.
+    fn get_model_info(&self) -> (String, Vec<String>);
+
+    /// Change the permission mode for a session.
+    fn set_permission_mode(
+        &mut self,
+        session_id: &str,
+        mode: PermissionMode,
+    ) -> Result<(), AcpError>;
 }
 
 /// Observer that collects session update notifications to be forwarded to
@@ -169,26 +200,40 @@ impl RuntimeObserver for SdkSessionObserver {
     }
 }
 
-/// Extract plain text from a slice of ACP `ContentBlock`s.
+/// Extract plain text from a slice of ACP `ContentBlock`s. Image blocks are
+/// tracked separately and returned as `(text, images)`.
+pub(crate) fn extract_content_from_blocks(
+    blocks: &[ContentBlock],
+) -> Result<(String, Vec<(String, String)>), AcpError> {
+    let mut texts = Vec::new();
+    let mut images = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text(tc) => {
+                let t = tc.text.trim();
+                if !t.is_empty() {
+                    texts.push(t.to_owned());
+                }
+            }
+            ContentBlock::Image(ic) => {
+                images.push((ic.data.clone(), ic.mime_type.clone()));
+            }
+            _ => {}
+        }
+    }
+    if texts.is_empty() && images.is_empty() {
+        return Err(AcpError::invalid_params(
+            "prompt must include at least one non-empty text or image content block",
+        ));
+    }
+    Ok((texts.join("\n"), images))
+}
+
+/// Backward-compatible helper that extracts only text.
 pub(crate) fn extract_text_from_content_blocks(
     blocks: &[ContentBlock],
 ) -> Result<String, AcpError> {
-    let text: String = blocks
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text(tc) => {
-                let t = tc.text.trim();
-                if t.is_empty() {
-                    None
-                } else {
-                    Some(t.to_owned())
-                }
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
+    let (text, _images) = extract_content_from_blocks(blocks)?;
     if text.is_empty() {
         return Err(AcpError::invalid_params(
             "prompt must include at least one non-empty text content block",
@@ -227,6 +272,101 @@ pub(crate) fn run_delegate_prompt(
     (reason, notifications)
 }
 
+/// A permission prompter that bridges to the ACP client over channels.
+///
+/// From inside the blocking `spawn_blocking` context, `decide()` sends
+/// the permission request to an async handler which forwards it to the
+/// ACP client, then blocks waiting for the response.
+struct AcpPermissionBridge {
+    tx: tokio::sync::mpsc::UnboundedSender<(
+        PermissionRequest,
+        tokio::sync::oneshot::Sender<PermissionPromptDecision>,
+    )>,
+}
+
+impl PermissionPrompter for AcpPermissionBridge {
+    fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if self.tx.send((request.clone(), response_tx)).is_err() {
+            return PermissionPromptDecision::Deny {
+                reason: "permission bridge closed".to_string(),
+            };
+        }
+        response_rx
+            .blocking_recv()
+            .unwrap_or(PermissionPromptDecision::Deny {
+                reason: "permission response channel closed".to_string(),
+            })
+    }
+}
+
+/// Build an ACP `RequestPermissionRequest` from a runtime `PermissionRequest`.
+fn build_acp_permission_request(
+    session_id: String,
+    request: &PermissionRequest,
+) -> RequestPermissionRequest {
+    let tool_call = ToolCallUpdate::new(
+        format!("perm-{}", uuid_v4()),
+        ToolCallUpdateFields::new()
+            .status(ToolCallStatus::InProgress)
+            .raw_input(serde_json::Value::String(request.input.clone())),
+    );
+
+    let options = vec![
+        PermissionOption::new(
+            PermissionOptionId::new("allow_once"),
+            "Allow Once",
+            PermissionOptionKind::AllowOnce,
+        ),
+        PermissionOption::new(
+            PermissionOptionId::new("allow_always"),
+            "Allow Always",
+            PermissionOptionKind::AllowAlways,
+        ),
+        PermissionOption::new(
+            PermissionOptionId::new("reject_once"),
+            "Reject Once",
+            PermissionOptionKind::RejectOnce,
+        ),
+        PermissionOption::new(
+            PermissionOptionId::new("reject_always"),
+            "Reject Always",
+            PermissionOptionKind::RejectAlways,
+        ),
+    ];
+
+    RequestPermissionRequest::new(session_id, tool_call, options)
+}
+
+/// Map an ACP permission response to a `PermissionPromptDecision`.
+fn map_permission_response(response: RequestPermissionResponse) -> PermissionPromptDecision {
+    match response.outcome {
+        RequestPermissionOutcome::Selected(selected) => {
+            let id_str: &str = &selected.option_id.0;
+            if id_str.starts_with("allow") {
+                PermissionPromptDecision::Allow
+            } else {
+                PermissionPromptDecision::Deny {
+                    reason: format!("user selected: {id_str}"),
+                }
+            }
+        }
+        RequestPermissionOutcome::Cancelled | _ => PermissionPromptDecision::Deny {
+            reason: "user cancelled permission prompt".to_string(),
+        },
+    }
+}
+
+/// Generate a pseudo-random UUID v4 string without pulling in the `uuid` crate.
+fn uuid_v4() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{nanos:032x}")
+}
+
 // ---------------------------------------------------------------------------
 // Server entry point
 // ---------------------------------------------------------------------------
@@ -253,7 +393,12 @@ pub async fn run_sdk_acp_server(
                     let resp = InitializeResponse::new(req.protocol_version)
                         .agent_info(Implementation::new("scode", &version))
                         .agent_capabilities(
-                            AgentCapabilities::new().prompt_capabilities(PromptCapabilities::new()),
+                            AgentCapabilities::new()
+                                .prompt_capabilities(PromptCapabilities::new().image(true))
+                                .session_capabilities(
+                                    SessionCapabilities::new()
+                                        .close(SessionCloseCapabilities::new()),
+                                ),
                         );
                     responder.respond(resp)?;
                     Ok(())
@@ -293,7 +438,7 @@ pub async fn run_sdk_acp_server(
             },
             on_receive_request!(),
         )
-        // --- session/prompt ---
+        // --- session/prompt (with permission-prompt bridging) ---
         .on_receive_request(
             {
                 let delegate = Arc::clone(&delegate);
@@ -311,13 +456,77 @@ pub async fn run_sdk_acp_server(
                     let d = Arc::clone(&delegate);
                     let sid = req.session_id.to_string();
                     let cx_inner = cx.clone();
+                    let cx_perm = cx.clone();
                     cx.spawn(async move {
-                        let (stop_reason, notifications) = tokio::task::spawn_blocking(move || {
-                            run_delegate_prompt(&d, &sid, prompt_text)
-                        })
-                        .await
-                        .unwrap_or((StopReason::EndTurn, Vec::new()));
+                        // Set up permission-prompt bridge channels.
+                        let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::unbounded_channel::<(
+                            PermissionRequest,
+                            tokio::sync::oneshot::Sender<PermissionPromptDecision>,
+                        )>();
 
+                        let sid_for_blocking = sid.clone();
+                        let sid_for_perm = sid.clone();
+                        let blocking_handle = tokio::task::spawn_blocking(move || {
+                            let mut observer = SdkSessionObserver::new(&sid_for_blocking);
+                            let mut bridge = AcpPermissionBridge { tx: bridge_tx };
+                            let mut delegate =
+                                d.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+                            let stop = if prompt_text.starts_with('/') {
+                                delegate
+                                    .handle_slash_command(
+                                        &sid_for_blocking,
+                                        &prompt_text,
+                                        &mut observer,
+                                    )
+                                    .map(|()| StopReason::EndTurn)
+                            } else {
+                                delegate.run_prompt_with_prompter(
+                                    &sid_for_blocking,
+                                    prompt_text,
+                                    &mut observer,
+                                    &mut bridge,
+                                )
+                            };
+                            let notifications = observer.drain();
+                            let reason = stop.unwrap_or(StopReason::EndTurn);
+                            (reason, notifications)
+                        });
+
+                        // Concurrently serve permission requests from the
+                        // blocking thread and wait for the blocking task to
+                        // finish.
+                        let mut blocking_handle = blocking_handle;
+                        let result = loop {
+                            tokio::select! {
+                                biased;
+                                perm = bridge_rx.recv() => {
+                                    if let Some((perm_req, response_tx)) = perm {
+                                        let acp_req = build_acp_permission_request(
+                                            sid_for_perm.clone(),
+                                            &perm_req,
+                                        );
+                                        let decision = match cx_perm
+                                            .send_request(acp_req)
+                                            .block_task()
+                                            .await
+                                        {
+                                            Ok(resp) => map_permission_response(resp),
+                                            Err(_) => PermissionPromptDecision::Deny {
+                                                reason: "ACP permission request failed"
+                                                    .to_string(),
+                                            },
+                                        };
+                                        let _ = response_tx.send(decision);
+                                    }
+                                }
+                                done = &mut blocking_handle => {
+                                    break done.unwrap_or((StopReason::EndTurn, Vec::new()));
+                                }
+                            }
+                        };
+
+                        let (stop_reason, notifications) = result;
                         for notif in notifications {
                             cx_inner.send_notification(notif)?;
                         }
@@ -330,18 +539,47 @@ pub async fn run_sdk_acp_server(
             },
             on_receive_request!(),
         )
-        // --- session/cancel (notification, no response) ---
+        // --- session/cancel (notification) ---
         .on_receive_notification(
             {
+                let delegate = Arc::clone(&delegate);
                 async move |notif: CancelNotification, _cx: ConnectionTo<Client>| {
-                    eprintln!(
-                        "[acp-sdk] cancel requested for session {}, not yet implemented",
-                        notif.session_id
-                    );
+                    let d = Arc::clone(&delegate);
+                    let sid = notif.session_id.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        d.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .cancel_session(&sid);
+                    });
                     Ok(())
                 }
             },
             on_receive_notification!(),
+        )
+        // --- session/close ---
+        .on_receive_request(
+            {
+                let delegate = Arc::clone(&delegate);
+                async move |req: CloseSessionRequest,
+                            responder: Responder<CloseSessionResponse>,
+                            cx: ConnectionTo<Client>| {
+                    let d = Arc::clone(&delegate);
+                    let sid = req.session_id.to_string();
+                    cx.spawn(async move {
+                        tokio::task::spawn_blocking(move || {
+                            d.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .close_session(&sid);
+                        })
+                        .await
+                        .ok();
+                        responder.respond(CloseSessionResponse::new())?;
+                        Ok(())
+                    })?;
+                    Ok(())
+                }
+            },
+            on_receive_request!(),
         )
         // --- session/list ---
         .on_receive_request(
@@ -371,6 +609,40 @@ pub async fn run_sdk_acp_server(
             },
             on_receive_request!(),
         )
+        // --- session/setModel (unstable) ---
+        .on_receive_request(
+            {
+                let delegate = Arc::clone(&delegate);
+                async move |req: SetSessionModelRequest,
+                            responder: Responder<SetSessionModelResponse>,
+                            cx: ConnectionTo<Client>| {
+                    let d = Arc::clone(&delegate);
+                    let sid = req.session_id.to_string();
+                    let model_id: String = req.model_id.0.to_string();
+                    cx.spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            d.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .set_model(&sid, &model_id)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(AcpError::internal(e.to_string())));
+
+                        match result {
+                            Ok(_report) => {
+                                responder.respond(SetSessionModelResponse::new())?;
+                            }
+                            Err(e) => {
+                                responder.respond_with_error(acp_error_to_sdk(&e))?;
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    Ok(())
+                }
+            },
+            on_receive_request!(),
+        )
         // --- session/load (stub — not yet supported) ---
         .on_receive_request(
             {
@@ -385,7 +657,7 @@ pub async fn run_sdk_acp_server(
             },
             on_receive_request!(),
         )
-        // --- catch-all for unhandled methods (includes session/close) ---
+        // --- catch-all for unhandled methods ---
         .on_receive_dispatch(
             async move |dispatch: Dispatch, cx: ConnectionTo<Client>| {
                 dispatch.respond_with_error(Error::method_not_found(), cx)?;
