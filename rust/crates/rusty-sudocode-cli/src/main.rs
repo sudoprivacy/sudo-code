@@ -1429,6 +1429,20 @@ impl BuiltRuntime {
         self
     }
 
+    fn install_hook_abort_signal(&mut self, hook_abort_signal: runtime::HookAbortSignal) {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before installing hook abort signal");
+        self.runtime = Some(runtime.with_hook_abort_signal(hook_abort_signal));
+    }
+
+    fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.api_client_mut().set_reasoning_effort(effort);
+        }
+    }
+
     fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.plugins_active {
             self.plugin_registry.shutdown()?;
@@ -1480,6 +1494,8 @@ struct AcpCliSession {
     cwd: PathBuf,
     handle: SessionHandle,
     runtime: BuiltRuntime,
+    model: String,
+    permission_mode: PermissionMode,
 }
 
 struct AcpCliAgent {
@@ -1516,42 +1532,19 @@ impl AcpCliAgent {
         let cwd = canonical_session_cwd(cwd)?;
         let model = self.resolve_model_for_cwd(&cwd)?;
         let permission_mode = self.resolve_permission_mode_for_cwd(&cwd)?;
-        let system_prompt = build_system_prompt_for(&cwd).map_err(|error| {
-            AcpError::internal(format!("failed to build system prompt: {error}"))
-        })?;
         let session_state = new_cli_session_for(&cwd)
             .map_err(|error| AcpError::internal(format!("failed to create session: {error}")))?;
         let handle = create_managed_session_handle_for(&cwd, &session_state.session_id).map_err(
             |error| AcpError::internal(format!("failed to create session handle: {error}")),
         )?;
-        let mut runtime = build_runtime_for_cwd(
+        let session_model = model.clone();
+        let runtime = self.rebuild_runtime_for_session(
             &cwd,
+            handle.id.as_str(),
             session_state.with_persistence_path(handle.path.clone()),
-            &handle.id,
-            {
-                let sudocode_config =
-                    require_sudocode_config_for_cwd(&cwd).map_err(AcpError::internal)?;
-                let auth_mode = resolve_auth_mode(&model, self.auth_mode, &sudocode_config)
-                    .map_err(|e| AcpError::internal(format!("failed to resolve auth mode: {e}")))?;
-                RuntimeConfig {
-                    model,
-                    system_prompt,
-                    enable_tools: true,
-                    emit_output: false,
-                    allowed_tools: self.allowed_tools.clone(),
-                    permission_mode,
-                    progress_reporter: None,
-                    auth_mode,
-                    sudocode_config,
-                }
-            },
-        )
-        .map_err(|error| AcpError::internal(format!("failed to build runtime: {error}")))?;
-        if let Some(runtime) = runtime.runtime.as_mut() {
-            runtime
-                .api_client_mut()
-                .set_reasoning_effort(self.reasoning_effort.clone());
-        }
+            &session_model,
+            permission_mode,
+        )?;
         runtime
             .session()
             .save_to_path(&handle.path)
@@ -1561,6 +1554,8 @@ impl AcpCliAgent {
             cwd,
             handle,
             runtime,
+            model,
+            permission_mode,
         })
     }
 
@@ -1581,9 +1576,194 @@ impl AcpCliAgent {
             .map_err(|error| AcpError::internal(format!("failed to enter cwd: {error}")))?;
         Ok(default_permission_mode())
     }
-}
+    fn rebuild_runtime_for_session(
+        &self,
+        cwd: &Path,
+        handle_id: &str,
+        mut session_state: Session,
+        model: &str,
+        permission_mode: PermissionMode,
+    ) -> Result<BuiltRuntime, AcpError> {
+        let system_prompt = build_system_prompt_for(cwd).map_err(|error| {
+            AcpError::internal(format!("failed to build system prompt: {error}"))
+        })?;
+        let sudocode_config = load_sudocode_config_for_cwd(cwd);
+        let auth_mode = resolve_auth_mode(model, self.auth_mode, &sudocode_config)
+            .map_err(|e| AcpError::internal(format!("failed to resolve auth mode: {e}")))?;
+        session_state.model = Some(model.to_string());
+        let mut runtime = build_runtime_for_cwd(
+            cwd,
+            session_state,
+            handle_id,
+            RuntimeConfig {
+                model: model.to_string(),
+                system_prompt,
+                enable_tools: true,
+                emit_output: false,
+                allowed_tools: self.allowed_tools.clone(),
+                permission_mode,
+                progress_reporter: None,
+                auth_mode,
+                sudocode_config,
+            },
+        )
+        .map_err(|error| AcpError::internal(error.to_string()))?;
+        runtime.set_reasoning_effort(self.reasoning_effort.clone());
+        Ok(runtime)
+    }
 
-impl AcpCliAgent {
+    fn permission_mode_descriptors() -> Vec<runtime::acp_sdk_server::SdkModeDescriptor> {
+        vec![
+            runtime::acp_sdk_server::SdkModeDescriptor::new("read-only", "Read Only")
+                .description("Read files and inspect state without making changes."),
+            runtime::acp_sdk_server::SdkModeDescriptor::new("workspace-write", "Workspace Write")
+                .description("Allow edits inside the workspace and prompt for escalations."),
+            runtime::acp_sdk_server::SdkModeDescriptor::new(
+                "danger-full-access",
+                "Danger Full Access",
+            )
+            .description("Allow unrestricted local tool execution without further escalation."),
+            runtime::acp_sdk_server::SdkModeDescriptor::new("prompt", "Prompt")
+                .description("Require approval before executing tools."),
+            runtime::acp_sdk_server::SdkModeDescriptor::new("allow", "Allow")
+                .description("Allow all tool execution without prompting."),
+        ]
+    }
+
+    fn permission_mode_from_session_mode(mode_id: &str) -> Result<PermissionMode, AcpError> {
+        match mode_id {
+            "read-only" => Ok(PermissionMode::ReadOnly),
+            "workspace-write" => Ok(PermissionMode::WorkspaceWrite),
+            "danger-full-access" => Ok(PermissionMode::DangerFullAccess),
+            "prompt" => Ok(PermissionMode::Prompt),
+            "allow" => Ok(PermissionMode::Allow),
+            other => Err(AcpError::invalid_params(format!(
+                "unsupported ACP session mode '{other}'"
+            ))),
+        }
+    }
+
+    fn model_descriptors_for_session(
+        &self,
+        cwd: &Path,
+        current_model: &str,
+    ) -> Vec<runtime::acp_sdk_server::SdkModelDescriptor> {
+        let mut descriptors = BTreeMap::new();
+        descriptors.insert(
+            current_model.to_string(),
+            runtime::acp_sdk_server::SdkModelDescriptor::new(current_model, current_model),
+        );
+
+        let config = load_sudocode_config_for_cwd(cwd);
+        for alias in config.models.keys() {
+            let resolved = {
+                let _guard = ScopedCurrentDir::change_to(cwd).ok();
+                resolve_model_alias_with_config(alias)
+            };
+            descriptors.entry(resolved.clone()).or_insert_with(|| {
+                runtime::acp_sdk_server::SdkModelDescriptor::new(&resolved, alias)
+            });
+        }
+
+        descriptors.into_values().collect()
+    }
+
+    fn sdk_session_state(
+        &self,
+        cwd: &Path,
+        model: &str,
+        permission_mode: PermissionMode,
+    ) -> runtime::acp_sdk_server::SdkSessionState {
+        runtime::acp_sdk_server::SdkSessionState {
+            modes: runtime::acp_sdk_server::build_sdk_mode_state(
+                permission_mode.as_str(),
+                Self::permission_mode_descriptors(),
+            ),
+            models: runtime::acp_sdk_server::build_sdk_model_state(
+                model,
+                self.model_descriptors_for_session(cwd, model),
+            ),
+        }
+    }
+
+    fn session_state(
+        &self,
+        session_id: &str,
+    ) -> Result<runtime::acp_sdk_server::SdkSessionState, AcpError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| AcpError::invalid_params(format!("unknown sessionId: {session_id}")))?;
+        Ok(self.sdk_session_state(&session.cwd, &session.model, session.permission_mode))
+    }
+
+    fn persist_acp_session(session: &AcpCliSession) -> Result<(), AcpError> {
+        session
+            .runtime
+            .session()
+            .save_to_path(&session.handle.path)
+            .map_err(|error| AcpError::internal(format!("failed to persist session: {error}")))
+    }
+
+    fn set_session_model(&mut self, session_id: &str, new_model: &str) -> Result<(), AcpError> {
+        let (cwd, handle_id, session_state, permission_mode) = {
+            let session = self.sessions.get(session_id).ok_or_else(|| {
+                AcpError::invalid_params(format!("unknown sessionId: {session_id}"))
+            })?;
+            (
+                session.cwd.clone(),
+                session.handle.id.clone(),
+                session.runtime.session().clone(),
+                session.permission_mode,
+            )
+        };
+        let resolved = {
+            let _guard = ScopedCurrentDir::change_to(&cwd)
+                .map_err(|error| AcpError::internal(format!("failed to enter cwd: {error}")))?;
+            resolve_model_alias_with_config(new_model)
+        };
+        let runtime = self.rebuild_runtime_for_session(
+            &cwd,
+            &handle_id,
+            session_state,
+            &resolved,
+            permission_mode,
+        )?;
+        let session = self.sessions.get_mut(session_id).unwrap();
+        session.runtime = runtime;
+        session.model = resolved;
+        Self::persist_acp_session(session)
+    }
+
+    fn set_session_mode(
+        &mut self,
+        session_id: &str,
+        permission_mode: PermissionMode,
+    ) -> Result<(), AcpError> {
+        let (cwd, handle_id, session_state, model) = {
+            let session = self.sessions.get(session_id).ok_or_else(|| {
+                AcpError::invalid_params(format!("unknown sessionId: {session_id}"))
+            })?;
+            (
+                session.cwd.clone(),
+                session.handle.id.clone(),
+                session.runtime.session().clone(),
+                session.model.clone(),
+            )
+        };
+        let runtime = self.rebuild_runtime_for_session(
+            &cwd,
+            &handle_id,
+            session_state,
+            &model,
+            permission_mode,
+        )?;
+        let session = self.sessions.get_mut(session_id).unwrap();
+        session.runtime = runtime;
+        session.permission_mode = permission_mode;
+        Self::persist_acp_session(session)
+    }
+
     fn handle_acp_model_switch(
         &mut self,
         session_id: &str,
@@ -1596,61 +1776,60 @@ impl AcpCliAgent {
 
         let Some(new_model) = model else {
             return Ok(format_model_report(
-                &self.model,
+                &session.model,
                 session.runtime.session().messages.len(),
                 UsageTracker::from_session(session.runtime.session()).turns(),
             ));
         };
 
-        let resolved = resolve_model_alias_with_config(&new_model);
-        if resolved == self.model {
-            let session = self.sessions.get(session_id).unwrap();
+        let resolved = {
+            let _guard = ScopedCurrentDir::change_to(&session.cwd)
+                .map_err(|error| AcpError::internal(format!("failed to enter cwd: {error}")))?;
+            resolve_model_alias_with_config(&new_model)
+        };
+        if resolved == session.model {
             return Ok(format_model_report(
-                &self.model,
+                &session.model,
                 session.runtime.session().messages.len(),
                 UsageTracker::from_session(session.runtime.session()).turns(),
             ));
         }
 
-        let previous = self.model.clone();
-        let session = self.sessions.get(session_id).unwrap();
+        let previous = session.model.clone();
         let message_count = session.runtime.session().messages.len();
-        let cloned_session = session.runtime.session().clone();
-        let cwd = session.cwd.clone();
-        let handle_id = session.handle.id.clone();
-
-        let sudocode_config = load_sudocode_config_for_cwd(&cwd);
-        let permission_mode = self.resolve_permission_mode_for_cwd(&cwd)?;
-        let auth_mode = resolve_auth_mode(&resolved, self.auth_mode, &sudocode_config)
-            .map_err(|e| AcpError::internal(format!("failed to resolve auth mode: {e}")))?;
-        let system_prompt = build_system_prompt_for(&cwd)
-            .map_err(|e| AcpError::internal(format!("failed to build system prompt: {e}")))?;
-        let runtime = build_runtime_for_cwd(
-            &cwd,
-            cloned_session,
-            &handle_id,
-            RuntimeConfig {
-                model: resolved.clone(),
-                system_prompt,
-                enable_tools: true,
-                emit_output: false,
-                allowed_tools: self.allowed_tools.clone(),
-                permission_mode,
-                progress_reporter: None,
-                auth_mode,
-                sudocode_config,
-            },
-        )
-        .map_err(|e| AcpError::internal(e.to_string()))?;
-
-        let session = self.sessions.get_mut(session_id).unwrap();
-        session.runtime = runtime;
-        self.model.clone_from(&resolved);
+        self.set_session_model(session_id, &resolved)?;
 
         Ok(format_model_switch_report(
             &previous,
             &resolved,
             message_count,
+        ))
+    }
+
+    fn handle_acp_permission_switch(
+        &mut self,
+        session_id: &str,
+        mode: Option<String>,
+    ) -> Result<String, AcpError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| AcpError::invalid_params(format!("unknown sessionId: {session_id}")))?;
+
+        let Some(mode) = mode else {
+            return Ok(format_permissions_report(session.permission_mode.as_str()));
+        };
+
+        let resolved = Self::permission_mode_from_session_mode(&mode)?;
+        if resolved == session.permission_mode {
+            return Ok(format_permissions_report(session.permission_mode.as_str()));
+        }
+
+        let previous = session.permission_mode.as_str().to_string();
+        self.set_session_mode(session_id, resolved)?;
+        Ok(format_permissions_switch_report(
+            &previous,
+            resolved.as_str(),
         ))
     }
 }
@@ -1748,18 +1927,37 @@ impl AcpSdkDelegate {
 }
 
 impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
-    fn new_session(&mut self, cwd: PathBuf) -> Result<(String, PathBuf), runtime::AcpError> {
+    fn new_session(
+        &mut self,
+        cwd: PathBuf,
+    ) -> Result<runtime::acp_sdk_server::SdkNewSession, runtime::AcpError> {
         let session = self.inner.build_session(&cwd)?;
         let session_id = session.handle.id.clone();
         let session_cwd = session.cwd.clone();
+        let state =
+            self.inner
+                .sdk_session_state(&session.cwd, &session.model, session.permission_mode);
         self.inner.sessions.insert(session_id.clone(), session);
-        Ok((session_id, session_cwd))
+        Ok(runtime::acp_sdk_server::SdkNewSession {
+            session_id,
+            cwd: session_cwd,
+            state,
+        })
+    }
+
+    fn session_state(
+        &self,
+        session_id: &str,
+    ) -> Result<runtime::acp_sdk_server::SdkSessionState, runtime::AcpError> {
+        self.inner.session_state(session_id)
     }
 
     fn run_prompt(
         &mut self,
         session_id: &str,
         prompt: String,
+        abort_signal: runtime::HookAbortSignal,
+        prompter: Option<&mut dyn runtime::PermissionPrompter>,
         observer: &mut runtime::acp_sdk_server::SdkSessionObserver,
     ) -> Result<runtime::acp_sdk_server::AcpStopReason, runtime::AcpError> {
         let session = self.inner.sessions.get_mut(session_id).ok_or_else(|| {
@@ -1768,16 +1966,43 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
         let _guard = ScopedCurrentDir::change_to(&session.cwd).map_err(|e| {
             runtime::AcpError::internal(format!("failed to enter session cwd: {e}"))
         })?;
+        session.runtime.install_hook_abort_signal(abort_signal);
         session
             .runtime
-            .run_turn(prompt, None, Some(observer))
+            .set_reasoning_effort(self.inner.reasoning_effort.clone());
+        let summary = session
+            .runtime
+            .run_turn(prompt, prompter, Some(observer))
             .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
         session
             .runtime
             .session()
             .save_to_path(&session.handle.path)
             .map_err(|e| runtime::AcpError::internal(format!("failed to persist session: {e}")))?;
-        Ok(runtime::acp_sdk_server::AcpStopReason::EndTurn)
+        Ok(if format!("{:?}", summary.stop_reason) == "Cancelled" {
+            runtime::acp_sdk_server::AcpStopReason::Cancelled
+        } else {
+            runtime::acp_sdk_server::AcpStopReason::EndTurn
+        })
+    }
+
+    fn set_mode(
+        &mut self,
+        session_id: &str,
+        mode_id: &str,
+    ) -> Result<runtime::acp_sdk_server::SdkSessionState, runtime::AcpError> {
+        let mode = AcpCliAgent::permission_mode_from_session_mode(mode_id)?;
+        self.inner.set_session_mode(session_id, mode)?;
+        self.inner.session_state(session_id)
+    }
+
+    fn set_model(
+        &mut self,
+        session_id: &str,
+        model_id: &str,
+    ) -> Result<runtime::acp_sdk_server::SdkSessionState, runtime::AcpError> {
+        self.inner.set_session_model(session_id, model_id)?;
+        self.inner.session_state(session_id)
     }
 
     fn handle_slash_command(
@@ -1798,6 +2023,9 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
             SlashCommand::Model { model } => {
                 self.inner.handle_acp_model_switch(session_id, model.clone())?
             }
+            SlashCommand::Permissions { mode } => {
+                self.inner.handle_acp_permission_switch(session_id, mode.clone())?
+            }
             SlashCommand::Help => render_repl_help(),
             SlashCommand::Status => {
                 let session = self.inner.sessions.get(session_id).ok_or_else(|| {
@@ -1809,7 +2037,7 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
                     .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
                 let tracker = UsageTracker::from_session(session.runtime.session());
                 format_status_report(
-                    &self.inner.model,
+                    &session.model,
                     StatusUsage {
                         message_count: session.runtime.session().messages.len(),
                         turns: tracker.turns(),
@@ -1817,7 +2045,7 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
                         cumulative: tracker.cumulative_usage(),
                         estimated_tokens: 0,
                     },
-                    default_permission_mode().as_str(),
+                    session.permission_mode.as_str(),
                     &status_context(Some(&session.handle.path))
                         .map_err(|e| runtime::AcpError::internal(e.to_string()))?,
                     None,
@@ -1874,7 +2102,7 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
                 .map(|report| report.render())
                 .map_err(|e| runtime::AcpError::internal(e.to_string()))?,
             _ => format!(
-                "`{}` is not supported in ACP mode. Available: /model, /status, /cost, /config, /diff, /doctor, /help",
+                "`{}` is not supported in ACP mode. Available: /model, /permissions, /status, /cost, /config, /diff, /doctor, /help",
                 input.split_whitespace().next().unwrap_or(input)
             ),
         };

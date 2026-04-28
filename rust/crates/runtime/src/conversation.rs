@@ -11,6 +11,7 @@ use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
+    CANCELLED_PERMISSION_DECISION_REASON,
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
@@ -122,6 +123,12 @@ impl Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnStopReason {
+    EndTurn,
+    Cancelled,
+}
+
 /// Summary of one completed runtime turn, including tool results and usage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnSummary {
@@ -131,6 +138,7 @@ pub struct TurnSummary {
     pub iterations: usize,
     pub usage: TokenUsage,
     pub auto_compaction: Option<AutoCompactionEvent>,
+    pub stop_reason: TurnStopReason,
 }
 
 /// Details about automatic session compaction applied during a turn.
@@ -356,6 +364,7 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        let mut stop_reason = TurnStopReason::EndTurn;
 
         loop {
             iterations += 1;
@@ -411,11 +420,17 @@ where
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             assistant_messages.push(assistant_message);
 
+            if self.hook_abort_signal.is_aborted() {
+                stop_reason = TurnStopReason::Cancelled;
+                break;
+            }
+
             if pending_tool_uses.is_empty() {
                 break;
             }
 
-            for (tool_use_id, tool_name, input) in pending_tool_uses {
+            let mut tool_calls = pending_tool_uses.into_iter().peekable();
+            while let Some((tool_use_id, tool_name, input)) = tool_calls.next() {
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
                 let effective_input = pre_hook_result
                     .updated_input()
@@ -427,10 +442,7 @@ where
 
                 let permission_outcome = if pre_hook_result.is_cancelled() {
                     PermissionOutcome::Deny {
-                        reason: format_hook_message(
-                            &pre_hook_result,
-                            &format!("PreToolUse hook cancelled tool `{tool_name}`"),
-                        ),
+                        reason: CANCELLED_PERMISSION_DECISION_REASON.to_string(),
                     }
                 } else if pre_hook_result.is_failed() {
                     PermissionOutcome::Deny {
@@ -447,16 +459,18 @@ where
                         ),
                     }
                 } else if let Some(prompt) = prompter.as_mut() {
-                    self.permission_policy.authorize_with_context(
+                    self.permission_policy.authorize_with_context_for_tool_call(
                         &tool_name,
                         &effective_input,
+                        Some(&tool_use_id),
                         &permission_context,
                         Some(*prompt),
                     )
                 } else {
-                    self.permission_policy.authorize_with_context(
+                    self.permission_policy.authorize_with_context_for_tool_call(
                         &tool_name,
                         &effective_input,
+                        Some(&tool_use_id),
                         &permission_context,
                         None,
                     )
@@ -502,6 +516,46 @@ where
 
                         ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
                     }
+                    PermissionOutcome::Deny { reason }
+                        if reason == CANCELLED_PERMISSION_DECISION_REASON =>
+                    {
+                        let reason = format_hook_message(
+                            &pre_hook_result,
+                            &format!("tool `{tool_name}` was cancelled before execution"),
+                        );
+                        let result_message = cancelled_tool_result(
+                            tool_use_id,
+                            tool_name.clone(),
+                            merge_hook_feedback(pre_hook_result.messages(), reason, true),
+                        );
+                        notify_tool_result(runtime_observer_mut(&mut observer), &result_message);
+                        self.session
+                            .push_message(result_message.clone())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        self.record_tool_finished(iterations, &result_message);
+                        tool_results.push(result_message);
+
+                        for (remaining_tool_use_id, remaining_tool_name, _) in tool_calls {
+                            let cancelled_message = cancelled_tool_result(
+                                remaining_tool_use_id,
+                                remaining_tool_name,
+                                "prompt turn cancelled before pending tool approval completed"
+                                    .to_string(),
+                            );
+                            notify_tool_result(
+                                runtime_observer_mut(&mut observer),
+                                &cancelled_message,
+                            );
+                            self.session
+                                .push_message(cancelled_message.clone())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            self.record_tool_finished(iterations, &cancelled_message);
+                            tool_results.push(cancelled_message);
+                        }
+
+                        stop_reason = TurnStopReason::Cancelled;
+                        break;
+                    }
                     PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
                         tool_use_id,
                         tool_name,
@@ -509,6 +563,9 @@ where
                         true,
                     ),
                 };
+                if matches!(stop_reason, TurnStopReason::Cancelled) {
+                    break;
+                }
                 notify_tool_result(runtime_observer_mut(&mut observer), &result_message);
                 self.session
                     .push_message(result_message.clone())
@@ -516,9 +573,17 @@ where
                 self.record_tool_finished(iterations, &result_message);
                 tool_results.push(result_message);
             }
+
+            if matches!(stop_reason, TurnStopReason::Cancelled) {
+                break;
+            }
         }
 
-        let auto_compaction = self.maybe_auto_compact();
+        let auto_compaction = if matches!(stop_reason, TurnStopReason::Cancelled) {
+            None
+        } else {
+            self.maybe_auto_compact()
+        };
 
         let summary = TurnSummary {
             assistant_messages,
@@ -527,6 +592,7 @@ where
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
+            stop_reason,
         };
         self.record_turn_completed(&summary);
 
@@ -693,6 +759,16 @@ where
             "prompt_cache_events".to_string(),
             Value::from(summary.prompt_cache_events.len() as u64),
         );
+        attributes.insert(
+            "stop_reason".to_string(),
+            Value::String(
+                match summary.stop_reason {
+                    TurnStopReason::EndTurn => "end_turn",
+                    TurnStopReason::Cancelled => "cancelled",
+                }
+                .to_string(),
+            ),
+        );
         session_tracer.record("turn_completed", attributes);
     }
 
@@ -814,6 +890,14 @@ fn notify_tool_result(
     observer.on_tool_result(tool_use_id, tool_name, output, *is_error);
 }
 
+fn cancelled_tool_result(
+    tool_use_id: impl Into<String>,
+    tool_name: impl Into<String>,
+    reason: String,
+) -> ConversationMessage {
+    ConversationMessage::tool_result(tool_use_id, tool_name, reason, true)
+}
+
 fn runtime_observer_mut<'a>(
     observer: &'a mut Option<&mut dyn RuntimeObserver>,
 ) -> Option<&'a mut dyn RuntimeObserver> {
@@ -894,7 +978,7 @@ mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        RuntimeObserver, StaticToolExecutor, ToolExecutor,
+        RuntimeObserver, StaticToolExecutor, ToolExecutor, TurnStopReason,
         DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
@@ -1075,6 +1159,7 @@ mod tests {
         assert_eq!(runtime.session().messages.len(), 4);
         assert_eq!(summary.usage.output_tokens, 10);
         assert_eq!(summary.auto_compaction, None);
+        assert_eq!(summary.stop_reason, TurnStopReason::EndTurn);
         assert!(matches!(
             runtime.session().messages[1].blocks[1],
             ContentBlock::ToolUse { .. }
@@ -1173,6 +1258,58 @@ mod tests {
         assert!(matches!(
             &summary.tool_results[0].blocks[0],
             ContentBlock::ToolResult { is_error: true, output, .. } if output == "not now"
+        ));
+    }
+
+    #[test]
+    fn returns_cancelled_stop_reason_when_permission_prompt_is_cancelled() {
+        struct CancelPrompter;
+        impl PermissionPrompter for CancelPrompter {
+            fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
+                PermissionPromptDecision::Cancelled
+            }
+        }
+
+        struct SingleCallApiClient;
+        impl ApiClient for SingleCallApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if request
+                    .messages
+                    .iter()
+                    .any(|message| message.role == MessageRole::Tool)
+                {
+                    panic!("cancelled turns should not issue a follow-up model request");
+                }
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "blocked".to_string(),
+                        input: r#"{"path":"secret.txt"}"#.to_string(),
+                        thought_signature: None,
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SingleCallApiClient,
+            StaticToolExecutor::new().register("blocked", |_input| Ok("unexpected".to_string())),
+            PermissionPolicy::new(PermissionMode::Prompt)
+                .with_tool_requirement("blocked", PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("use the tool", Some(&mut CancelPrompter), None)
+            .expect("cancelled approvals should still complete the turn");
+
+        assert_eq!(summary.stop_reason, TurnStopReason::Cancelled);
+        assert_eq!(summary.tool_results.len(), 1);
+        assert!(matches!(
+            &summary.tool_results[0].blocks[0],
+            ContentBlock::ToolResult { is_error: true, output, .. } if output.contains("cancelled")
         ));
     }
 

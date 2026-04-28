@@ -14,7 +14,12 @@ use axum::Router;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
-use crate::acp_sdk_server::{run_delegate_prompt, SdkAcpConfig, SdkAcpDelegate, SharedDelegate};
+use crate::acp_sdk_server::{
+    build_new_session_response, cancel_prompt, extract_prompt_from_content_blocks,
+    register_prompt_cancel_signal, run_delegate_prompt, unregister_prompt_cancel_signal,
+    SdkAcpConfig, SdkAcpDelegate, SharedCancelRegistry, SharedDelegate,
+};
+use crate::HookAbortSignal;
 
 static WEB_UI_HTML: &str = include_str!("acp_web_ui.html");
 
@@ -22,6 +27,7 @@ static WEB_UI_HTML: &str = include_str!("acp_web_ui.html");
 struct AppState {
     config: SdkAcpConfig,
     delegate: SharedDelegate,
+    cancel_registry: SharedCancelRegistry,
 }
 
 /// Run an ACP server over WebSocket + serve the embedded web UI.
@@ -37,6 +43,7 @@ pub async fn run_acp_ws_server(
     let state = AppState {
         config,
         delegate: Arc::new(Mutex::new(delegate)),
+        cancel_registry: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
     let app = Router::new()
         .route("/", get(serve_html))
@@ -95,7 +102,10 @@ async fn dispatch_method(
         "initialize" => handle_initialize(socket, state, id, params).await,
         "session/new" => handle_session_new(socket, state, id, params).await,
         "session/prompt" => handle_session_prompt(socket, state, id, params).await,
+        "session/set_mode" => handle_session_set_mode(socket, state, id, params).await,
+        "session/set_model" => handle_session_set_model(socket, state, id, params).await,
         "session/list" => handle_session_list(socket, state, id).await,
+        "session/cancel" => handle_session_cancel(socket, state, params).await,
         "session/load" => {
             let resp = json_rpc_error(id, -32603, "session loading not yet supported");
             let _ = send_json(socket, &resp).await;
@@ -126,7 +136,12 @@ async fn handle_initialize(socket: &mut WebSocket, state: &AppState, id: &Value,
                 "version": state.config.agent_version,
             },
             "agentCapabilities": {
-                "promptCapabilities": {}
+                "promptCapabilities": {
+                    "image": true
+                },
+                "sessionCapabilities": {
+                    "list": {}
+                }
             }
         }
     });
@@ -150,11 +165,11 @@ async fn handle_session_new(socket: &mut WebSocket, state: &AppState, id: &Value
     .unwrap_or_else(|e| Err(crate::acp_sdk_server::AcpError::internal(e.to_string())));
 
     let resp = match result {
-        Ok((session_id, _cwd)) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": { "sessionId": session_id }
-        }),
+        Ok(new_session) => serde_json::to_value(build_new_session_response(new_session))
+            .map_or_else(
+                |e| json_rpc_error(id, -32603, &e.to_string()),
+                |result| json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            ),
         Err(e) => json_rpc_error(id, -32603, &e.to_string()),
     };
     let _ = send_json(socket, &resp).await;
@@ -172,27 +187,41 @@ async fn handle_session_prompt(
         .unwrap_or_default()
         .to_owned();
 
-    let Some(prompt_text) = extract_prompt_text(params) else {
-        let err = json_rpc_error(
-            id,
-            -32602,
-            "params.prompt must contain at least one non-empty text content block",
-        );
-        let _ = send_json(socket, &err).await;
-        return;
+    let prompt_text = match extract_prompt_text(params) {
+        Ok(prompt_text) => prompt_text,
+        Err(message) => {
+            let err = json_rpc_error(id, -32602, &message);
+            let _ = send_json(socket, &err).await;
+            return;
+        }
     };
 
     let delegate = Arc::clone(&state.delegate);
-    let (stop_reason, notifications) = tokio::task::spawn_blocking(move || {
-        run_delegate_prompt(&delegate, &session_id, prompt_text)
+    let cancel_registry = Arc::clone(&state.cancel_registry);
+    let abort_signal = HookAbortSignal::new();
+    register_prompt_cancel_signal(&cancel_registry, &session_id, abort_signal.clone());
+    let session_id_for_prompt = session_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        run_delegate_prompt(
+            &delegate,
+            &session_id_for_prompt,
+            prompt_text,
+            abort_signal,
+            None,
+        )
     })
     .await
-    .unwrap_or_else(|_| {
-        (
-            agent_client_protocol_schema::StopReason::EndTurn,
-            Vec::new(),
-        )
-    });
+    .unwrap_or_else(|e| Err(crate::acp_sdk_server::AcpError::internal(e.to_string())));
+    unregister_prompt_cancel_signal(&cancel_registry, &session_id);
+
+    let (stop_reason, notifications) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let resp = json_rpc_error(id, -32603, &error.to_string());
+            let _ = send_json(socket, &resp).await;
+            return;
+        }
+    };
 
     // Send each notification as a separate WS message.
     for notif in &notifications {
@@ -213,6 +242,105 @@ async fn handle_session_prompt(
         "result": { "stopReason": stop_reason }
     });
     let _ = send_json(socket, &resp).await;
+}
+
+async fn handle_session_set_mode(
+    socket: &mut WebSocket,
+    state: &AppState,
+    id: &Value,
+    params: &Value,
+) {
+    let Ok(request) = serde_json::from_value::<agent_client_protocol_schema::SetSessionModeRequest>(
+        params.clone(),
+    ) else {
+        let resp = json_rpc_error(id, -32602, "invalid session/set_mode params");
+        let _ = send_json(socket, &resp).await;
+        return;
+    };
+
+    let delegate = Arc::clone(&state.delegate);
+    let session_id = request.session_id.to_string();
+    let mode_id = request.mode_id.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        delegate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_mode(&session_id, &mode_id)
+    })
+    .await
+    .unwrap_or_else(|e| Err(crate::acp_sdk_server::AcpError::internal(e.to_string())));
+
+    match result {
+        Ok(state) => {
+            let resp = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": serde_json::to_value(agent_client_protocol_schema::SetSessionModeResponse::new()).unwrap_or_default()
+            });
+            let _ = send_json(socket, &resp).await;
+            let notif = json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": serde_json::to_value(agent_client_protocol_schema::SessionNotification::new(
+                    request.session_id,
+                    agent_client_protocol_schema::SessionUpdate::CurrentModeUpdate(
+                        agent_client_protocol_schema::CurrentModeUpdate::new(state.modes.current_mode_id),
+                    ),
+                )).unwrap_or_default()
+            });
+            let _ = send_json(socket, &notif).await;
+        }
+        Err(error) => {
+            let resp = json_rpc_error(id, -32603, &error.to_string());
+            let _ = send_json(socket, &resp).await;
+        }
+    }
+}
+
+async fn handle_session_set_model(
+    socket: &mut WebSocket,
+    state: &AppState,
+    id: &Value,
+    params: &Value,
+) {
+    let Ok(request) = serde_json::from_value::<agent_client_protocol_schema::SetSessionModelRequest>(
+        params.clone(),
+    ) else {
+        let resp = json_rpc_error(id, -32602, "invalid session/set_model params");
+        let _ = send_json(socket, &resp).await;
+        return;
+    };
+
+    let delegate = Arc::clone(&state.delegate);
+    let session_id = request.session_id.to_string();
+    let model_id = request.model_id.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        delegate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_model(&session_id, &model_id)
+    })
+    .await
+    .unwrap_or_else(|e| Err(crate::acp_sdk_server::AcpError::internal(e.to_string())));
+
+    let resp = match result {
+        Ok(_) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": serde_json::to_value(agent_client_protocol_schema::SetSessionModelResponse::new()).unwrap_or_default()
+        }),
+        Err(error) => json_rpc_error(id, -32603, &error.to_string()),
+    };
+    let _ = send_json(socket, &resp).await;
+}
+
+async fn handle_session_cancel(_socket: &mut WebSocket, state: &AppState, params: &Value) {
+    let Ok(request) =
+        serde_json::from_value::<agent_client_protocol_schema::CancelNotification>(params.clone())
+    else {
+        return;
+    };
+    let _ = cancel_prompt(&state.cancel_registry, &request.session_id.to_string());
 }
 
 async fn handle_session_list(socket: &mut WebSocket, state: &AppState, id: &Value) {
@@ -244,37 +372,25 @@ async fn handle_session_list(socket: &mut WebSocket, state: &AppState, id: &Valu
 /// Supports both:
 /// - `{"prompt": [{"type": "text", "text": "hello"}]}` (ACP content blocks)
 /// - `{"prompt": "hello"}` (plain string shorthand)
-fn extract_prompt_text(params: &Value) -> Option<String> {
-    let prompt = params.get("prompt")?;
+fn extract_prompt_text(params: &Value) -> Result<String, String> {
+    let prompt = params
+        .get("prompt")
+        .ok_or_else(|| "params.prompt is required".to_string())?;
     if let Some(s) = prompt.as_str() {
         let trimmed = s.trim();
         if trimmed.is_empty() {
-            return None;
+            return Err("params.prompt must not be empty".to_string());
         }
-        return Some(trimmed.to_owned());
+        return Ok(trimmed.to_owned());
     }
-    if let Some(arr) = prompt.as_array() {
-        let texts: Vec<String> = arr
-            .iter()
-            .filter_map(|block| {
-                if block.get("type")?.as_str()? == "text" {
-                    let t = block.get("text")?.as_str()?.trim();
-                    if t.is_empty() {
-                        None
-                    } else {
-                        Some(t.to_owned())
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if texts.is_empty() {
-            return None;
-        }
-        return Some(texts.join("\n"));
+    if prompt.is_array() {
+        let parsed = serde_json::from_value::<Vec<agent_client_protocol_schema::ContentBlock>>(
+            prompt.clone(),
+        )
+        .map_err(|error| format!("invalid ACP content blocks: {error}"))?;
+        return extract_prompt_from_content_blocks(&parsed).map_err(|error| error.to_string());
     }
-    None
+    Err("params.prompt must be a string or ACP content block array".to_string())
 }
 
 fn json_rpc_error(id: &Value, code: i32, message: &str) -> Value {

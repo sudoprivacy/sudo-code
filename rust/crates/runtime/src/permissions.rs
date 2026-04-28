@@ -68,6 +68,7 @@ impl PermissionContext {
 /// Full authorization request presented to a permission prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionRequest {
+    pub tool_call_id: Option<String>,
     pub tool_name: String,
     pub input: String,
     pub current_mode: PermissionMode,
@@ -80,7 +81,10 @@ pub struct PermissionRequest {
 pub enum PermissionPromptDecision {
     Allow,
     Deny { reason: String },
+    Cancelled,
 }
+
+pub const CANCELLED_PERMISSION_DECISION_REASON: &str = "__permission_prompt_cancelled__";
 
 /// Prompting interface used when policy requires interactive approval.
 pub trait PermissionPrompter {
@@ -167,7 +171,24 @@ impl PermissionPolicy {
         input: &str,
         prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
-        self.authorize_with_context(tool_name, input, &PermissionContext::default(), prompter)
+        self.authorize_for_tool_call(tool_name, input, None, prompter)
+    }
+
+    #[must_use]
+    pub fn authorize_for_tool_call(
+        &self,
+        tool_name: &str,
+        input: &str,
+        tool_call_id: Option<&str>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> PermissionOutcome {
+        self.authorize_with_context_for_tool_call(
+            tool_name,
+            input,
+            tool_call_id,
+            &PermissionContext::default(),
+            prompter,
+        )
     }
 
     #[must_use]
@@ -176,6 +197,19 @@ impl PermissionPolicy {
         &self,
         tool_name: &str,
         input: &str,
+        context: &PermissionContext,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> PermissionOutcome {
+        self.authorize_with_context_for_tool_call(tool_name, input, None, context, prompter)
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn authorize_with_context_for_tool_call(
+        &self,
+        tool_name: &str,
+        input: &str,
+        tool_call_id: Option<&str>,
         context: &PermissionContext,
         prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
@@ -210,6 +244,7 @@ impl PermissionPolicy {
                 return Self::prompt_or_deny(
                     tool_name,
                     input,
+                    tool_call_id,
                     current_mode,
                     required_mode,
                     Some(reason),
@@ -225,6 +260,7 @@ impl PermissionPolicy {
                     return Self::prompt_or_deny(
                         tool_name,
                         input,
+                        tool_call_id,
                         current_mode,
                         required_mode,
                         Some(reason),
@@ -233,7 +269,7 @@ impl PermissionPolicy {
                 }
                 if allow_rule.is_some()
                     || current_mode == PermissionMode::Allow
-                    || current_mode >= required_mode
+                    || (current_mode != PermissionMode::Prompt && current_mode >= required_mode)
                 {
                     return PermissionOutcome::Allow;
                 }
@@ -249,6 +285,7 @@ impl PermissionPolicy {
             return Self::prompt_or_deny(
                 tool_name,
                 input,
+                tool_call_id,
                 current_mode,
                 required_mode,
                 Some(reason),
@@ -258,7 +295,7 @@ impl PermissionPolicy {
 
         if allow_rule.is_some()
             || current_mode == PermissionMode::Allow
-            || current_mode >= required_mode
+            || (current_mode != PermissionMode::Prompt && current_mode >= required_mode)
         {
             return PermissionOutcome::Allow;
         }
@@ -275,6 +312,7 @@ impl PermissionPolicy {
             return Self::prompt_or_deny(
                 tool_name,
                 input,
+                tool_call_id,
                 current_mode,
                 required_mode,
                 reason,
@@ -294,12 +332,14 @@ impl PermissionPolicy {
     fn prompt_or_deny(
         tool_name: &str,
         input: &str,
+        tool_call_id: Option<&str>,
         current_mode: PermissionMode,
         required_mode: PermissionMode,
         reason: Option<String>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
         let request = PermissionRequest {
+            tool_call_id: tool_call_id.map(ToOwned::to_owned),
             tool_name: tool_name.to_string(),
             input: input.to_string(),
             current_mode,
@@ -311,6 +351,9 @@ impl PermissionPolicy {
             Some(prompter) => match prompter.decide(&request) {
                 PermissionPromptDecision::Allow => PermissionOutcome::Allow,
                 PermissionPromptDecision::Deny { reason } => PermissionOutcome::Deny { reason },
+                PermissionPromptDecision::Cancelled => PermissionOutcome::Deny {
+                    reason: CANCELLED_PERMISSION_DECISION_REASON.to_string(),
+                },
             },
             None => PermissionOutcome::Deny {
                 reason: reason.unwrap_or_else(|| {
@@ -473,24 +516,19 @@ mod tests {
     use super::{
         PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
         PermissionPromptDecision, PermissionPrompter, PermissionRequest,
+        CANCELLED_PERMISSION_DECISION_REASON,
     };
     use crate::config::RuntimePermissionRuleConfig;
 
     struct RecordingPrompter {
         seen: Vec<PermissionRequest>,
-        allow: bool,
+        decision: PermissionPromptDecision,
     }
 
     impl PermissionPrompter for RecordingPrompter {
         fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
             self.seen.push(request.clone());
-            if self.allow {
-                PermissionPromptDecision::Allow
-            } else {
-                PermissionPromptDecision::Deny {
-                    reason: "not now".to_string(),
-                }
-            }
+            self.decision.clone()
         }
     }
 
@@ -532,7 +570,7 @@ mod tests {
             .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
         let mut prompter = RecordingPrompter {
             seen: Vec::new(),
-            allow: true,
+            decision: PermissionPromptDecision::Allow,
         };
 
         let outcome = policy.authorize("bash", "echo hi", Some(&mut prompter));
@@ -548,6 +586,7 @@ mod tests {
             prompter.seen[0].required_mode,
             PermissionMode::DangerFullAccess
         );
+        assert_eq!(prompter.seen[0].tool_call_id, None);
     }
 
     #[test]
@@ -556,7 +595,9 @@ mod tests {
             .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
         let mut prompter = RecordingPrompter {
             seen: Vec::new(),
-            allow: false,
+            decision: PermissionPromptDecision::Deny {
+                reason: "not now".to_string(),
+            },
         };
 
         assert!(matches!(
@@ -598,7 +639,7 @@ mod tests {
             .with_permission_rules(&rules);
         let mut prompter = RecordingPrompter {
             seen: Vec::new(),
-            allow: true,
+            decision: PermissionPromptDecision::Allow,
         };
 
         let outcome = policy.authorize("bash", r#"{"command":"git status"}"#, Some(&mut prompter));
@@ -627,7 +668,7 @@ mod tests {
         );
         let mut prompter = RecordingPrompter {
             seen: Vec::new(),
-            allow: true,
+            decision: PermissionPromptDecision::Allow,
         };
 
         let outcome = policy.authorize_with_context(
@@ -668,7 +709,7 @@ mod tests {
         );
         let mut prompter = RecordingPrompter {
             seen: Vec::new(),
-            allow: true,
+            decision: PermissionPromptDecision::Allow,
         };
 
         let outcome = policy.authorize_with_context("bash", "{}", &context, Some(&mut prompter));
@@ -679,5 +720,30 @@ mod tests {
             prompter.seen[0].reason.as_deref(),
             Some("hook requested confirmation")
         );
+    }
+
+    #[test]
+    fn cancelled_prompts_propagate_with_tool_call_ids() {
+        let policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+        let mut prompter = RecordingPrompter {
+            seen: Vec::new(),
+            decision: PermissionPromptDecision::Cancelled,
+        };
+
+        let outcome = policy.authorize_for_tool_call(
+            "bash",
+            r#"{"command":"rm -rf /tmp/x"}"#,
+            Some("call_1"),
+            Some(&mut prompter),
+        );
+
+        assert_eq!(
+            outcome,
+            PermissionOutcome::Deny {
+                reason: CANCELLED_PERMISSION_DECISION_REASON.to_string(),
+            }
+        );
+        assert_eq!(prompter.seen[0].tool_call_id.as_deref(), Some("call_1"));
     }
 }
