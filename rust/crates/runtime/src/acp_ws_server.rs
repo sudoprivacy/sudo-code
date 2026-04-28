@@ -183,16 +183,16 @@ async fn handle_session_prompt(
     };
 
     let delegate = Arc::clone(&state.delegate);
-    let sid = session_id.clone();
-    let (stop_reason, notifications) =
-        tokio::task::spawn_blocking(move || run_delegate_prompt(&delegate, &sid, prompt_text))
-            .await
-            .unwrap_or_else(|_| {
-                (
-                    agent_client_protocol_schema::StopReason::EndTurn,
-                    Vec::new(),
-                )
-            });
+    let (stop_reason, notifications) = tokio::task::spawn_blocking(move || {
+        run_delegate_prompt(&delegate, &session_id, prompt_text)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        (
+            agent_client_protocol_schema::StopReason::EndTurn,
+            Vec::new(),
+        )
+    });
 
     // Send each notification as a separate WS message.
     for notif in &notifications {
