@@ -228,56 +228,76 @@ fn build_codex_request(request: &MessageRequest) -> Value {
 }
 
 fn translate_input_message(message: &InputMessage, input: &mut Vec<Value>) {
-    match message.role.as_str() {
-        "assistant" => {
-            let mut text_buf = String::new();
-            for block in &message.content {
-                match block {
-                    InputContentBlock::Text { text } => text_buf.push_str(text),
-                    InputContentBlock::ToolUse {
-                        id,
-                        name,
-                        input: args,
-                        ..
-                    } => {
-                        flush_text(&mut text_buf, "assistant", input);
-                        input.push(json!({
-                            "type": "function_call",
-                            "call_id": id,
-                            "name": name,
-                            "arguments": args.to_string(),
-                        }));
-                    }
-                    InputContentBlock::ToolResult { .. } | InputContentBlock::Image { .. } => {}
+    if message.role.as_str() == "assistant" {
+        let mut text_buf = String::new();
+        for block in &message.content {
+            match block {
+                InputContentBlock::Text { text } => text_buf.push_str(text),
+                InputContentBlock::ToolUse {
+                    id,
+                    name,
+                    input: args,
+                    ..
+                } => {
+                    flush_text(&mut text_buf, "assistant", input);
+                    input.push(json!({
+                        "type": "function_call",
+                        "call_id": id,
+                        "name": name,
+                        "arguments": args.to_string(),
+                    }));
                 }
+                InputContentBlock::ToolResult { .. } | InputContentBlock::Image { .. } => {}
             }
-            flush_text(&mut text_buf, "assistant", input);
         }
-        _ => {
-            for block in &message.content {
-                match block {
-                    InputContentBlock::Text { text } => {
-                        input.push(json!({"role": "user", "content": text}));
-                    }
-                    InputContentBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                        ..
-                    } => {
-                        input.push(json!({
-                            "type": "function_call_output",
-                            "call_id": tool_use_id,
-                            "output": flatten_tool_result(content),
-                        }));
-                    }
-                    InputContentBlock::Image { source } => {
-                        input.push(json!({
-                            "type": "input_image",
-                            "image_url": format!("data:{};base64,{}", source.media_type, source.data),
-                        }));
-                    }
-                    InputContentBlock::ToolUse { .. } => {}
+        flush_text(&mut text_buf, "assistant", input);
+    } else {
+        let mut user_parts: Vec<Value> = Vec::new();
+        for block in &message.content {
+            match block {
+                InputContentBlock::Text { text } => {
+                    user_parts.push(json!({ "type": "input_text", "text": text }));
                 }
+                InputContentBlock::Image { source } => {
+                    user_parts.push(json!({
+                        "type": "input_image",
+                        "image_url": format!("data:{};base64,{}", source.media_type, source.data),
+                    }));
+                }
+                InputContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    // Flush accumulated user parts before the tool result.
+                    if !user_parts.is_empty() {
+                        input.push(json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": user_parts,
+                        }));
+                        user_parts = Vec::new();
+                    }
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": tool_use_id,
+                        "output": flatten_tool_result(content),
+                    }));
+                }
+                InputContentBlock::ToolUse { .. } => {}
+            }
+        }
+        // Flush remaining user parts.
+        if !user_parts.is_empty() {
+            // Plain string for text-only messages (broad compatibility).
+            if user_parts.len() == 1 && user_parts[0]["type"] == "input_text" {
+                input.push(json!({"role": "user", "content": user_parts[0]["text"]}));
+            } else {
+                input.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": user_parts,
+                }));
             }
         }
     }
