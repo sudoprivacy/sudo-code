@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
-use crate::http_client::build_http_client_or_default;
+use crate::http_transport::{HttpTransport, RetryPolicy};
 use crate::providers::registry::Credential;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
@@ -77,7 +77,7 @@ struct RefreshTokenResponse {
 
 #[derive(Debug)]
 pub struct GeminiClient {
-    http: reqwest::Client,
+    http: HttpTransport,
     base_url: String,
     credential: Credential,
     is_subscription: bool,
@@ -85,6 +85,7 @@ pub struct GeminiClient {
     project_id: tokio::sync::Mutex<Option<String>>,
     /// Cached access token + expiry (epoch ms) after refresh.
     token_cache: tokio::sync::Mutex<Option<(String, u64)>>,
+    retry_policy: RetryPolicy,
 }
 
 impl Clone for GeminiClient {
@@ -96,6 +97,7 @@ impl Clone for GeminiClient {
             is_subscription: self.is_subscription,
             project_id: tokio::sync::Mutex::new(None),
             token_cache: tokio::sync::Mutex::new(None),
+            retry_policy: self.retry_policy.clone(),
         }
     }
 }
@@ -108,13 +110,20 @@ impl GeminiClient {
             Credential::AuthFile(_) | Credential::Token(_)
         );
         Ok(Self {
-            http: build_http_client_or_default(),
+            http: HttpTransport::new(),
             base_url: resolved.base_url.clone(),
             credential: resolved.credential.clone(),
             is_subscription,
             project_id: tokio::sync::Mutex::new(None),
             token_cache: tokio::sync::Mutex::new(None),
+            retry_policy: RetryPolicy::DEFAULT,
         })
+    }
+
+    #[must_use]
+    pub fn with_session_tracer(mut self, session_tracer: telemetry::SessionTracer) -> Self {
+        self.http.set_session_tracer(session_tracer);
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -184,6 +193,7 @@ impl GeminiClient {
 
                 let resp = self
                     .http
+                    .raw()
                     .post("https://oauth2.googleapis.com/token")
                     .form(&[
                         ("grant_type", "refresh_token"),
@@ -230,6 +240,7 @@ impl GeminiClient {
         let url = format!("{}/v1internal:loadCodeAssist", self.base_url);
         let resp = self
             .http
+            .raw()
             .post(&url)
             .header("authorization", format!("Bearer {token}"))
             .header("content-type", "application/json")
@@ -308,22 +319,23 @@ impl GeminiClient {
             (url, payload)
         };
 
-        let mut req_builder = self
-            .http
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("user-agent", gemini_cli_user_agent(&request.model));
-
+        let mut headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "user-agent".to_string(),
+                gemini_cli_user_agent(&request.model),
+            ),
+        ];
         if self.is_subscription {
-            req_builder = req_builder.header("authorization", format!("Bearer {token}"));
+            headers.push(("authorization".to_string(), format!("Bearer {token}")));
         }
 
-        let response = req_builder.json(&payload).send().await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(error_from_response(status, response).await);
-        }
+        let response = self
+            .http
+            .send_json(&url, &headers, &payload, &self.retry_policy, |response| {
+                check_gemini_response(response)
+            })
+            .await?;
 
         Ok(MessageStream {
             response,
@@ -351,7 +363,11 @@ fn now_epoch_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-async fn error_from_response(status: reqwest::StatusCode, response: reqwest::Response) -> ApiError {
+async fn check_gemini_response(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
     let body = response.text().await.unwrap_or_default();
     let (error_type, message) = serde_json::from_str::<Value>(&body)
         .ok()
@@ -363,7 +379,7 @@ async fn error_from_response(status: reqwest::StatusCode, response: reqwest::Res
             ))
         })
         .unwrap_or((None, None));
-    ApiError::Api {
+    Err(ApiError::Api {
         status,
         error_type,
         message,
@@ -371,7 +387,7 @@ async fn error_from_response(status: reqwest::StatusCode, response: reqwest::Res
         body,
         retryable: matches!(status.as_u16(), 429 | 500 | 502 | 503),
         suggested_action: None,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------

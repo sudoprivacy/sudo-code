@@ -36,7 +36,6 @@ use api::{
     OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
-use base64::Engine;
 
 use cli::api_client::{
     collect_prompt_cache_events, collect_tool_results, collect_tool_uses, final_assistant_text,
@@ -1260,7 +1259,7 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
@@ -1292,10 +1291,9 @@ fn run_repl(
             .unwrap_or(80);
         let separator = format!("\x1b[2m{}\x1b[0m", "─".repeat(term_width));
         let footer = "  \x1b[2m/help · /status · Tab for /commands\x1b[0m";
-        // Print the entire input chrome block: image indicator placeholder,
-        // top sep, prompt placeholder, bottom sep, footer.  Then move the
-        // cursor back to the prompt line so read_line() renders there.
-        println!(); // image indicator (initially blank)
+        // Print the entire input chrome block: top sep, prompt placeholder,
+        // bottom sep, footer.  Then move the cursor back to the prompt line
+        // so read_line() renders there — the user sees all four elements at once.
         println!("{separator}");
         println!();
         println!("{separator}");
@@ -1304,24 +1302,18 @@ fn run_repl(
         std::io::Write::flush(&mut std::io::stdout())?;
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
-                // Clear pre-printed chrome (indicator + sep + prompt + sep + footer).
+                // Clear pre-printed bottom sep + footer
                 print!("\x1b[J");
+                // Replace prompt line with gray-background echo of user input
                 let trimmed = input.trim().to_string();
-                let echo_display = format!("❯ {}", trimmed.replace('\n', " "));
+                let echo_display = format!(" › {}", trimmed.replace('\n', " "));
                 let pad = term_width.saturating_sub(echo_display.chars().count());
-                print!("\x1b[3F\x1b[J"); // up 3 to indicator line, clear all below
-
-                // Print echo of user input, then any image-attach lines,
-                // then separator — all in one block.
+                print!(
+                    "\x1b[1F\x1b[2K\x1b[48;5;236m{echo_display}{}\x1b[0m",
+                    " ".repeat(pad)
+                );
                 println!();
-                print!("\x1b[48;5;236m{echo_display}{}\x1b[0m", " ".repeat(pad));
-                println!();
-                let pasted_images = editor.take_images();
-                for hash in pasted_images.keys() {
-                    println!("  \x1b[2m📎 [Image #{}] attached\x1b[0m", &hash[..12]);
-                }
-                println!();
-
+                println!("{separator}");
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
                     cli.persist_session()?;
                     break;
@@ -1361,24 +1353,8 @@ fn run_repl(
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
-
-                if pasted_images.is_empty() {
-                    if let Err(e) = cli.run_turn(&trimmed) {
-                        eprintln!("\x1b[31m{e}\x1b[0m");
-                    }
-                } else {
-                    let mut blocks = vec![ContentBlock::Text {
-                        text: trimmed.clone(),
-                    }];
-                    for (b64, mime) in pasted_images.values() {
-                        blocks.push(ContentBlock::Image {
-                            data: b64.clone(),
-                            mime_type: mime.clone(),
-                        });
-                    }
-                    if let Err(e) = cli.run_turn_with_blocks(blocks) {
-                        eprintln!("\x1b[31m{e}\x1b[0m");
-                    }
+                if let Err(e) = cli.run_turn(&trimmed) {
+                    eprintln!("\x1b[31m{e}\x1b[0m");
                 }
             }
             input::ReadOutcome::Exit => {
@@ -1975,23 +1951,12 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
         let session = self.inner.sessions.get_mut(session_id).ok_or_else(|| {
             runtime::AcpError::invalid_params(format!("unknown sessionId: {session_id}"))
         })?;
-        let registry = runtime::ImageRegistry::default_cache()
-            .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
         for (data, mime_type) in images {
-            let raw_bytes = base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
-            let registered = registry
-                .register_bytes(&raw_bytes, mime_type)
-                .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
-            let (b64, final_mime) = registry
-                .load(&registered.hash)
-                .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
             let msg = runtime::ConversationMessage {
                 role: runtime::MessageRole::User,
                 blocks: vec![runtime::ContentBlock::Image {
-                    data: b64,
-                    mime_type: final_mime,
+                    data: data.clone(),
+                    mime_type: mime_type.clone(),
                 }],
                 usage: None,
             };
@@ -2362,15 +2327,6 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.run_turn_with_blocks(vec![ContentBlock::Text {
-            text: input.to_string(),
-        }])
-    }
-
-    fn run_turn_with_blocks(
-        &mut self,
-        blocks: Vec<ContentBlock>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
         let turn_start = Instant::now();
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
@@ -2386,7 +2342,7 @@ impl LiveCli {
             .set_spinner_pause(pause_flag.clone());
         runtime.tool_executor_mut().set_spinner_pause(pause_flag);
         let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
-        let result = runtime.run_turn_with_blocks(blocks, Some(&mut permission_prompter), None);
+        let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {

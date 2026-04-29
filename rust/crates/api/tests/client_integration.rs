@@ -198,7 +198,7 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
     );
 
     let events = sink.events();
-    assert_eq!(events.len(), 6);
+    assert_eq!(events.len(), 7);
     assert!(matches!(
         &events[0],
         TelemetryEvent::HttpRequestStarted {
@@ -215,6 +215,14 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
     ));
     assert!(matches!(
         &events[2],
+        TelemetryEvent::HttpRequestDebug {
+            method,
+            url,
+            ..
+        } if method == "POST" && url.contains("/v1/messages")
+    ));
+    assert!(matches!(
+        &events[3],
         TelemetryEvent::HttpRequestSucceeded {
             request_id,
             status: 200,
@@ -222,11 +230,11 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
         } if request_id.as_deref() == Some("req_profile_123")
     ));
     assert!(matches!(
-        &events[3],
+        &events[4],
         TelemetryEvent::SessionTrace(trace) if trace.name == "http_request_succeeded"
     ));
     assert!(matches!(
-        &events[4],
+        &events[5],
         TelemetryEvent::Analytics(event)
             if event.namespace == "api"
                 && event.action == "message_usage"
@@ -235,7 +243,7 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
                 && event.properties.get("estimated_cost_usd") == Some(&json!("$0.0001"))
     ));
     assert!(matches!(
-        &events[5],
+        &events[6],
         TelemetryEvent::SessionTrace(trace) if trace.name == "analytics"
     ));
 }

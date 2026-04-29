@@ -1,3 +1,5 @@
+use telemetry::SessionTracer;
+
 use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
@@ -148,6 +150,17 @@ impl ProviderClient {
             Self::OpenAi(_) => ProviderKind::OpenAi,
             Self::Codex(_) => ProviderKind::Codex,
             Self::Gemini(_) => ProviderKind::Gemini,
+        }
+    }
+
+    #[must_use]
+    pub fn with_session_tracer(self, session_tracer: SessionTracer) -> Self {
+        match self {
+            Self::Anthropic(client) => Self::Anthropic(client.with_session_tracer(session_tracer)),
+            Self::Xai(client) => Self::Xai(client.with_session_tracer(session_tracer)),
+            Self::OpenAi(client) => Self::OpenAi(client.with_session_tracer(session_tracer)),
+            Self::Codex(client) => Self::Codex(client.with_session_tracer(session_tracer)),
+            Self::Gemini(client) => Self::Gemini(client.with_session_tracer(session_tracer)),
         }
     }
 

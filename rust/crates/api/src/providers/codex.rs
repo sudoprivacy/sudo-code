@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
-use crate::http_client::build_http_client_or_default;
+use crate::http_transport::{HttpTransport, RetryPolicy};
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
@@ -85,10 +85,11 @@ fn read_auth_file() -> Result<(String, String), ApiError> {
 
 #[derive(Debug, Clone)]
 pub struct CodexClient {
-    http: reqwest::Client,
+    http: HttpTransport,
     base_url: String,
     access_token: String,
     account_id: String,
+    retry_policy: RetryPolicy,
 }
 
 impl CodexClient {
@@ -96,24 +97,31 @@ impl CodexClient {
     #[must_use]
     pub fn new(base_url: String, access_token: String, account_id: String) -> Self {
         Self {
-            http: build_http_client_or_default(),
+            http: HttpTransport::new(),
             base_url,
             access_token,
             account_id,
+            retry_policy: RetryPolicy::DEFAULT,
         }
+    }
+
+    #[must_use]
+    pub fn with_session_tracer(mut self, session_tracer: telemetry::SessionTracer) -> Self {
+        self.http.set_session_tracer(session_tracer);
+        self
     }
 
     /// Build from `~/.codex/auth.json`.
     pub fn from_auth_file() -> Result<Self, ApiError> {
         let (access_token, account_id) = read_auth_file()?;
-        let http = build_http_client_or_default();
         let base_url =
             std::env::var("CODEX_BASE_URL").unwrap_or_else(|_| DEFAULT_CODEX_BASE_URL.to_string());
         Ok(Self {
-            http,
+            http: HttpTransport::new(),
             base_url,
             access_token,
             account_id,
+            retry_policy: RetryPolicy::DEFAULT,
         })
     }
 
@@ -141,22 +149,26 @@ impl CodexClient {
         let payload = build_codex_request(request);
         let url = format!("{}/responses", self.base_url);
 
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "authorization".to_string(),
+                format!("Bearer {}", self.access_token),
+            ),
+            ("chatgpt-account-id".to_string(), self.account_id.clone()),
+            (
+                "openai-beta".to_string(),
+                "responses=experimental".to_string(),
+            ),
+            ("originator".to_string(), "codex_cli_rs".to_string()),
+        ];
+
         let response = self
             .http
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {}", self.access_token))
-            .header("chatgpt-account-id", &self.account_id)
-            .header("openai-beta", "responses=experimental")
-            .header("originator", "codex_cli_rs")
-            .json(&payload)
-            .send()
+            .send_json(&url, &headers, &payload, &self.retry_policy, |response| {
+                check_codex_response(response)
+            })
             .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(error_from_response(status, response).await);
-        }
 
         Ok(MessageStream {
             response,
@@ -168,7 +180,11 @@ impl CodexClient {
     }
 }
 
-async fn error_from_response(status: reqwest::StatusCode, response: reqwest::Response) -> ApiError {
+async fn check_codex_response(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
     let body = response.text().await.unwrap_or_default();
     let (error_type, message) = serde_json::from_str::<Value>(&body)
         .ok()
@@ -180,7 +196,7 @@ async fn error_from_response(status: reqwest::StatusCode, response: reqwest::Res
             ))
         })
         .unwrap_or((None, None));
-    ApiError::Api {
+    Err(ApiError::Api {
         status,
         error_type,
         message,
@@ -188,7 +204,7 @@ async fn error_from_response(status: reqwest::StatusCode, response: reqwest::Res
         body,
         retryable: matches!(status.as_u16(), 429 | 500 | 502 | 503),
         suggested_action: None,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
