@@ -1788,7 +1788,13 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
         session_id: &str,
         prompt: String,
         observer: &mut runtime::acp_sdk_server::SdkSessionObserver,
-    ) -> Result<runtime::acp_sdk_server::AcpStopReason, runtime::AcpError> {
+    ) -> Result<
+        (
+            runtime::acp_sdk_server::AcpStopReason,
+            Option<runtime::acp_sdk_server::PromptUsage>,
+        ),
+        runtime::AcpError,
+    > {
         self.run_prompt_impl(session_id, prompt, observer, None)
     }
 
@@ -1798,7 +1804,13 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
         prompt: String,
         observer: &mut runtime::acp_sdk_server::SdkSessionObserver,
         prompter: &mut dyn runtime::PermissionPrompter,
-    ) -> Result<runtime::acp_sdk_server::AcpStopReason, runtime::AcpError> {
+    ) -> Result<
+        (
+            runtime::acp_sdk_server::AcpStopReason,
+            Option<runtime::acp_sdk_server::PromptUsage>,
+        ),
+        runtime::AcpError,
+    > {
         self.run_prompt_impl(session_id, prompt, observer, Some(prompter))
     }
 
@@ -2062,7 +2074,13 @@ impl AcpSdkDelegate {
         prompt: String,
         observer: &mut runtime::acp_sdk_server::SdkSessionObserver,
         prompter: Option<&mut dyn runtime::PermissionPrompter>,
-    ) -> Result<runtime::acp_sdk_server::AcpStopReason, runtime::AcpError> {
+    ) -> Result<
+        (
+            runtime::acp_sdk_server::AcpStopReason,
+            Option<runtime::acp_sdk_server::PromptUsage>,
+        ),
+        runtime::AcpError,
+    > {
         let session = self.inner.sessions.get_mut(session_id).ok_or_else(|| {
             runtime::AcpError::invalid_params(format!("unknown sessionId: {session_id}"))
         })?;
@@ -2075,12 +2093,23 @@ impl AcpSdkDelegate {
             .runtime
             .run_turn(prompt, prompter, Some(observer))
             .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
+        let usage = UsageTracker::from_session(session.runtime.session()).cumulative_usage();
+        let prompt_usage = runtime::acp_sdk_server::PromptUsage {
+            input_tokens: u64::from(usage.input_tokens),
+            output_tokens: u64::from(usage.output_tokens),
+            total_tokens: u64::from(usage.total_tokens()),
+            cache_read_tokens: Some(u64::from(usage.cache_read_input_tokens)),
+            cache_write_tokens: Some(u64::from(usage.cache_creation_input_tokens)),
+        };
         session
             .runtime
             .session()
             .save_to_path(&session.handle.path)
             .map_err(|e| runtime::AcpError::internal(format!("failed to persist session: {e}")))?;
-        Ok(runtime::acp_sdk_server::AcpStopReason::EndTurn)
+        Ok((
+            runtime::acp_sdk_server::AcpStopReason::EndTurn,
+            Some(prompt_usage),
+        ))
     }
 }
 

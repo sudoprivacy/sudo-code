@@ -28,7 +28,7 @@ use agent_client_protocol_schema::{
     RequestPermissionRequest, RequestPermissionResponse, SessionCapabilities,
     SessionCloseCapabilities, SessionInfo, SessionNotification, SessionUpdate,
     SetSessionModelRequest, SetSessionModelResponse, StopReason, TextContent, ToolCall,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, Usage,
 };
 
 /// Error type returned by ACP agent implementations.
@@ -102,7 +102,7 @@ pub trait SdkAcpDelegate: Send + 'static {
         session_id: &str,
         prompt: String,
         observer: &mut SdkSessionObserver,
-    ) -> Result<StopReason, AcpError>;
+    ) -> Result<(StopReason, Option<PromptUsage>), AcpError>;
 
     /// Run a prompt with permission prompting bridged to the ACP client.
     fn run_prompt_with_prompter(
@@ -111,7 +111,7 @@ pub trait SdkAcpDelegate: Send + 'static {
         prompt: String,
         observer: &mut SdkSessionObserver,
         prompter: &mut dyn PermissionPrompter,
-    ) -> Result<StopReason, AcpError>;
+    ) -> Result<(StopReason, Option<PromptUsage>), AcpError>;
 
     /// Handle a slash command, returning text output.
     fn handle_slash_command(
@@ -288,6 +288,16 @@ pub(crate) fn extract_content_from_blocks(
 /// Re-export `StopReason` so the CLI crate doesn't need a direct dep on
 /// the schema crate.
 pub use agent_client_protocol_schema::StopReason as AcpStopReason;
+
+/// Token usage data returned by a prompt turn.
+#[derive(Debug, Clone, Default)]
+pub struct PromptUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+}
 
 /// Thread-safe handle to a delegate, shared across async handlers.
 pub type SharedDelegate = Arc<Mutex<Box<dyn SdkAcpDelegate>>>;
@@ -518,7 +528,7 @@ pub(crate) async fn run_acp_on_transport(
                                         &prompt_text,
                                         &mut observer,
                                     )
-                                    .map(|()| StopReason::EndTurn)
+                                    .map(|()| (StopReason::EndTurn, None))
                             } else {
                                 delegate.run_prompt_with_prompter(
                                     &sid_for_blocking,
@@ -528,8 +538,8 @@ pub(crate) async fn run_acp_on_transport(
                                 )
                             };
                             let notifications = observer.drain();
-                            let reason = stop.unwrap_or(StopReason::EndTurn);
-                            (reason, notifications)
+                            let (reason, usage) = stop.unwrap_or((StopReason::EndTurn, None));
+                            (reason, usage, notifications)
                         });
 
                         // Concurrently serve permission requests from the
@@ -562,21 +572,29 @@ pub(crate) async fn run_acp_on_transport(
                                         // Await the result directly to avoid a busy loop
                                         // (biased select would keep picking this branch).
                                         break blocking_handle.await
-                                            .unwrap_or((StopReason::EndTurn, Vec::new()));
+                                            .unwrap_or((StopReason::EndTurn, None, Vec::new()));
                                     }
                                 }
                                 done = &mut blocking_handle => {
-                                    break done.unwrap_or((StopReason::EndTurn, Vec::new()));
+                                    break done.unwrap_or((StopReason::EndTurn, None, Vec::new()));
                                 }
                             }
                         };
 
-                        let (stop_reason, notifications) = result;
+                        let (stop_reason, prompt_usage, notifications) = result;
                         for notif in notifications {
                             cx_inner.send_notification(notif)?;
                         }
 
-                        responder.respond(PromptResponse::new(stop_reason))?;
+                        let mut response = PromptResponse::new(stop_reason);
+                        if let Some(u) = prompt_usage {
+                            response = response.usage(
+                                Usage::new(u.total_tokens, u.input_tokens, u.output_tokens)
+                                    .cached_read_tokens(u.cache_read_tokens)
+                                    .cached_write_tokens(u.cache_write_tokens),
+                            );
+                        }
+                        responder.respond(response)?;
                         Ok(())
                     })?;
                     Ok(())

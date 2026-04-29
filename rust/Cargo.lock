@@ -2360,7 +2360,6 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
- "sha2",
  "syntect",
  "tokio",
  "tokio-tungstenite",
