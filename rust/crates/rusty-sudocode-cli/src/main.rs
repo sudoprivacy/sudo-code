@@ -1307,7 +1307,7 @@ fn run_repl(
                 // Clear pre-printed chrome (indicator + sep + prompt + sep + footer).
                 print!("\x1b[J");
                 let trimmed = input.trim().to_string();
-                let echo_display = format!(" ❯ {}", trimmed.replace('\n', " "));
+                let echo_display = format!("❯ {}", trimmed.replace('\n', " "));
                 let pad = term_width.saturating_sub(echo_display.chars().count());
                 print!("\x1b[3F\x1b[J"); // up 3 to indicator line, clear all below
 
