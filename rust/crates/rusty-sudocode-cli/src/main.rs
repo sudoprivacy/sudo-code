@@ -1260,70 +1260,6 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
     }
 }
 
-/// Parse `<image:HASH>` tags from the input text and resolve them from the
-/// image registry.  Returns the content blocks for a user message: one or more
-/// `Text` blocks (the remaining text segments) interleaved with `Image` blocks.
-fn resolve_image_tags(input: &str) -> Vec<ContentBlock> {
-    let re = regex::Regex::new(r"<image:([a-fA-F0-9]{64})>").expect("valid regex");
-    let Ok(registry) = runtime::ImageRegistry::default_cache() else {
-        return vec![ContentBlock::Text {
-            text: input.to_string(),
-        }];
-    };
-
-    let mut blocks = Vec::new();
-    let mut last_end = 0;
-
-    for cap in re.captures_iter(input) {
-        let full_match = cap.get(0).expect("capture group 0");
-        let hash = &cap[1];
-
-        // Collect any text before this tag.
-        if full_match.start() > last_end {
-            let text_segment = &input[last_end..full_match.start()];
-            let trimmed = text_segment.trim();
-            if !trimmed.is_empty() {
-                blocks.push(ContentBlock::Text {
-                    text: trimmed.to_string(),
-                });
-            }
-        }
-        last_end = full_match.end();
-
-        // Resolve the image from the registry.
-        if let Ok((b64, mime)) = registry.load(hash) {
-            blocks.push(ContentBlock::Image {
-                data: b64,
-                mime_type: mime,
-            });
-        } else {
-            // If the hash doesn't resolve, keep the tag as text.
-            blocks.push(ContentBlock::Text {
-                text: full_match.as_str().to_string(),
-            });
-        }
-    }
-
-    // Trailing text after the last tag.
-    if last_end < input.len() {
-        let trailing = input[last_end..].trim();
-        if !trailing.is_empty() {
-            blocks.push(ContentBlock::Text {
-                text: trailing.to_string(),
-            });
-        }
-    }
-
-    // Fallback: if nothing matched, just produce a single text block.
-    if blocks.is_empty() {
-        blocks.push(ContentBlock::Text {
-            text: input.to_string(),
-        });
-    }
-
-    blocks
-}
-
 #[allow(clippy::needless_pass_by_value)]
 fn run_repl(
     model: String,
@@ -1366,7 +1302,10 @@ fn run_repl(
         print!("\x1b[2F\x1b[2K"); // cursor up 2 lines, clear prompt placeholder
         std::io::Write::flush(&mut std::io::stdout())?;
         match editor.read_line()? {
-            input::ReadOutcome::Submit(input) => {
+            input::ReadOutcome::Submit {
+                text: input,
+                clipboard_image,
+            } => {
                 // Clear pre-printed bottom sep + footer
                 print!("\x1b[J");
                 // Replace prompt line with gray-background echo of user input
@@ -1419,10 +1358,17 @@ fn run_repl(
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
 
-                // If the prompt contains <image:HASH> tags (inserted by
-                // the /image command), resolve them and run a multi-block turn.
-                if trimmed.contains("<image:") {
-                    let blocks = resolve_image_tags(&trimmed);
+                // Build content blocks: if clipboard has a new image,
+                // attach it alongside the text.
+                if let Some((b64, mime)) = clipboard_image {
+                    println!("  \x1b[2m📎 Clipboard image attached\x1b[0m");
+                    let mut blocks = vec![ContentBlock::Text {
+                        text: trimmed.clone(),
+                    }];
+                    blocks.push(ContentBlock::Image {
+                        data: b64,
+                        mime_type: mime,
+                    });
                     if let Err(e) = cli.run_turn_with_blocks(blocks) {
                         eprintln!("\x1b[31m{e}\x1b[0m");
                     }

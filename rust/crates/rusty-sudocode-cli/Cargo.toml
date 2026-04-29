@@ -19,7 +19,6 @@ compat-harness = { path = "../compat-harness" }
 crossterm = "0.28"
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 pulldown-cmark = "0.13"
-regex = "1"
 rustyline = "15"
 runtime = { path = "../runtime" }
 plugins = { path = "../plugins" }

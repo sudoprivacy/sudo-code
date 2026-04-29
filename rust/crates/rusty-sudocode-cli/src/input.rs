@@ -14,46 +14,6 @@ use rustyline::{
     EventHandler, Helper, KeyCode, KeyEvent, Modifiers, RepeatCount,
 };
 
-/// Intercepts Ctrl+V to check the system clipboard for image data.
-/// If an image is found it is registered in the [`ImageRegistry`] and an
-/// `<image:HASH>` tag is inserted into the editing buffer.  When the
-/// clipboard holds no image the default `QuotedInsert` behaviour is preserved.
-struct ImagePasteHandler;
-
-impl ConditionalEventHandler for ImagePasteHandler {
-    fn handle(
-        &self,
-        _evt: &rustyline::Event,
-        _n: RepeatCount,
-        _positive: bool,
-        _ctx: &EventContext<'_>,
-    ) -> Option<Cmd> {
-        if let Some(tag) = try_grab_clipboard_image_tag() {
-            Some(Cmd::Insert(1, tag))
-        } else {
-            // No image — fall back to rustyline's default Ctrl-V (QuotedInsert).
-            Some(Cmd::QuotedInsert)
-        }
-    }
-}
-
-/// Try to grab an image from the system clipboard, register it in the
-/// [`ImageRegistry`], and return the `<image:HASH>` tag string.
-fn try_grab_clipboard_image_tag() -> Option<String> {
-    let mut clipboard = arboard::Clipboard::new().ok()?;
-    let img_data = clipboard.get_image().ok()?;
-    let registry = runtime::ImageRegistry::default_cache().ok()?;
-    let rgba: Vec<u8> = img_data.bytes.to_vec();
-    let registered = registry
-        .register_rgba(
-            u32::try_from(img_data.width).unwrap_or(0),
-            u32::try_from(img_data.height).unwrap_or(0),
-            &rgba,
-        )
-        .ok()?;
-    Some(format!("<image:{}>", registered.hash))
-}
-
 /// Accept the line only when it contains non-whitespace text.
 /// When the line is empty, Enter is a no-op.
 struct AcceptNonEmpty;
@@ -76,7 +36,13 @@ impl ConditionalEventHandler for AcceptNonEmpty {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
-    Submit(String),
+    /// User submitted text input, possibly with attached image data.
+    Submit {
+        text: String,
+        /// If the clipboard contained a new image since the last submit,
+        /// this holds `(base64_data, mime_type)`.
+        clipboard_image: Option<(String, String)>,
+    },
     Exit,
 }
 
@@ -168,6 +134,9 @@ pub struct LineEditor {
     editor: Editor<SlashCommandHelper, DefaultHistory>,
     /// Whether the previous read returned a Ctrl-C on an empty prompt.
     pending_exit: bool,
+    /// Hash of the last clipboard image that was already sent, so we don't
+    /// re-attach a stale clipboard image on every submit.
+    last_sent_image_hash: Option<String>,
 }
 
 impl LineEditor {
@@ -182,11 +151,6 @@ impl LineEditor {
         editor.set_helper(Some(SlashCommandHelper::new(completions)));
         editor.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
         editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::SHIFT), Cmd::Newline);
-        // Ctrl+V: check clipboard for image data before falling back to QuotedInsert.
-        editor.bind_sequence(
-            KeyEvent(KeyCode::Char('V'), Modifiers::CTRL),
-            EventHandler::Conditional(Box::new(ImagePasteHandler)),
-        );
         editor.bind_sequence(
             KeyEvent(KeyCode::Enter, Modifiers::NONE),
             EventHandler::Conditional(Box::new(AcceptNonEmpty)),
@@ -196,6 +160,7 @@ impl LineEditor {
             prompt: prompt.into(),
             editor,
             pending_exit: false,
+            last_sent_image_hash: None,
         }
     }
 
@@ -214,6 +179,33 @@ impl LineEditor {
         }
     }
 
+    /// Probe the system clipboard for an image. If one is found and its hash
+    /// differs from the last image we sent, register it and return
+    /// `(base64_data, mime_type)`. If it's the same image we already sent,
+    /// return `None` to avoid re-attaching a stale screenshot.
+    fn take_clipboard_image(&mut self) -> Option<(String, String)> {
+        let mut clipboard = arboard::Clipboard::new().ok()?;
+        let img_data = clipboard.get_image().ok()?;
+        let registry = runtime::ImageRegistry::default_cache().ok()?;
+        let rgba: Vec<u8> = img_data.bytes.to_vec();
+        let registered = registry
+            .register_rgba(
+                u32::try_from(img_data.width).unwrap_or(0),
+                u32::try_from(img_data.height).unwrap_or(0),
+                &rgba,
+            )
+            .ok()?;
+
+        // Deduplicate: skip if this is the same image we already sent.
+        if self.last_sent_image_hash.as_deref() == Some(&registered.hash) {
+            return None;
+        }
+
+        self.last_sent_image_hash = Some(registered.hash.clone());
+        let (b64, mime) = registry.load(&registered.hash).ok()?;
+        Some((b64, mime))
+    }
+
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return self.read_line_fallback();
@@ -227,7 +219,11 @@ impl LineEditor {
             match self.editor.readline(&self.prompt) {
                 Ok(line) => {
                     self.pending_exit = false;
-                    return Ok(ReadOutcome::Submit(line));
+                    let clipboard_image = self.take_clipboard_image();
+                    return Ok(ReadOutcome::Submit {
+                        text: line,
+                        clipboard_image,
+                    });
                 }
                 Err(ReadlineError::Interrupted) => {
                     let has_input = !self.current_line().is_empty();
@@ -295,7 +291,10 @@ impl LineEditor {
         while matches!(buffer.chars().last(), Some('\n' | '\r')) {
             buffer.pop();
         }
-        Ok(ReadOutcome::Submit(buffer))
+        Ok(ReadOutcome::Submit {
+            text: buffer,
+            clipboard_image: None,
+        })
     }
 }
 

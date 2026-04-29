@@ -2355,7 +2355,6 @@ dependencies = [
  "mock-anthropic-service",
  "plugins",
  "pulldown-cmark",
- "regex",
  "runtime",
  "rustyline",
  "serde",
