@@ -3,6 +3,8 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Write};
 
+use base64::Engine;
+
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter};
@@ -36,14 +38,19 @@ impl ConditionalEventHandler for AcceptNonEmpty {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
-    /// User submitted text input, possibly with attached image data.
-    Submit {
-        text: String,
-        /// If the clipboard contained a new image since the last submit,
-        /// this holds `(base64_data, mime_type)`.
-        clipboard_image: Option<(String, String)>,
-    },
+    Submit(String),
     Exit,
+}
+
+/// A clipboard image that has been detected and registered but not yet sent.
+#[derive(Debug, Clone)]
+pub struct PendingImage {
+    /// Sequential image number for display (e.g. `[Image #3]`).
+    pub number: u32,
+    /// Base64-encoded image data.
+    pub data: String,
+    /// MIME type, e.g. `image/png`.
+    pub mime_type: String,
 }
 
 struct SlashCommandHelper {
@@ -137,6 +144,10 @@ pub struct LineEditor {
     /// Hash of the last clipboard image that was already sent, so we don't
     /// re-attach a stale clipboard image on every submit.
     last_sent_image_hash: Option<String>,
+    /// Monotonically increasing image counter for display.
+    image_counter: u32,
+    /// Image detected before the current readline, ready to be consumed on submit.
+    pending_image: Option<PendingImage>,
 }
 
 impl LineEditor {
@@ -161,6 +172,8 @@ impl LineEditor {
             editor,
             pending_exit: false,
             last_sent_image_hash: None,
+            image_counter: 0,
+            pending_image: None,
         }
     }
 
@@ -179,11 +192,13 @@ impl LineEditor {
         }
     }
 
-    /// Probe the system clipboard for an image. If one is found and its hash
-    /// differs from the last image we sent, register it and return
-    /// `(base64_data, mime_type)`. If it's the same image we already sent,
-    /// return `None` to avoid re-attaching a stale screenshot.
-    fn take_clipboard_image(&mut self) -> Option<(String, String)> {
+    /// Check the system clipboard for a new image. If one is found (and it
+    /// differs from the last image we sent), register it and store it as
+    /// pending. Returns the [`PendingImage`] for display purposes.
+    ///
+    /// Call this **before** rendering the prompt chrome so the REPL can show
+    /// an `[Image #N]` indicator.
+    pub fn check_clipboard_image(&mut self) -> Option<&PendingImage> {
         let mut clipboard = arboard::Clipboard::new().ok()?;
         let img_data = clipboard.get_image().ok()?;
         let registry = runtime::ImageRegistry::default_cache().ok()?;
@@ -198,12 +213,43 @@ impl LineEditor {
 
         // Deduplicate: skip if this is the same image we already sent.
         if self.last_sent_image_hash.as_deref() == Some(&registered.hash) {
+            self.pending_image = None;
             return None;
         }
 
-        self.last_sent_image_hash = Some(registered.hash.clone());
         let (b64, mime) = registry.load(&registered.hash).ok()?;
-        Some((b64, mime))
+
+        // Only bump counter if this is a genuinely new image hash.
+        let is_new = self
+            .pending_image
+            .as_ref()
+            .is_none_or(|prev| prev.data != b64);
+        if is_new {
+            self.image_counter += 1;
+        }
+
+        self.pending_image = Some(PendingImage {
+            number: self.image_counter,
+            data: b64,
+            mime_type: mime,
+        });
+        self.pending_image.as_ref()
+    }
+
+    /// Consume the pending clipboard image (if any) after the user submits.
+    /// Marks the image as sent so it won't be re-attached next time.
+    pub fn take_pending_image(&mut self) -> Option<PendingImage> {
+        let img = self.pending_image.take()?;
+        // Compute hash from base64 data to track dedup.
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&img.data)
+            .ok()?;
+        let hash = {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(&raw))
+        };
+        self.last_sent_image_hash = Some(hash);
+        Some(img)
     }
 
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
@@ -219,11 +265,7 @@ impl LineEditor {
             match self.editor.readline(&self.prompt) {
                 Ok(line) => {
                     self.pending_exit = false;
-                    let clipboard_image = self.take_clipboard_image();
-                    return Ok(ReadOutcome::Submit {
-                        text: line,
-                        clipboard_image,
-                    });
+                    return Ok(ReadOutcome::Submit(line));
                 }
                 Err(ReadlineError::Interrupted) => {
                     let has_input = !self.current_line().is_empty();
@@ -291,10 +333,7 @@ impl LineEditor {
         while matches!(buffer.chars().last(), Some('\n' | '\r')) {
             buffer.pop();
         }
-        Ok(ReadOutcome::Submit {
-            text: buffer,
-            clipboard_image: None,
-        })
+        Ok(ReadOutcome::Submit(buffer))
     }
 }
 

@@ -1292,20 +1292,33 @@ fn run_repl(
             .unwrap_or(80);
         let separator = format!("\x1b[2m{}\x1b[0m", "─".repeat(term_width));
         let footer = "  \x1b[2m/help · /status · Tab for /commands\x1b[0m";
-        // Print the entire input chrome block: top sep, prompt placeholder,
-        // bottom sep, footer.  Then move the cursor back to the prompt line
-        // so read_line() renders there — the user sees all four elements at once.
+        // Check clipboard for an image BEFORE rendering chrome so we can
+        // show an [Image #N] indicator above the prompt.
+        let has_clipboard_image = editor.check_clipboard_image().is_some();
+
+        // Print the entire input chrome block.  When a clipboard image is
+        // detected we insert an extra indicator line between the top
+        // separator and the prompt placeholder.
+        //
+        //   ──────────────────      (top separator)
+        //   [Image #4]              (only when clipboard has image)
+        //                           (prompt placeholder — readline here)
+        //   ──────────────────      (bottom separator)
+        //   footer
         println!("{separator}");
+        if has_clipboard_image {
+            let n = editor.check_clipboard_image().map_or(0, |img| img.number);
+            println!("  \x1b[2m[Image #{n}]\x1b[0m");
+        }
         println!();
         println!("{separator}");
         print!("{footer}");
-        print!("\x1b[2F\x1b[2K"); // cursor up 2 lines, clear prompt placeholder
+        // Move cursor back up to the prompt placeholder line.
+        let lines_up = if has_clipboard_image { 3 } else { 2 };
+        print!("\x1b[{lines_up}F\x1b[2K");
         std::io::Write::flush(&mut std::io::stdout())?;
         match editor.read_line()? {
-            input::ReadOutcome::Submit {
-                text: input,
-                clipboard_image,
-            } => {
+            input::ReadOutcome::Submit(input) => {
                 // Clear pre-printed bottom sep + footer
                 print!("\x1b[J");
                 // Replace prompt line with gray-background echo of user input
@@ -1358,17 +1371,19 @@ fn run_repl(
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
 
-                // Build content blocks: if clipboard has a new image,
-                // attach it alongside the text.
-                if let Some((b64, mime)) = clipboard_image {
-                    println!("  \x1b[2m📎 Clipboard image attached\x1b[0m");
-                    let mut blocks = vec![ContentBlock::Text {
-                        text: trimmed.clone(),
-                    }];
-                    blocks.push(ContentBlock::Image {
-                        data: b64,
-                        mime_type: mime,
-                    });
+                // If a clipboard image was detected before readline,
+                // consume it and attach to the message.
+                if let Some(pending) = editor.take_pending_image() {
+                    println!("  \x1b[2m📎 Image #{} attached\x1b[0m", pending.number);
+                    let blocks = vec![
+                        ContentBlock::Text {
+                            text: trimmed.clone(),
+                        },
+                        ContentBlock::Image {
+                            data: pending.data,
+                            mime_type: pending.mime_type,
+                        },
+                    ];
                     if let Err(e) = cli.run_turn_with_blocks(blocks) {
                         eprintln!("\x1b[31m{e}\x1b[0m");
                     }
