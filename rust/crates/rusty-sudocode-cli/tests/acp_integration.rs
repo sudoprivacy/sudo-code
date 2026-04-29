@@ -396,6 +396,30 @@ async fn scenario_session_prompt_streaming(client: &mut AcpTestClient, session_i
         result.get("stopReason").is_some(),
         "prompt response should include stopReason"
     );
+
+    // The response should include token usage data.
+    let usage = result.get("usage");
+    assert!(
+        usage.is_some(),
+        "prompt response should include usage (got result: {result})"
+    );
+    let usage = usage.unwrap();
+    assert!(
+        usage.get("totalTokens").is_some(),
+        "usage should include totalTokens"
+    );
+    assert!(
+        usage["totalTokens"].as_u64().unwrap_or(0) > 0,
+        "totalTokens should be > 0"
+    );
+    assert!(
+        usage.get("inputTokens").is_some(),
+        "usage should include inputTokens"
+    );
+    assert!(
+        usage.get("outputTokens").is_some(),
+        "usage should include outputTokens"
+    );
 }
 
 async fn scenario_session_list(client: &mut AcpTestClient, expected_session_id: &str) {
