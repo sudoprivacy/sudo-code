@@ -11,6 +11,10 @@ use agent_client_protocol::role::acp::{Agent, Client};
 // NOTE: `ConnectTo` and `ConnectionTo` are different SDK concepts:
 //   - `ConnectTo<R>`:    trait for wiring up a transport (Stdio, Lines, etc.)
 //   - `ConnectionTo<R>`: runtime handle passed to handlers for sending messages
+use crate::conversation::RuntimeObserver;
+use crate::permissions::{
+    PermissionMode, PermissionPromptDecision, PermissionPrompter, PermissionRequest,
+};
 use agent_client_protocol::{
     on_receive_dispatch, on_receive_notification, on_receive_request, ConnectTo, ConnectionTo,
     Dispatch, Error, JsonRpcRequest, JsonRpcResponse, Responder,
@@ -25,12 +29,6 @@ use agent_client_protocol_schema::{
     SessionCloseCapabilities, SessionInfo, SessionNotification, SessionUpdate,
     SetSessionModelRequest, SetSessionModelResponse, StopReason, TextContent, ToolCall,
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-};
-use agent_client_protocol_tokio::Stdio;
-
-use crate::conversation::RuntimeObserver;
-use crate::permissions::{
-    PermissionMode, PermissionPromptDecision, PermissionPrompter, PermissionRequest,
 };
 
 /// Error type returned by ACP agent implementations.
@@ -390,17 +388,8 @@ fn uuid_v4() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Server entry point
+// Shared handler chain
 // ---------------------------------------------------------------------------
-
-/// Run the SDK-based ACP server on stdin/stdout.
-pub async fn run_sdk_acp_server(
-    config: SdkAcpConfig,
-    delegate: Box<dyn SdkAcpDelegate>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let delegate: SharedDelegate = Arc::new(Mutex::new(delegate));
-    run_acp_on_transport(&config, delegate, Stdio::new()).await
-}
 
 /// Run the ACP agent handler chain on an arbitrary transport.
 ///

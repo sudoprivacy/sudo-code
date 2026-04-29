@@ -1716,7 +1716,7 @@ fn run_acp_server(
             config, delegate, port,
         ))
     } else {
-        rt.block_on(runtime::acp_sdk_server::run_sdk_acp_server(
+        rt.block_on(runtime::acp_stdio_server::run_acp_stdio_server(
             config, delegate,
         ))
     }
