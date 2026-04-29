@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::role::acp::{Agent, Client};
+// NOTE: `ConnectTo` and `ConnectionTo` are different SDK concepts:
+//   - `ConnectTo<R>`:    trait for wiring up a transport (Stdio, Lines, etc.)
+//   - `ConnectionTo<R>`: runtime handle passed to handlers for sending messages
 use agent_client_protocol::{
     on_receive_dispatch, on_receive_notification, on_receive_request, ConnectTo, ConnectionTo,
     Dispatch, Error, Responder,
