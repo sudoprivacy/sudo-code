@@ -13,7 +13,7 @@ use agent_client_protocol::role::acp::{Agent, Client};
 //   - `ConnectionTo<R>`: runtime handle passed to handlers for sending messages
 use agent_client_protocol::{
     on_receive_dispatch, on_receive_notification, on_receive_request, ConnectTo, ConnectionTo,
-    Dispatch, Error, Responder,
+    Dispatch, Error, JsonRpcRequest, JsonRpcResponse, Responder,
 };
 use agent_client_protocol_schema::{
     AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse, ContentBlock,
@@ -71,6 +71,23 @@ pub struct SdkAcpConfig {
     pub permission_mode_override: Option<PermissionMode>,
     pub reasoning_effort: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Custom extension: session/setPermissionMode (not in ACP SDK schema)
+// ---------------------------------------------------------------------------
+
+/// Request to change the permission mode for a session.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcRequest)]
+#[request(method = "session/setPermissionMode", response = SetPermissionModeResponse)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SetPermissionModeRequest {
+    pub session_id: String,
+    pub permission_mode: String,
+}
+
+/// Response to a permission mode change.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
+pub(crate) struct SetPermissionModeResponse {}
 
 /// Callback trait that the CLI crate implements to provide session
 /// construction and prompt execution, keeping runtime/provider deps out of
@@ -711,66 +728,55 @@ pub(crate) async fn run_acp_on_transport(
             on_receive_request!(),
         )
         // --- session/setPermissionMode (custom extension, not in SDK schema) ---
-        // Handled in the catch-all because there is no typed request for it.
-        .on_receive_dispatch(
+        .on_receive_request(
             {
                 let delegate = Arc::clone(&delegate);
-                async move |dispatch: Dispatch, cx: ConnectionTo<Client>| {
-                    let method = dispatch.method().to_owned();
-                    if method == "session/setPermissionMode" {
-                        if let Dispatch::Request(msg, responder) = dispatch {
-                            let d = Arc::clone(&delegate);
-                            let params = msg.params.clone();
-                            cx.spawn(async move {
-                                let result = tokio::task::spawn_blocking(move || {
-                                    let session_id = params
-                                        .get("sessionId")
-                                        .and_then(serde_json::Value::as_str)
-                                        .unwrap_or_default()
-                                        .to_owned();
-                                    let mode_str = params
-                                        .get("permissionMode")
-                                        .and_then(serde_json::Value::as_str)
-                                        .unwrap_or_default();
-                                    let mode = match mode_str {
-                                        "read-only" => Ok(PermissionMode::ReadOnly),
-                                        "workspace-write" => Ok(PermissionMode::WorkspaceWrite),
-                                        "danger-full-access" => {
-                                            Ok(PermissionMode::DangerFullAccess)
-                                        }
-                                        "prompt" => Ok(PermissionMode::Prompt),
-                                        "allow" => Ok(PermissionMode::Allow),
-                                        _ => Err(AcpError::invalid_params(format!(
-                                            "unknown permission mode: {mode_str}"
-                                        ))),
-                                    };
-                                    match mode {
-                                        Ok(m) => d
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                            .set_permission_mode(&session_id, m),
-                                        Err(e) => Err(e),
-                                    }
-                                })
-                                .await
-                                .unwrap_or_else(|e| Err(AcpError::internal(e.to_string())));
-                                match result {
-                                    Ok(()) => {
-                                        responder.respond(serde_json::json!({}))?;
-                                    }
-                                    Err(e) => {
-                                        responder.respond_with_error(acp_error_to_sdk(&e))?;
-                                    }
-                                }
-                                Ok(())
-                            })?;
+                async move |req: SetPermissionModeRequest,
+                            responder: Responder<SetPermissionModeResponse>,
+                            cx: ConnectionTo<Client>| {
+                    let d = Arc::clone(&delegate);
+                    cx.spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            let mode = match req.permission_mode.as_str() {
+                                "read-only" => Ok(PermissionMode::ReadOnly),
+                                "workspace-write" => Ok(PermissionMode::WorkspaceWrite),
+                                "danger-full-access" => Ok(PermissionMode::DangerFullAccess),
+                                "prompt" => Ok(PermissionMode::Prompt),
+                                "allow" => Ok(PermissionMode::Allow),
+                                other => Err(AcpError::invalid_params(format!(
+                                    "unknown permission mode: {other}"
+                                ))),
+                            };
+                            match mode {
+                                Ok(m) => d
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .set_permission_mode(&req.session_id, m),
+                                Err(e) => Err(e),
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(AcpError::internal(e.to_string())));
+                        match result {
+                            Ok(()) => {
+                                responder.respond(SetPermissionModeResponse {})?;
+                            }
+                            Err(e) => {
+                                responder.respond_with_error(acp_error_to_sdk(&e))?;
+                            }
                         }
                         Ok(())
-                    } else {
-                        dispatch.respond_with_error(Error::method_not_found(), cx)?;
-                        Ok(())
-                    }
+                    })?;
+                    Ok(())
                 }
+            },
+            on_receive_request!(),
+        )
+        // --- catch-all for unhandled methods ---
+        .on_receive_dispatch(
+            async move |dispatch: Dispatch, cx: ConnectionTo<Client>| {
+                dispatch.respond_with_error(Error::method_not_found(), cx)?;
+                Ok(())
             },
             on_receive_dispatch!(),
         )
