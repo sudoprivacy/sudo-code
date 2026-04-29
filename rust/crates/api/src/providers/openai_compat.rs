@@ -1,12 +1,11 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
-use crate::http_client::build_http_client_or_default;
+use crate::http_transport::{request_id_from_headers, HttpTransport, RetryPolicy};
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
@@ -20,11 +19,6 @@ use super::{Provider, ProviderFuture};
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
-const REQUEST_ID_HEADER: &str = "request-id";
-const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
-const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
-const DEFAULT_MAX_RETRIES: u32 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
@@ -99,13 +93,11 @@ impl OpenAiCompatConfig {
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatClient {
-    http: reqwest::Client,
+    http: HttpTransport,
     api_key: String,
     config: OpenAiCompatConfig,
     base_url: String,
-    max_retries: u32,
-    initial_backoff: Duration,
-    max_backoff: Duration,
+    retry_policy: RetryPolicy,
 }
 
 impl OpenAiCompatClient {
@@ -120,13 +112,11 @@ impl OpenAiCompatClient {
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
         Self {
-            http: build_http_client_or_default(),
+            http: HttpTransport::new(),
             api_key: api_key.into(),
             config,
             base_url: read_base_url(config),
-            max_retries: DEFAULT_MAX_RETRIES,
-            initial_backoff: DEFAULT_INITIAL_BACKOFF,
-            max_backoff: DEFAULT_MAX_BACKOFF,
+            retry_policy: RetryPolicy::DEFAULT,
         }
     }
 
@@ -147,15 +137,23 @@ impl OpenAiCompatClient {
     }
 
     #[must_use]
+    pub fn with_session_tracer(mut self, session_tracer: telemetry::SessionTracer) -> Self {
+        self.http.set_session_tracer(session_tracer);
+        self
+    }
+
+    #[must_use]
     pub fn with_retry_policy(
         mut self,
         max_retries: u32,
         initial_backoff: Duration,
         max_backoff: Duration,
     ) -> Self {
-        self.max_retries = max_retries;
-        self.initial_backoff = initial_backoff;
-        self.max_backoff = max_backoff;
+        self.retry_policy = RetryPolicy {
+            max_retries,
+            initial_backoff,
+            max_backoff,
+        };
         self
     }
 
@@ -168,7 +166,7 @@ impl OpenAiCompatClient {
             ..request.clone()
         };
         preflight_message_request(&request)?;
-        let response = self.send_with_retry(&request).await?;
+        let response = self.send_request(&request).await?;
         let request_id = request_id_from_headers(response.headers());
         let body = response.text().await.map_err(ApiError::from)?;
         // Some backends return {"error":{"message":"...","type":"...","code":...}}
@@ -219,9 +217,7 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
         preflight_message_request(request)?;
-        let response = self
-            .send_with_retry(&request.clone().with_streaming())
-            .await?;
+        let response = self.send_request(&request.clone().with_streaming()).await?;
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
@@ -232,79 +228,27 @@ impl OpenAiCompatClient {
         })
     }
 
-    async fn send_with_retry(
-        &self,
-        request: &MessageRequest,
-    ) -> Result<reqwest::Response, ApiError> {
-        let mut attempts = 0;
-
-        let last_error = loop {
-            attempts += 1;
-            let retryable_error = match self.send_raw_request(request).await {
-                Ok(response) => match expect_success(response).await {
-                    Ok(response) => return Ok(response),
-                    Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
-                    Err(error) => return Err(error),
-                },
-                Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
-                Err(error) => return Err(error),
-            };
-
-            if attempts > self.max_retries {
-                break retryable_error;
-            }
-
-            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
-        };
-
-        Err(ApiError::RetriesExhausted {
-            attempts,
-            last_error: Box::new(last_error),
-        })
-    }
-
-    async fn send_raw_request(
-        &self,
-        request: &MessageRequest,
-    ) -> Result<reqwest::Response, ApiError> {
-        // Pre-flight check: verify request body size against provider limits
+    /// Build URL, headers, body and send through `HttpTransport` with retries.
+    async fn send_request(&self, request: &MessageRequest) -> Result<reqwest::Response, ApiError> {
         check_request_body_size(request, self.config())?;
 
-        let request_url = chat_completions_endpoint(&self.base_url);
+        let url = chat_completions_endpoint(&self.base_url);
+        let body = build_chat_completion_request(request, self.config());
+
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "authorization".to_string(),
+                format!("Bearer {}", self.api_key),
+            ),
+        ];
+
         self.http
-            .post(&request_url)
-            .header("content-type", "application/json")
-            .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
-            .send()
+            .send_json(&url, &headers, &body, &self.retry_policy, expect_success)
             .await
-            .map_err(ApiError::from)
-    }
-
-    fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
-        let Some(multiplier) = 1_u32.checked_shl(attempt.saturating_sub(1)) else {
-            return Err(ApiError::BackoffOverflow {
-                attempt,
-                base_delay: self.initial_backoff,
-            });
-        };
-        Ok(self
-            .initial_backoff
-            .checked_mul(multiplier)
-            .map_or(self.max_backoff, |delay| delay.min(self.max_backoff)))
-    }
-
-    fn jittered_backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
-        let base = self.backoff_for_attempt(attempt)?;
-        Ok(base + jitter_for_base(base))
     }
 }
 
-/// Process-wide counter that guarantees distinct jitter samples even when
-/// the system clock resolution is coarser than consecutive retry sleeps.
-static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Returns a random additive jitter in `[0, base]` to decorrelate retries
 /// Deserialize a JSON field as a `Vec<T>`, treating an explicit `null` value
 /// the same as a missing field (i.e. as an empty vector).
 /// Some OpenAI-compatible providers emit `"tool_calls": null` instead of
@@ -316,29 +260,6 @@ where
     T: serde::Deserialize<'de>,
 {
     Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
-}
-
-/// from multiple concurrent clients. Entropy is drawn from the nanosecond
-/// wall clock mixed with a monotonic counter and run through a splitmix64
-/// finalizer; adequate for retry jitter (no cryptographic requirement).
-fn jitter_for_base(base: Duration) -> Duration {
-    let base_nanos = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
-    if base_nanos == 0 {
-        return Duration::ZERO;
-    }
-    let raw_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    let tick = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut mixed = raw_nanos
-        .wrapping_add(tick)
-        .wrapping_add(0x9E37_79B9_7F4A_7C15);
-    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    mixed ^= mixed >> 31;
-    let jitter_nanos = mixed % base_nanos.saturating_add(1);
-    Duration::from_nanos(jitter_nanos)
 }
 
 impl Provider for OpenAiCompatClient {
@@ -1360,14 +1281,6 @@ fn chat_completions_endpoint(base_url: &str) -> String {
     } else {
         format!("{trimmed}/chat/completions")
     }
-}
-
-fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    headers
-        .get(REQUEST_ID_HEADER)
-        .or_else(|| headers.get(ALT_REQUEST_ID_HEADER))
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned)
 }
 
 async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {

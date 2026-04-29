@@ -157,7 +157,10 @@ impl ProviderClient {
     pub fn with_session_tracer(self, session_tracer: SessionTracer) -> Self {
         match self {
             Self::Anthropic(client) => Self::Anthropic(client.with_session_tracer(session_tracer)),
-            other => other,
+            Self::Xai(client) => Self::Xai(client.with_session_tracer(session_tracer)),
+            Self::OpenAi(client) => Self::OpenAi(client.with_session_tracer(session_tracer)),
+            Self::Codex(client) => Self::Codex(client.with_session_tracer(session_tracer)),
+            Self::Gemini(client) => Self::Gemini(client.with_session_tracer(session_tracer)),
         }
     }
 
