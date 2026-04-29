@@ -2,9 +2,9 @@ use std::io::{self, Write};
 
 use api::{
     resolve_startup_auth_source, AnthropicClient, AuthMode, AuthSource, ContentBlockDelta,
-    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
-    PromptCache, ProviderClient as ApiProviderClient, StreamEvent as ApiStreamEvent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock,
+    ImageSource, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
@@ -677,6 +677,13 @@ pub(crate) fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMes
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Image { data, mime_type } => InputContentBlock::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: mime_type.clone(),
+                            data: data.clone(),
+                        },
+                    },
                     ContentBlock::ToolUse {
                         id,
                         name,

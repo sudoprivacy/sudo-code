@@ -10,6 +10,7 @@ agent-client-protocol = { workspace = true }
 agent-client-protocol-schema = { workspace = true }
 agent-client-protocol-tokio = { workspace = true }
 axum = { workspace = true }
+futures = "0.3"
 sha2 = "0.10"
 glob = "0.3"
 keyring = "3"
@@ -18,7 +19,7 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 telemetry = { path = "../telemetry" }
-tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
 tower-http = { workspace = true }
 walkdir = "2"
 

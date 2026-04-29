@@ -170,7 +170,7 @@ body { display: flex; flex-direction: column; }
   }
 
   async function createNewSession() {
-    const resp = await sendRpc('session/new', {});
+    const resp = await sendRpc('session/new', {cwd: '.', mcpServers: []});
     if (resp.result && resp.result.sessionId) {
       currentSession = resp.result.sessionId;
       addChatMsg('system', 'Session created: ' + currentSession.substring(0, 8) + '...');

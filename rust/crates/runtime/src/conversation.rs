@@ -358,6 +358,10 @@ where
         let mut iterations = 0;
 
         loop {
+            if self.hook_abort_signal.is_aborted() {
+                return Err(RuntimeError::new("turn cancelled by abort signal"));
+            }
+
             iterations += 1;
             if iterations > self.max_iterations {
                 let error = RuntimeError::new(
@@ -555,6 +559,16 @@ where
 
     pub fn api_client_mut(&mut self) -> &mut C {
         &mut self.api_client
+    }
+
+    pub fn permission_policy_mut(&mut self) -> &mut PermissionPolicy {
+        &mut self.permission_policy
+    }
+
+    /// Access the hook abort signal for external cancellation.
+    #[must_use]
+    pub fn hook_abort_signal(&self) -> &HookAbortSignal {
+        &self.hook_abort_signal
     }
 
     pub fn tool_executor_mut(&mut self) -> &mut T {
