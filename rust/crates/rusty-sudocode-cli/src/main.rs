@@ -1304,18 +1304,24 @@ fn run_repl(
         std::io::Write::flush(&mut std::io::stdout())?;
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
-                // Clear pre-printed bottom sep + footer
+                // Clear pre-printed chrome (indicator + sep + prompt + sep + footer).
                 print!("\x1b[J");
-                // Clear indicator + separator + prompt (3 lines above cursor),
-                // then rewrite echo + separator in their place.
                 let trimmed = input.trim().to_string();
                 let echo_display = format!(" › {}", trimmed.replace('\n', " "));
                 let pad = term_width.saturating_sub(echo_display.chars().count());
                 print!("\x1b[3F\x1b[J"); // up 3 to indicator line, clear all below
+
+                // Print echo of user input, then any image-attach lines,
+                // then separator — all in one block.
                 println!();
                 print!("\x1b[48;5;236m{echo_display}{}\x1b[0m", " ".repeat(pad));
                 println!();
+                let pasted_images = editor.take_images();
+                for hash in pasted_images.keys() {
+                    println!("  \x1b[2m📎 [Image #{}] attached\x1b[0m", &hash[..12]);
+                }
                 println!("{separator}");
+
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
                     cli.persist_session()?;
                     break;
@@ -1356,8 +1362,6 @@ fn run_repl(
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
 
-                // Attach any images pasted during this input session.
-                let pasted_images = editor.take_images();
                 if pasted_images.is_empty() {
                     if let Err(e) = cli.run_turn(&trimmed) {
                         eprintln!("\x1b[31m{e}\x1b[0m");
@@ -1371,9 +1375,6 @@ fn run_repl(
                             data: b64.clone(),
                             mime_type: mime.clone(),
                         });
-                    }
-                    for hash in pasted_images.keys() {
-                        println!("  \x1b[2m📎 [Image #{}] attached\x1b[0m", &hash[..12]);
                     }
                     if let Err(e) = cli.run_turn_with_blocks(blocks) {
                         eprintln!("\x1b[31m{e}\x1b[0m");
