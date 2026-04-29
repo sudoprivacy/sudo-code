@@ -947,69 +947,102 @@ pub fn model_rejects_is_error_field(model: &str) -> bool {
 #[must_use]
 pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
     let supports_is_error = !model_rejects_is_error_field(model);
-    match message.role.as_str() {
-        "assistant" => {
-            let mut text = String::new();
-            let mut tool_calls = Vec::new();
-            for block in &message.content {
-                match block {
-                    InputContentBlock::Text { text: value } => text.push_str(value),
-                    InputContentBlock::ToolUse {
-                        id, name, input, ..
-                    } => tool_calls.push(json!({
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": input.to_string(),
-                        }
-                    })),
-                    InputContentBlock::ToolResult { .. } | InputContentBlock::Image { .. } => {}
-                }
-            }
-            if text.is_empty() && tool_calls.is_empty() {
-                Vec::new()
-            } else {
-                let mut msg = serde_json::json!({
-                    "role": "assistant",
-                    "content": (!text.is_empty()).then_some(text),
-                });
-                // Only include tool_calls when non-empty: some providers reject
-                // assistant messages with an explicit empty tool_calls array.
-                if !tool_calls.is_empty() {
-                    msg["tool_calls"] = json!(tool_calls);
-                }
-                vec![msg]
+    if message.role.as_str() == "assistant" {
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        for block in &message.content {
+            match block {
+                InputContentBlock::Text { text: value } => text.push_str(value),
+                InputContentBlock::ToolUse {
+                    id, name, input, ..
+                } => tool_calls.push(json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": input.to_string(),
+                    }
+                })),
+                InputContentBlock::ToolResult { .. } | InputContentBlock::Image { .. } => {}
             }
         }
-        _ => message
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                InputContentBlock::Text { text } => Some(json!({
-                    "role": "user",
-                    "content": text,
-                })),
+        if text.is_empty() && tool_calls.is_empty() {
+            Vec::new()
+        } else {
+            let mut msg = serde_json::json!({
+                "role": "assistant",
+                "content": (!text.is_empty()).then_some(text),
+            });
+            // Only include tool_calls when non-empty: some providers reject
+            // assistant messages with an explicit empty tool_calls array.
+            if !tool_calls.is_empty() {
+                msg["tool_calls"] = json!(tool_calls);
+            }
+            vec![msg]
+        }
+    } else {
+        // Collect text + image blocks into a single user message with a
+        // content array, and tool results as separate tool messages.
+        let mut user_parts = Vec::new();
+        let mut messages = Vec::new();
+
+        for block in &message.content {
+            match block {
+                InputContentBlock::Text { text } => {
+                    user_parts.push(json!({ "type": "text", "text": text }));
+                }
+                InputContentBlock::Image { source } => {
+                    let data_url = format!("data:{};base64,{}", source.media_type, source.data);
+                    user_parts.push(json!({
+                        "type": "image_url",
+                        "image_url": { "url": data_url }
+                    }));
+                }
                 InputContentBlock::ToolResult {
                     tool_use_id,
                     content,
                     is_error,
                 } => {
+                    // Flush any accumulated user parts before the tool result.
+                    if !user_parts.is_empty() {
+                        messages.push(json!({
+                            "role": "user",
+                            "content": user_parts,
+                        }));
+                        user_parts = Vec::new();
+                    }
                     let mut msg = json!({
                         "role": "tool",
                         "tool_call_id": tool_use_id,
                         "content": flatten_tool_result_content(content),
                     });
-                    // Only include is_error for models that support it.
-                    // kimi models reject this field with 400 Bad Request.
                     if supports_is_error {
                         msg["is_error"] = json!(is_error);
                     }
-                    Some(msg)
+                    messages.push(msg);
                 }
-                InputContentBlock::ToolUse { .. } | InputContentBlock::Image { .. } => None,
-            })
-            .collect(),
+                InputContentBlock::ToolUse { .. } => {}
+            }
+        }
+
+        // Flush remaining user parts.
+        if !user_parts.is_empty() {
+            // Optimise: if only a single text part, use a plain string
+            // for compatibility with providers that don't support arrays.
+            if user_parts.len() == 1 && user_parts[0]["type"] == "text" {
+                messages.push(json!({
+                    "role": "user",
+                    "content": user_parts[0]["text"],
+                }));
+            } else {
+                messages.push(json!({
+                    "role": "user",
+                    "content": user_parts,
+                }));
+            }
+        }
+
+        messages
     }
 }
 

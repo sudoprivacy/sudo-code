@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, IsTerminal, Write};
+use std::sync::{Arc, Mutex};
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -38,6 +39,69 @@ impl ConditionalEventHandler for AcceptNonEmpty {
 pub enum ReadOutcome {
     Submit(String),
     Exit,
+}
+
+/// Shared map of pasted images: hash -> (base64, mime_type).
+type ImageMap = Arc<Mutex<HashMap<String, (String, String)>>>;
+
+/// Intercepts `BracketedPasteStart` (fired by Cmd+V on macOS).  If the
+/// clipboard contains only image data (no text), register the image and
+/// display an `[Image #HASH_PREFIX]` indicator above the prompt.  When
+/// the clipboard has text, returns `None` so rustyline's default
+/// paste-text path runs instead.
+struct ImagePasteHandler {
+    images: ImageMap,
+}
+
+impl ConditionalEventHandler for ImagePasteHandler {
+    fn handle(
+        &self,
+        _evt: &rustyline::Event,
+        _n: RepeatCount,
+        _positive: bool,
+        _ctx: &EventContext<'_>,
+    ) -> Option<Cmd> {
+        let mut cb = arboard::Clipboard::new().ok()?;
+
+        // If the clipboard has text, let rustyline's default bracketed-paste
+        // handler insert it (return None → fall through to default keymap).
+        if cb.get_text().ok().is_some_and(|t| !t.is_empty()) {
+            return None;
+        }
+
+        let img_data = cb.get_image().ok()?;
+        let registry = runtime::ImageRegistry::default_cache().ok()?;
+        let rgba: Vec<u8> = img_data.bytes.to_vec();
+        let registered = registry
+            .register_rgba(
+                u32::try_from(img_data.width).unwrap_or(0),
+                u32::try_from(img_data.height).unwrap_or(0),
+                &rgba,
+            )
+            .ok()?;
+
+        let (b64, mime) = registry.load(&registered.hash).ok()?;
+
+        let mut images = self.images.lock().ok()?;
+        // If this exact hash is already inserted, don't duplicate.
+        if images.contains_key(&registered.hash) {
+            return Some(Cmd::Noop);
+        }
+        images.insert(registered.hash.clone(), (b64, mime));
+        drop(images);
+
+        // Write the indicator on the pre-allocated line above the prompt
+        // chrome.  Layout: indicator is 2 lines above the cursor (prompt).
+        let mut stdout = std::io::stdout();
+        // Save cursor, move up 2 to indicator line, clear & write, restore.
+        write!(stdout, "\x1b7\x1b[2A\x1b[2K").ok();
+        let hash_prefix = &registered.hash[..12];
+        write!(stdout, "  \x1b[1m[Image #{hash_prefix}]\x1b[0m").ok();
+        write!(stdout, "\x1b8").ok();
+        stdout.flush().ok();
+
+        Some(Cmd::Noop)
+    }
 }
 
 struct SlashCommandHelper {
@@ -106,6 +170,10 @@ impl Completer for SlashCommandHelper {
 
 impl Hinter for SlashCommandHelper {
     type Hint = String;
+
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        None
+    }
 }
 
 impl Highlighter for SlashCommandHelper {
@@ -128,6 +196,8 @@ pub struct LineEditor {
     editor: Editor<SlashCommandHelper, DefaultHistory>,
     /// Whether the previous read returned a Ctrl-C on an empty prompt.
     pending_exit: bool,
+    /// Shared image map populated by the `ImagePasteHandler`.
+    images: ImageMap,
 }
 
 impl LineEditor {
@@ -147,10 +217,33 @@ impl LineEditor {
             EventHandler::Conditional(Box::new(AcceptNonEmpty)),
         );
 
+        let images: ImageMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let handler = ImagePasteHandler {
+            images: Arc::clone(&images),
+        };
+        // Cmd+V on macOS triggers the terminal's paste action which sends a
+        // bracketed paste sequence.  When the clipboard has only image data
+        // the paste content is empty (`ESC[200~ ESC[201~`).  We intercept
+        // BracketedPasteStart to check for image data; if no image (i.e. the
+        // clipboard has text), we return None so the default paste path runs.
+        editor.bind_sequence(
+            KeyEvent(KeyCode::BracketedPasteStart, Modifiers::NONE),
+            EventHandler::Conditional(Box::new(handler)),
+        );
+        // Consume the trailing BracketedPasteEnd that remains in the buffer
+        // after we handle an image paste (the default handler would have
+        // consumed it inside read_pasted_text, but we bypassed that path).
+        editor.bind_sequence(
+            KeyEvent(KeyCode::BracketedPasteEnd, Modifiers::NONE),
+            Cmd::Noop,
+        );
+
         Self {
             prompt: prompt.into(),
             editor,
             pending_exit: false,
+            images,
         }
     }
 
@@ -167,6 +260,13 @@ impl LineEditor {
         if let Some(helper) = self.editor.helper_mut() {
             helper.set_completions(completions);
         }
+    }
+
+    /// Drain all images that were pasted during the current input session.
+    /// Returns a map of full SHA-256 hash -> (base64_data, mime_type).
+    pub fn take_images(&mut self) -> HashMap<String, (String, String)> {
+        let mut map = self.images.lock().expect("image map lock");
+        std::mem::take(&mut *map)
     }
 
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {

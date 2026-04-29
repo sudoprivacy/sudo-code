@@ -253,6 +253,15 @@ impl Session {
         self.push_message(ConversationMessage::user_text(text))
     }
 
+    /// Push a user message containing multiple content blocks (e.g. text + images).
+    pub fn push_user_blocks(&mut self, blocks: Vec<ContentBlock>) -> Result<(), SessionError> {
+        self.push_message(ConversationMessage {
+            role: MessageRole::User,
+            blocks,
+            usage: None,
+        })
+    }
+
     pub fn record_compaction(&mut self, summary: impl Into<String>, removed_message_count: usize) {
         self.touch();
         let count = self.compaction.as_ref().map_or(1, |value| value.count + 1);

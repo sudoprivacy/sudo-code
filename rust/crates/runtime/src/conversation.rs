@@ -331,12 +331,31 @@ where
     pub fn run_turn(
         &mut self,
         user_input: impl Into<String>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+        observer: Option<&mut dyn RuntimeObserver>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        let text = user_input.into();
+        self.run_turn_with_blocks(vec![ContentBlock::Text { text }], prompter, observer)
+    }
+
+    /// Run a conversation turn with pre-built content blocks (e.g. text +
+    /// image).  [`run_turn`](Self::run_turn) is a convenience wrapper that
+    /// creates a single `Text` block and delegates here.
+    #[allow(clippy::too_many_lines)]
+    pub fn run_turn_with_blocks(
+        &mut self,
+        blocks: Vec<ContentBlock>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
         mut observer: Option<&mut dyn RuntimeObserver>,
     ) -> Result<TurnSummary, RuntimeError> {
-        let user_input = user_input.into();
+        let label = blocks
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
 
-        // ROADMAP #38: Session-health canary - probe if context was compacted
         if self.session.compaction.is_some() {
             if let Err(error) = self.run_session_health_probe() {
                 return Err(RuntimeError::new(format!(
@@ -347,9 +366,9 @@ where
             }
         }
 
-        self.record_turn_started(&user_input);
+        self.record_turn_started(&label);
         self.session
-            .push_user_text(user_input)
+            .push_user_blocks(blocks)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
 
         let mut assistant_messages = Vec::new();

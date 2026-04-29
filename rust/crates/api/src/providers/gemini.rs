@@ -472,8 +472,13 @@ fn translate_input_message(message: &InputMessage, contents: &mut Vec<Value>) {
                     }]
                 }));
             }
-            InputContentBlock::Image { .. } => {
-                // Image support not yet implemented for Gemini provider; skip.
+            InputContentBlock::Image { source } => {
+                parts.push(json!({
+                    "inlineData": {
+                        "mimeType": source.media_type,
+                        "data": source.data,
+                    }
+                }));
             }
         }
     }
