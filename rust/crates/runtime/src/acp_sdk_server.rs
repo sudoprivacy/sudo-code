@@ -557,6 +557,12 @@ pub(crate) async fn run_acp_on_transport(
                                             },
                                         };
                                         let _ = response_tx.send(decision);
+                                    } else {
+                                        // Channel closed — blocking task dropped the sender.
+                                        // Await the result directly to avoid a busy loop
+                                        // (biased select would keep picking this branch).
+                                        break blocking_handle.await
+                                            .unwrap_or((StopReason::EndTurn, Vec::new()));
                                     }
                                 }
                                 done = &mut blocking_handle => {
