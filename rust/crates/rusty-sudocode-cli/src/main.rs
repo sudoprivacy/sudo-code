@@ -1312,6 +1312,7 @@ fn run_repl(
                 let echo_display = format!(" › {}", trimmed.replace('\n', " "));
                 let pad = term_width.saturating_sub(echo_display.chars().count());
                 print!("\x1b[3F\x1b[J"); // up 3 to indicator line, clear all below
+                println!("{separator}");
                 print!("\x1b[48;5;236m{echo_display}{}\x1b[0m", " ".repeat(pad));
                 println!();
                 println!("{separator}");
@@ -1371,9 +1372,9 @@ fn run_repl(
                             mime_type: mime.clone(),
                         });
                     }
-                    let n = pasted_images.len();
-                    let label = if n == 1 { "image" } else { "images" };
-                    println!("  \x1b[2m📎 {n} {label} attached\x1b[0m");
+                    for hash in pasted_images.keys() {
+                        println!("  \x1b[2m📎 [Image #{}] attached\x1b[0m", &hash[..12]);
+                    }
                     if let Err(e) = cli.run_turn_with_blocks(blocks) {
                         eprintln!("\x1b[31m{e}\x1b[0m");
                     }
