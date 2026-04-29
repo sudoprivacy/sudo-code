@@ -19,6 +19,7 @@ mod file_ops;
 mod git_context;
 pub mod green_contract;
 mod hooks;
+pub mod image_registry;
 mod json;
 pub mod jsonrpc_transport;
 mod lane_events;
@@ -88,6 +89,7 @@ pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
     HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
 };
+pub use image_registry::{ImageRegistry, RegisteredImage};
 pub use lane_events::{
     compute_event_fingerprint, dedupe_superseded_commit_events, dedupe_terminal_events,
     is_terminal_event, BlockedSubphase, EventProvenance, LaneCommitProvenance, LaneEvent,

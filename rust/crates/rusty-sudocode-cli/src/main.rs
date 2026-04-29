@@ -36,6 +36,7 @@ use api::{
     OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
+use base64::Engine;
 
 use cli::api_client::{
     collect_prompt_cache_events, collect_tool_results, collect_tool_uses, final_assistant_text,
@@ -1259,6 +1260,86 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
     }
 }
 
+/// Try to grab an image from the system clipboard. Returns `None` when the
+/// clipboard holds text-only content or when clipboard access is unavailable.
+fn grab_clipboard_image() -> Option<runtime::RegisteredImage> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let img_data = clipboard.get_image().ok()?;
+    let registry = runtime::ImageRegistry::default_cache().ok()?;
+    let rgba: Vec<u8> = img_data.bytes.to_vec();
+    registry
+        .register_rgba(
+            u32::try_from(img_data.width).unwrap_or(0),
+            u32::try_from(img_data.height).unwrap_or(0),
+            &rgba,
+        )
+        .ok()
+}
+
+/// Parse `<image:HASH>` tags from the input text and resolve them from the
+/// image registry.  Returns the content blocks for a user message: one or more
+/// `Text` blocks (the remaining text segments) interleaved with `Image` blocks.
+fn resolve_image_tags(input: &str) -> Vec<ContentBlock> {
+    let re = regex::Regex::new(r"<image:([a-fA-F0-9]{64})>").expect("valid regex");
+    let Ok(registry) = runtime::ImageRegistry::default_cache() else {
+        return vec![ContentBlock::Text {
+            text: input.to_string(),
+        }];
+    };
+
+    let mut blocks = Vec::new();
+    let mut last_end = 0;
+
+    for cap in re.captures_iter(input) {
+        let full_match = cap.get(0).expect("capture group 0");
+        let hash = &cap[1];
+
+        // Collect any text before this tag.
+        if full_match.start() > last_end {
+            let text_segment = &input[last_end..full_match.start()];
+            let trimmed = text_segment.trim();
+            if !trimmed.is_empty() {
+                blocks.push(ContentBlock::Text {
+                    text: trimmed.to_string(),
+                });
+            }
+        }
+        last_end = full_match.end();
+
+        // Resolve the image from the registry.
+        if let Ok((b64, mime)) = registry.load(hash) {
+            blocks.push(ContentBlock::Image {
+                data: b64,
+                mime_type: mime,
+            });
+        } else {
+            // If the hash doesn't resolve, keep the tag as text.
+            blocks.push(ContentBlock::Text {
+                text: full_match.as_str().to_string(),
+            });
+        }
+    }
+
+    // Trailing text after the last tag.
+    if last_end < input.len() {
+        let trailing = input[last_end..].trim();
+        if !trailing.is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: trailing.to_string(),
+            });
+        }
+    }
+
+    // Fallback: if nothing matched, just produce a single text block.
+    if blocks.is_empty() {
+        blocks.push(ContentBlock::Text {
+            text: input.to_string(),
+        });
+    }
+
+    blocks
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_repl(
     model: String,
@@ -1353,7 +1434,29 @@ fn run_repl(
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
-                if let Err(e) = cli.run_turn(&trimmed) {
+
+                // Check clipboard for image data. If an image is present,
+                // register it and append an <image:HASH> tag to the prompt
+                // so the API client can resolve it into an Image content block.
+                let effective_prompt = if let Some(registered) = grab_clipboard_image() {
+                    let size_kb = registered
+                        .path
+                        .metadata()
+                        .map_or(0u32, |m| u32::try_from(m.len() / 1024).unwrap_or(u32::MAX));
+                    println!("  \x1b[2m📎 Image detected in clipboard ({size_kb} KB)\x1b[0m",);
+                    format!("{trimmed}\n<image:{}>", registered.hash)
+                } else {
+                    trimmed.clone()
+                };
+
+                // If the prompt contains <image:HASH> tags, resolve them
+                // and run a multi-block turn.
+                if effective_prompt.contains("<image:") {
+                    let blocks = resolve_image_tags(&effective_prompt);
+                    if let Err(e) = cli.run_turn_with_blocks(blocks) {
+                        eprintln!("\x1b[31m{e}\x1b[0m");
+                    }
+                } else if let Err(e) = cli.run_turn(&trimmed) {
                     eprintln!("\x1b[31m{e}\x1b[0m");
                 }
             }
@@ -1939,12 +2042,23 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
         let session = self.inner.sessions.get_mut(session_id).ok_or_else(|| {
             runtime::AcpError::invalid_params(format!("unknown sessionId: {session_id}"))
         })?;
+        let registry = runtime::ImageRegistry::default_cache()
+            .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
         for (data, mime_type) in images {
+            let raw_bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
+            let registered = registry
+                .register_bytes(&raw_bytes, mime_type)
+                .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
+            let (b64, final_mime) = registry
+                .load(&registered.hash)
+                .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
             let msg = runtime::ConversationMessage {
                 role: runtime::MessageRole::User,
                 blocks: vec![runtime::ContentBlock::Image {
-                    data: data.clone(),
-                    mime_type: mime_type.clone(),
+                    data: b64,
+                    mime_type: final_mime,
                 }],
                 usage: None,
             };
@@ -2314,6 +2428,60 @@ impl LiveCli {
         runtime.tool_executor_mut().set_spinner_pause(pause_flag);
         let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
+        hook_abort_monitor.stop();
+        match result {
+            Ok(summary) => {
+                self.replace_runtime(runtime)?;
+                spinner.clear(&mut stdout)?;
+                if let Some(event) = summary.auto_compaction {
+                    println!(
+                        "{}",
+                        format_auto_compaction_notice(event.removed_message_count)
+                    );
+                }
+                let elapsed = turn_start.elapsed();
+                let usage = self.runtime.usage().current_turn_usage();
+                let turns = self.runtime.usage().turns();
+                println!(
+                    "{}",
+                    format_turn_status_line(&self.config.model, turns, &usage, elapsed)
+                );
+                self.persist_session()?;
+                Ok(())
+            }
+            Err(error) => {
+                runtime.shutdown_plugins()?;
+                spinner.fail(
+                    "❌ Request failed",
+                    TerminalRenderer::new().color_theme(),
+                    &mut stdout,
+                )?;
+                Err(Box::new(error))
+            }
+        }
+    }
+
+    /// Run a turn with pre-resolved content blocks (text + images).
+    fn run_turn_with_blocks(
+        &mut self,
+        blocks: Vec<ContentBlock>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let turn_start = Instant::now();
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        let mut spinner = Spinner::new();
+        let mut stdout = io::stdout();
+        spinner.start(
+            "🦀 Thinking...",
+            Some(self.config.model.as_str()),
+            TerminalRenderer::new().color_theme(),
+        );
+        let pause_flag = spinner.pause_flag();
+        runtime
+            .api_client_mut()
+            .set_spinner_pause(pause_flag.clone());
+        runtime.tool_executor_mut().set_spinner_pause(pause_flag);
+        let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
+        let result = runtime.run_turn_with_blocks(blocks, Some(&mut permission_prompter), None);
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
