@@ -1292,43 +1292,27 @@ fn run_repl(
             .unwrap_or(80);
         let separator = format!("\x1b[2m{}\x1b[0m", "─".repeat(term_width));
         let footer = "  \x1b[2m/help · /status · Tab for /commands\x1b[0m";
-        // Check clipboard for an image BEFORE rendering chrome so we can
-        // show an [Image #N] indicator above the prompt.
-        let has_clipboard_image = editor.check_clipboard_image().is_some();
-
-        // Print the entire input chrome block.  When a clipboard image is
-        // detected we insert an extra indicator line between the top
-        // separator and the prompt placeholder.
-        //
-        //   ──────────────────      (top separator)
-        //   [Image #4]              (only when clipboard has image)
-        //                           (prompt placeholder — readline here)
-        //   ──────────────────      (bottom separator)
-        //   footer
+        // Print the entire input chrome block: image indicator placeholder,
+        // top sep, prompt placeholder, bottom sep, footer.  Then move the
+        // cursor back to the prompt line so read_line() renders there.
+        println!(); // image indicator (initially blank)
         println!("{separator}");
-        if has_clipboard_image {
-            let n = editor.check_clipboard_image().map_or(0, |img| img.number);
-            println!("  \x1b[2m[Image #{n}]\x1b[0m");
-        }
         println!();
         println!("{separator}");
         print!("{footer}");
-        // Move cursor back up to the prompt placeholder line.
-        let lines_up = if has_clipboard_image { 3 } else { 2 };
-        print!("\x1b[{lines_up}F\x1b[2K");
+        print!("\x1b[2F\x1b[2K"); // cursor up 2 lines, clear prompt placeholder
         std::io::Write::flush(&mut std::io::stdout())?;
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
                 // Clear pre-printed bottom sep + footer
                 print!("\x1b[J");
-                // Replace prompt line with gray-background echo of user input
+                // Clear indicator + separator + prompt (3 lines above cursor),
+                // then rewrite echo + separator in their place.
                 let trimmed = input.trim().to_string();
                 let echo_display = format!(" › {}", trimmed.replace('\n', " "));
                 let pad = term_width.saturating_sub(echo_display.chars().count());
-                print!(
-                    "\x1b[1F\x1b[2K\x1b[48;5;236m{echo_display}{}\x1b[0m",
-                    " ".repeat(pad)
-                );
+                print!("\x1b[3F\x1b[J"); // up 3 to indicator line, clear all below
+                print!("\x1b[48;5;236m{echo_display}{}\x1b[0m", " ".repeat(pad));
                 println!();
                 println!("{separator}");
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
@@ -1371,24 +1355,28 @@ fn run_repl(
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
 
-                // Check clipboard for image (re-checks now in case user
-                // copied an image while typing) and attach if found.
-                if let Some(pending) = editor.take_clipboard_image() {
-                    println!("  \x1b[2m📎 Image #{} attached\x1b[0m", pending.number);
-                    let blocks = vec![
-                        ContentBlock::Text {
-                            text: trimmed.clone(),
-                        },
-                        ContentBlock::Image {
-                            data: pending.data,
-                            mime_type: pending.mime_type,
-                        },
-                    ];
+                // Attach any images pasted during this input session.
+                let pasted_images = editor.take_images();
+                if pasted_images.is_empty() {
+                    if let Err(e) = cli.run_turn(&trimmed) {
+                        eprintln!("\x1b[31m{e}\x1b[0m");
+                    }
+                } else {
+                    let mut blocks = vec![ContentBlock::Text {
+                        text: trimmed.clone(),
+                    }];
+                    for (b64, mime) in pasted_images.values() {
+                        blocks.push(ContentBlock::Image {
+                            data: b64.clone(),
+                            mime_type: mime.clone(),
+                        });
+                    }
+                    let n = pasted_images.len();
+                    let label = if n == 1 { "image" } else { "images" };
+                    println!("  \x1b[2m📎 {n} {label} attached\x1b[0m");
                     if let Err(e) = cli.run_turn_with_blocks(blocks) {
                         eprintln!("\x1b[31m{e}\x1b[0m");
                     }
-                } else if let Err(e) = cli.run_turn(&trimmed) {
-                    eprintln!("\x1b[31m{e}\x1b[0m");
                 }
             }
             input::ReadOutcome::Exit => {

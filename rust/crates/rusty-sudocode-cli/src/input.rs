@@ -1,9 +1,8 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, IsTerminal, Write};
-
-use base64::Engine;
+use std::sync::{Arc, Mutex};
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -42,15 +41,75 @@ pub enum ReadOutcome {
     Exit,
 }
 
-/// A clipboard image that has been detected and registered but not yet sent.
-#[derive(Debug, Clone)]
-pub struct PendingImage {
-    /// Sequential image number for display (e.g. `[Image #3]`).
-    pub number: u32,
-    /// Base64-encoded image data.
-    pub data: String,
-    /// MIME type, e.g. `image/png`.
-    pub mime_type: String,
+/// Shared map of pasted images: hash -> (base64, mime_type).
+type ImageMap = Arc<Mutex<HashMap<String, (String, String)>>>;
+
+/// Monotonically increasing counter shared between the handler and the editor.
+type ImageCounter = Arc<Mutex<u32>>;
+
+/// Intercepts `BracketedPasteStart` (fired by Cmd+V on macOS).  If the
+/// clipboard contains only image data (no text), register the image and
+/// insert an `[Image #HASH_PREFIX]` tag.  When the clipboard has text,
+/// returns `None` so rustyline's default paste-text path runs instead.
+struct ImagePasteHandler {
+    images: ImageMap,
+    counter: ImageCounter,
+}
+
+impl ConditionalEventHandler for ImagePasteHandler {
+    fn handle(
+        &self,
+        _evt: &rustyline::Event,
+        _n: RepeatCount,
+        _positive: bool,
+        _ctx: &EventContext<'_>,
+    ) -> Option<Cmd> {
+        let mut cb = arboard::Clipboard::new().ok()?;
+
+        // If the clipboard has text, let rustyline's default bracketed-paste
+        // handler insert it (return None → fall through to default keymap).
+        if cb.get_text().ok().is_some_and(|t| !t.is_empty()) {
+            return None;
+        }
+
+        let img_data = cb.get_image().ok()?;
+        let registry = runtime::ImageRegistry::default_cache().ok()?;
+        let rgba: Vec<u8> = img_data.bytes.to_vec();
+        let registered = registry
+            .register_rgba(
+                u32::try_from(img_data.width).unwrap_or(0),
+                u32::try_from(img_data.height).unwrap_or(0),
+                &rgba,
+            )
+            .ok()?;
+
+        let (b64, mime) = registry.load(&registered.hash).ok()?;
+
+        let mut images = self.images.lock().ok()?;
+        // If this exact hash is already inserted, don't duplicate.
+        if images.contains_key(&registered.hash) {
+            return Some(Cmd::Noop);
+        }
+        images.insert(registered.hash.clone(), (b64, mime));
+        drop(images);
+
+        let mut ctr = self.counter.lock().ok()?;
+        *ctr += 1;
+        let n = *ctr;
+        drop(ctr);
+
+        // Write the indicator on the pre-allocated line above the prompt
+        // chrome.  Layout: indicator is 2 lines above the cursor (prompt).
+        let mut stdout = std::io::stdout();
+        // Save cursor, move up 2 to indicator line, clear & write, restore.
+        write!(stdout, "\x1b7\x1b[2A\x1b[2K").ok();
+        let hash_prefix = &registered.hash[..12];
+        write!(stdout, "  \x1b[1m[Image #{hash_prefix}]\x1b[0m").ok();
+        write!(stdout, "\x1b8").ok();
+        stdout.flush().ok();
+
+        Some(Cmd::Noop)
+    }
 }
 
 struct SlashCommandHelper {
@@ -119,6 +178,10 @@ impl Completer for SlashCommandHelper {
 
 impl Hinter for SlashCommandHelper {
     type Hint = String;
+
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        None
+    }
 }
 
 impl Highlighter for SlashCommandHelper {
@@ -141,13 +204,10 @@ pub struct LineEditor {
     editor: Editor<SlashCommandHelper, DefaultHistory>,
     /// Whether the previous read returned a Ctrl-C on an empty prompt.
     pending_exit: bool,
-    /// Hash of the last clipboard image that was already sent, so we don't
-    /// re-attach a stale clipboard image on every submit.
-    last_sent_image_hash: Option<String>,
-    /// Monotonically increasing image counter for display.
-    image_counter: u32,
-    /// Image detected before the current readline, ready to be consumed on submit.
-    pending_image: Option<PendingImage>,
+    /// Shared image map populated by the `ImagePasteHandler`.
+    images: ImageMap,
+    /// Shared image counter.
+    _counter: ImageCounter,
 }
 
 impl LineEditor {
@@ -167,13 +227,36 @@ impl LineEditor {
             EventHandler::Conditional(Box::new(AcceptNonEmpty)),
         );
 
+        let images: ImageMap = Arc::new(Mutex::new(HashMap::new()));
+        let counter: ImageCounter = Arc::new(Mutex::new(0));
+
+        let handler = ImagePasteHandler {
+            images: Arc::clone(&images),
+            counter: Arc::clone(&counter),
+        };
+        // Cmd+V on macOS triggers the terminal's paste action which sends a
+        // bracketed paste sequence.  When the clipboard has only image data
+        // the paste content is empty (`ESC[200~ ESC[201~`).  We intercept
+        // BracketedPasteStart to check for image data; if no image (i.e. the
+        // clipboard has text), we return None so the default paste path runs.
+        editor.bind_sequence(
+            KeyEvent(KeyCode::BracketedPasteStart, Modifiers::NONE),
+            EventHandler::Conditional(Box::new(handler)),
+        );
+        // Consume the trailing BracketedPasteEnd that remains in the buffer
+        // after we handle an image paste (the default handler would have
+        // consumed it inside read_pasted_text, but we bypassed that path).
+        editor.bind_sequence(
+            KeyEvent(KeyCode::BracketedPasteEnd, Modifiers::NONE),
+            Cmd::Noop,
+        );
+
         Self {
             prompt: prompt.into(),
             editor,
             pending_exit: false,
-            last_sent_image_hash: None,
-            image_counter: 0,
-            pending_image: None,
+            images,
+            _counter: counter,
         }
     }
 
@@ -192,69 +275,11 @@ impl LineEditor {
         }
     }
 
-    /// Check the system clipboard for a new image. If one is found (and it
-    /// differs from the last image we sent), register it and store it as
-    /// pending. Returns the [`PendingImage`] for display purposes.
-    ///
-    /// Call this **before** rendering the prompt chrome so the REPL can show
-    /// an `[Image #N]` indicator.
-    pub fn check_clipboard_image(&mut self) -> Option<&PendingImage> {
-        let mut clipboard = arboard::Clipboard::new().ok()?;
-        let img_data = clipboard.get_image().ok()?;
-        let registry = runtime::ImageRegistry::default_cache().ok()?;
-        let rgba: Vec<u8> = img_data.bytes.to_vec();
-        let registered = registry
-            .register_rgba(
-                u32::try_from(img_data.width).unwrap_or(0),
-                u32::try_from(img_data.height).unwrap_or(0),
-                &rgba,
-            )
-            .ok()?;
-
-        // Deduplicate: skip if this is the same image we already sent.
-        if self.last_sent_image_hash.as_deref() == Some(&registered.hash) {
-            self.pending_image = None;
-            return None;
-        }
-
-        let (b64, mime) = registry.load(&registered.hash).ok()?;
-
-        // Only bump counter if this is a genuinely new image hash.
-        let is_new = self
-            .pending_image
-            .as_ref()
-            .is_none_or(|prev| prev.data != b64);
-        if is_new {
-            self.image_counter += 1;
-        }
-
-        self.pending_image = Some(PendingImage {
-            number: self.image_counter,
-            data: b64,
-            mime_type: mime,
-        });
-        self.pending_image.as_ref()
-    }
-
-    /// Grab the clipboard image to attach on submit. Does a fresh clipboard
-    /// check (catches images copied while readline was blocking), then
-    /// marks the image as sent so it won't be re-attached next time.
-    pub fn take_clipboard_image(&mut self) -> Option<PendingImage> {
-        // Re-check clipboard now — the user may have copied an image
-        // while readline was active (after the pre-chrome check).
-        self.check_clipboard_image();
-
-        let img = self.pending_image.take()?;
-        // Compute hash from base64 data to track dedup.
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(&img.data)
-            .ok()?;
-        let hash = {
-            use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&raw))
-        };
-        self.last_sent_image_hash = Some(hash);
-        Some(img)
+    /// Drain all images that were pasted during the current input session.
+    /// Returns a map of full SHA-256 hash -> (base64_data, mime_type).
+    pub fn take_images(&mut self) -> HashMap<String, (String, String)> {
+        let mut map = self.images.lock().expect("image map lock");
+        std::mem::take(&mut *map)
     }
 
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
