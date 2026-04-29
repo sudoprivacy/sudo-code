@@ -12,7 +12,7 @@ const MAX_IMAGE_DIMENSION: u32 = 8000;
 
 /// On-disk cache for pasted images, keyed by their SHA-256 content hash.
 ///
-/// Images are stored under `~/.config/scode/image_cache/<hash>.<ext>` so that
+/// Images are stored under `~/.nexus/sudocode/image_cache/<hash>.<ext>` so that
 /// identical pastes are deduplicated and can be referenced by a short
 /// `<image:HASH>` tag inside the prompt text.
 pub struct ImageRegistry {
@@ -32,12 +32,12 @@ pub struct RegisteredImage {
 
 impl ImageRegistry {
     /// Create a new registry backed by the default cache directory
-    /// (`~/.config/scode/image_cache`).
+    /// (`~/.nexus/sudocode/image_cache`).
     pub fn default_cache() -> io::Result<Self> {
         let base = dirs_next().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "cannot determine home directory")
         })?;
-        let cache_dir = base.join(".config").join("scode").join("image_cache");
+        let cache_dir = base.join(".nexus").join("sudocode").join("image_cache");
         fs::create_dir_all(&cache_dir)?;
         Ok(Self { cache_dir })
     }
