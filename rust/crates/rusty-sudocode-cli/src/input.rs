@@ -44,16 +44,13 @@ pub enum ReadOutcome {
 /// Shared map of pasted images: hash -> (base64, mime_type).
 type ImageMap = Arc<Mutex<HashMap<String, (String, String)>>>;
 
-/// Monotonically increasing counter shared between the handler and the editor.
-type ImageCounter = Arc<Mutex<u32>>;
-
 /// Intercepts `BracketedPasteStart` (fired by Cmd+V on macOS).  If the
 /// clipboard contains only image data (no text), register the image and
-/// insert an `[Image #HASH_PREFIX]` tag.  When the clipboard has text,
-/// returns `None` so rustyline's default paste-text path runs instead.
+/// display an `[Image #HASH_PREFIX]` indicator above the prompt.  When
+/// the clipboard has text, returns `None` so rustyline's default
+/// paste-text path runs instead.
 struct ImagePasteHandler {
     images: ImageMap,
-    counter: ImageCounter,
 }
 
 impl ConditionalEventHandler for ImagePasteHandler {
@@ -92,11 +89,6 @@ impl ConditionalEventHandler for ImagePasteHandler {
         }
         images.insert(registered.hash.clone(), (b64, mime));
         drop(images);
-
-        let mut ctr = self.counter.lock().ok()?;
-        *ctr += 1;
-        let n = *ctr;
-        drop(ctr);
 
         // Write the indicator on the pre-allocated line above the prompt
         // chrome.  Layout: indicator is 2 lines above the cursor (prompt).
@@ -206,8 +198,6 @@ pub struct LineEditor {
     pending_exit: bool,
     /// Shared image map populated by the `ImagePasteHandler`.
     images: ImageMap,
-    /// Shared image counter.
-    _counter: ImageCounter,
 }
 
 impl LineEditor {
@@ -228,11 +218,9 @@ impl LineEditor {
         );
 
         let images: ImageMap = Arc::new(Mutex::new(HashMap::new()));
-        let counter: ImageCounter = Arc::new(Mutex::new(0));
 
         let handler = ImagePasteHandler {
             images: Arc::clone(&images),
-            counter: Arc::clone(&counter),
         };
         // Cmd+V on macOS triggers the terminal's paste action which sends a
         // bracketed paste sequence.  When the clipboard has only image data
@@ -256,7 +244,6 @@ impl LineEditor {
             editor,
             pending_exit: false,
             images,
-            _counter: counter,
         }
     }
 
