@@ -500,6 +500,26 @@ impl AnthropicClient {
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
         self.prepend_oauth_system_prefix(&mut request_body);
+
+        if let Some(session_tracer) = &self.session_tracer {
+            let mut headers: Vec<(String, String)> =
+                vec![("content-type".to_string(), "application/json".to_string())];
+            if let Some(api_key) = self.auth.api_key() {
+                headers.push(("x-api-key".to_string(), api_key.to_string()));
+            }
+            if let Some(token) = self.auth.bearer_token() {
+                headers.push(("authorization".to_string(), format!("Bearer {token}")));
+            }
+            headers.extend(self.request_profile.header_pairs());
+            let masked = telemetry::mask_sensitive_headers(&headers);
+            session_tracer.record_http_request_debug(
+                &request_url,
+                "POST",
+                masked,
+                request_body.clone(),
+            );
+        }
+
         let request_builder = self.build_request(&request_url).json(&request_body);
         request_builder.send().await.map_err(ApiError::from)
     }

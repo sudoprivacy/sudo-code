@@ -10,6 +10,7 @@ use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
     PromptCacheEvent, RuntimeError, TokenUsage,
 };
+use telemetry::{JsonlTelemetrySink, SessionTracer};
 use tools::GlobalToolRegistry;
 
 use super::format::{format_tool_call_start, format_user_visible_api_error};
@@ -57,8 +58,15 @@ impl AnthropicRuntimeClient {
             Some(effective_mode),
             sudocode_config,
         )?;
-        let client = ApiProviderClient::from_resolved(&resolved, Some(effective_mode))?
+        let mut client = ApiProviderClient::from_resolved(&resolved, Some(effective_mode))?
             .with_prompt_cache(PromptCache::new(session_id));
+
+        if let Some(capture_path) = &config.debug_request_capture {
+            let sink = Arc::new(JsonlTelemetrySink::new(capture_path)?);
+            let tracer = SessionTracer::new(session_id, sink);
+            client = client.with_session_tracer(tracer);
+        }
+
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,

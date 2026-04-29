@@ -2359,8 +2359,8 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
- "sha2",
  "syntect",
+ "telemetry",
  "tokio",
  "tools",
 ]

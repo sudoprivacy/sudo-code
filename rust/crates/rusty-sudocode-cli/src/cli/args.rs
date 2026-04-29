@@ -74,6 +74,10 @@ struct Cli {
     #[arg(long, global = true)]
     allow_broad_cwd: bool,
 
+    /// Capture full HTTP request debug data (URL, headers, body) to a JSONL file
+    #[arg(long, global = true)]
+    debug_request_capture: Option<PathBuf>,
+
     /// Non-interactive print mode
     #[arg(long, global = true)]
     print: bool,
@@ -272,6 +276,7 @@ pub(crate) enum CliAction {
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
         auth_mode: Option<AuthMode>,
+        debug_request_capture: Option<PathBuf>,
     },
     Doctor {
         output_format: CliOutputFormat,
@@ -311,6 +316,7 @@ pub(crate) enum CliAction {
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
         auth_mode: Option<AuthMode>,
+        debug_request_capture: Option<PathBuf>,
     },
     HelpTopic(LocalHelpTopic),
     Help {
@@ -423,6 +429,7 @@ fn convert_cli_to_action(cli: Cli) -> Result<CliAction, String> {
     };
     let allowed_tools = normalize_allowed_tools(&cli.allowed_tools)?;
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
+    let debug_request_capture = cli.debug_request_capture.clone();
 
     // --resume takes priority over subcommands
     if let Some(resume_value) = cli.resume {
@@ -483,6 +490,7 @@ fn convert_cli_to_action(cli: Cli) -> Result<CliAction, String> {
                         reasoning_effort: cli.reasoning_effort,
                         allow_broad_cwd: cli.allow_broad_cwd,
                         auth_mode,
+                        debug_request_capture,
                     }),
                     SkillSlashDispatch::Local => Ok(CliAction::Skills {
                         args: joined,
@@ -529,6 +537,7 @@ fn convert_cli_to_action(cli: Cli) -> Result<CliAction, String> {
                     reasoning_effort: cli.reasoning_effort,
                     allow_broad_cwd: cli.allow_broad_cwd,
                     auth_mode,
+                    debug_request_capture,
                 })
             }
         };
@@ -554,6 +563,7 @@ fn convert_cli_to_action(cli: Cli) -> Result<CliAction, String> {
             reasoning_effort: cli.reasoning_effort,
             allow_broad_cwd: cli.allow_broad_cwd,
             auth_mode,
+            debug_request_capture: debug_request_capture.clone(),
         });
     }
 
@@ -574,6 +584,7 @@ fn convert_cli_to_action(cli: Cli) -> Result<CliAction, String> {
                 reasoning_effort: cli.reasoning_effort,
                 allow_broad_cwd: cli.allow_broad_cwd,
                 auth_mode,
+                debug_request_capture: debug_request_capture.clone(),
             });
         }
     }
@@ -586,6 +597,7 @@ fn convert_cli_to_action(cli: Cli) -> Result<CliAction, String> {
         reasoning_effort: cli.reasoning_effort,
         allow_broad_cwd: cli.allow_broad_cwd,
         auth_mode,
+        debug_request_capture,
     })
 }
 
@@ -625,6 +637,7 @@ fn parse_slash_command_invocation(args: &[String]) -> Result<CliAction, String> 
                     reasoning_effort: None,
                     allow_broad_cwd: false,
                     auth_mode: None,
+                    debug_request_capture: None,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
