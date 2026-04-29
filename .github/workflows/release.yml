@@ -26,12 +26,24 @@ jobs:
         include:
           - name: linux-x64
             os: ubuntu-latest
-            bin: claw
-            artifact_name: claw-linux-x64
+            bin: scode
+            package_dir: scode-linux-x64
+            archive_name: scode-linux-x64.tar.gz
           - name: macos-arm64
             os: macos-14
-            bin: claw
-            artifact_name: claw-macos-arm64
+            bin: scode
+            package_dir: scode-macos-arm64
+            archive_name: scode-macos-arm64.tar.gz
+          - name: macos-x64
+            os: macos-13
+            bin: scode
+            package_dir: scode-macos-x64
+            archive_name: scode-macos-x64.tar.gz
+          - name: windows-x64
+            os: windows-2022
+            bin: scode.exe
+            package_dir: scode-windows-x64
+            archive_name: scode-windows-x64.zip
     defaults:
       run:
         working-directory: rust
@@ -45,24 +57,44 @@ jobs:
           workspaces: rust -> target
 
       - name: Build release binary
-        run: cargo build --release -p rusty-claude-cli
+        run: cargo build --locked --release -p rusty-sudocode-cli --bin scode
 
-      - name: Package artifact
+      - name: Stage release payload
         shell: bash
         run: |
-          mkdir -p dist
-          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.artifact_name }}"
-          chmod +x "dist/${{ matrix.artifact_name }}"
+          set -euo pipefail
+          mkdir -p "dist/${{ matrix.package_dir }}"
+          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.package_dir }}/${{ matrix.bin }}"
+          cp "../README.md" "dist/${{ matrix.package_dir }}/README.md"
+          if [[ "${{ runner.os }}" != "Windows" ]]; then
+            chmod +x "dist/${{ matrix.package_dir }}/${{ matrix.bin }}"
+          fi
+
+      - name: Archive release payload (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -C dist -czf "dist/${{ matrix.archive_name }}" "${{ matrix.package_dir }}"
+
+      - name: Archive release payload (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "dist/${{ matrix.package_dir }}" `
+            -DestinationPath "dist/${{ matrix.archive_name }}" `
+            -Force
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: rust/dist/${{ matrix.artifact_name }}
+          name: ${{ matrix.package_dir }}
+          path: rust/dist/${{ matrix.archive_name }}
 
       - name: Upload release asset
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: rust/dist/${{ matrix.artifact_name }}
+          files: rust/dist/${{ matrix.archive_name }}
           fail_on_unmatched_files: true
