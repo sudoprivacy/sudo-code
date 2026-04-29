@@ -419,7 +419,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             allow_broad_cwd,
             auth_mode,
-            debug_request_capture,
         } => {
             enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
             run_stale_base_preflight(base_commit.as_deref());
@@ -434,14 +433,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            let mut cli = LiveCli::new(
-                model,
-                true,
-                allowed_tools,
-                permission_mode,
-                auth_mode,
-                debug_request_capture,
-            )?;
+            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode, auth_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
@@ -509,7 +501,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             allow_broad_cwd,
             auth_mode,
-            debug_request_capture,
         } => run_repl(
             model,
             allowed_tools,
@@ -518,7 +509,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             allow_broad_cwd,
             auth_mode,
-            debug_request_capture,
         )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
@@ -1278,7 +1268,6 @@ fn run_repl(
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
     auth_mode: Option<AuthMode>,
-    debug_request_capture: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
@@ -1289,7 +1278,6 @@ fn run_repl(
         allowed_tools,
         permission_mode,
         auth_mode,
-        debug_request_capture,
     )?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
@@ -1407,7 +1395,6 @@ struct RuntimeConfig {
     progress_reporter: Option<InternalPromptProgressReporter>,
     auth_mode: AuthMode,
     sudocode_config: api::SudoCodeConfig,
-    debug_request_capture: Option<PathBuf>,
 }
 
 struct BuiltRuntime {
@@ -1557,7 +1544,6 @@ impl AcpCliAgent {
                     progress_reporter: None,
                     auth_mode,
                     sudocode_config,
-                    debug_request_capture: None,
                 }
             },
         )
@@ -1656,7 +1642,6 @@ impl AcpCliAgent {
                 progress_reporter: None,
                 auth_mode,
                 sudocode_config,
-                debug_request_capture: None,
             },
         )
         .map_err(|e| AcpError::internal(e.to_string()))?;
@@ -2010,7 +1995,6 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
                 progress_reporter: None,
                 auth_mode,
                 sudocode_config,
-                debug_request_capture: None,
             },
         )
         .map_err(|e| runtime::AcpError::internal(format!("failed to build runtime: {e}")))?;
@@ -2145,7 +2129,6 @@ impl LiveCli {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
         auth_mode: Option<AuthMode>,
-        debug_request_capture: Option<PathBuf>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let session_state = new_cli_session()?;
@@ -2164,7 +2147,6 @@ impl LiveCli {
             progress_reporter: None,
             auth_mode,
             sudocode_config,
-            debug_request_capture,
         };
         let runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),

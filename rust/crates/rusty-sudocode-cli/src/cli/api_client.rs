@@ -61,8 +61,8 @@ impl AnthropicRuntimeClient {
         let mut client = ApiProviderClient::from_resolved(&resolved, Some(effective_mode))?
             .with_prompt_cache(PromptCache::new(session_id));
 
-        if let Some(capture_path) = &config.debug_request_capture {
-            let sink = Arc::new(JsonlTelemetrySink::new(capture_path)?);
+        if let Ok(capture_path) = std::env::var("SCODE_HTTP_DEBUG") {
+            let sink = Arc::new(JsonlTelemetrySink::new(&capture_path)?);
             let tracer = SessionTracer::new(session_id, sink);
             client = client.with_session_tracer(tracer);
         }
