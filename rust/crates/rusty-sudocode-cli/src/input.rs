@@ -236,9 +236,14 @@ impl LineEditor {
         self.pending_image.as_ref()
     }
 
-    /// Consume the pending clipboard image (if any) after the user submits.
-    /// Marks the image as sent so it won't be re-attached next time.
-    pub fn take_pending_image(&mut self) -> Option<PendingImage> {
+    /// Grab the clipboard image to attach on submit. Does a fresh clipboard
+    /// check (catches images copied while readline was blocking), then
+    /// marks the image as sent so it won't be re-attached next time.
+    pub fn take_clipboard_image(&mut self) -> Option<PendingImage> {
+        // Re-check clipboard now — the user may have copied an image
+        // while readline was active (after the pre-chrome check).
+        self.check_clipboard_image();
+
         let img = self.pending_image.take()?;
         // Compute hash from base64 data to track dedup.
         let raw = base64::engine::general_purpose::STANDARD

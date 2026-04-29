@@ -1371,9 +1371,9 @@ fn run_repl(
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
 
-                // If a clipboard image was detected before readline,
-                // consume it and attach to the message.
-                if let Some(pending) = editor.take_pending_image() {
+                // Check clipboard for image (re-checks now in case user
+                // copied an image while typing) and attach if found.
+                if let Some(pending) = editor.take_clipboard_image() {
                     println!("  \x1b[2m📎 Image #{} attached\x1b[0m", pending.number);
                     let blocks = vec![
                         ContentBlock::Text {
