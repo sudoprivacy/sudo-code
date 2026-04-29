@@ -1312,7 +1312,7 @@ fn run_repl(
                 let echo_display = format!(" › {}", trimmed.replace('\n', " "));
                 let pad = term_width.saturating_sub(echo_display.chars().count());
                 print!("\x1b[3F\x1b[J"); // up 3 to indicator line, clear all below
-                println!("{separator}");
+                println!();
                 print!("\x1b[48;5;236m{echo_display}{}\x1b[0m", " ".repeat(pad));
                 println!();
                 println!("{separator}");
