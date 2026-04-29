@@ -32,12 +32,9 @@ pub struct RegisteredImage {
 
 impl ImageRegistry {
     /// Create a new registry backed by the default cache directory
-    /// (`~/.nexus/sudocode/image_cache`).
+    /// (`<config_home>/image_cache`, typically `~/.nexus/sudocode/image_cache`).
     pub fn default_cache() -> io::Result<Self> {
-        let base = dirs_next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "cannot determine home directory")
-        })?;
-        let cache_dir = base.join(".nexus").join("sudocode").join("image_cache");
+        let cache_dir = crate::config::default_config_home().join("image_cache");
         fs::create_dir_all(&cache_dir)?;
         Ok(Self { cache_dir })
     }
@@ -200,13 +197,6 @@ fn downsample_image(img: image::DynamicImage) -> io::Result<(Vec<u8>, String)> {
         // Reduce quality and try again.
         quality = quality.saturating_sub(15);
     }
-}
-
-/// Resolve the user's home directory.
-fn dirs_next() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
 }
 
 #[cfg(test)]
