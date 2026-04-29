@@ -1260,22 +1260,6 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
     }
 }
 
-/// Try to grab an image from the system clipboard. Returns `None` when the
-/// clipboard holds text-only content or when clipboard access is unavailable.
-fn grab_clipboard_image() -> Option<runtime::RegisteredImage> {
-    let mut clipboard = arboard::Clipboard::new().ok()?;
-    let img_data = clipboard.get_image().ok()?;
-    let registry = runtime::ImageRegistry::default_cache().ok()?;
-    let rgba: Vec<u8> = img_data.bytes.to_vec();
-    registry
-        .register_rgba(
-            u32::try_from(img_data.width).unwrap_or(0),
-            u32::try_from(img_data.height).unwrap_or(0),
-            &rgba,
-        )
-        .ok()
-}
-
 /// Parse `<image:HASH>` tags from the input text and resolve them from the
 /// image registry.  Returns the content blocks for a user message: one or more
 /// `Text` blocks (the remaining text segments) interleaved with `Image` blocks.
@@ -1435,24 +1419,10 @@ fn run_repl(
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
 
-                // Check clipboard for image data. If an image is present,
-                // register it and append an <image:HASH> tag to the prompt
-                // so the API client can resolve it into an Image content block.
-                let effective_prompt = if let Some(registered) = grab_clipboard_image() {
-                    let size_kb = registered
-                        .path
-                        .metadata()
-                        .map_or(0u32, |m| u32::try_from(m.len() / 1024).unwrap_or(u32::MAX));
-                    println!("  \x1b[2m📎 Image detected in clipboard ({size_kb} KB)\x1b[0m",);
-                    format!("{trimmed}\n<image:{}>", registered.hash)
-                } else {
-                    trimmed.clone()
-                };
-
-                // If the prompt contains <image:HASH> tags, resolve them
-                // and run a multi-block turn.
-                if effective_prompt.contains("<image:") {
-                    let blocks = resolve_image_tags(&effective_prompt);
+                // If the prompt contains <image:HASH> tags (inserted by
+                // the /image command), resolve them and run a multi-block turn.
+                if trimmed.contains("<image:") {
+                    let blocks = resolve_image_tags(&trimmed);
                     if let Err(e) = cli.run_turn_with_blocks(blocks) {
                         eprintln!("\x1b[31m{e}\x1b[0m");
                     }

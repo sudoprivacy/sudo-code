@@ -14,6 +14,46 @@ use rustyline::{
     EventHandler, Helper, KeyCode, KeyEvent, Modifiers, RepeatCount,
 };
 
+/// Intercepts Ctrl+V to check the system clipboard for image data.
+/// If an image is found it is registered in the [`ImageRegistry`] and an
+/// `<image:HASH>` tag is inserted into the editing buffer.  When the
+/// clipboard holds no image the default `QuotedInsert` behaviour is preserved.
+struct ImagePasteHandler;
+
+impl ConditionalEventHandler for ImagePasteHandler {
+    fn handle(
+        &self,
+        _evt: &rustyline::Event,
+        _n: RepeatCount,
+        _positive: bool,
+        _ctx: &EventContext<'_>,
+    ) -> Option<Cmd> {
+        if let Some(tag) = try_grab_clipboard_image_tag() {
+            Some(Cmd::Insert(1, tag))
+        } else {
+            // No image — fall back to rustyline's default Ctrl-V (QuotedInsert).
+            Some(Cmd::QuotedInsert)
+        }
+    }
+}
+
+/// Try to grab an image from the system clipboard, register it in the
+/// [`ImageRegistry`], and return the `<image:HASH>` tag string.
+fn try_grab_clipboard_image_tag() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let img_data = clipboard.get_image().ok()?;
+    let registry = runtime::ImageRegistry::default_cache().ok()?;
+    let rgba: Vec<u8> = img_data.bytes.to_vec();
+    let registered = registry
+        .register_rgba(
+            u32::try_from(img_data.width).unwrap_or(0),
+            u32::try_from(img_data.height).unwrap_or(0),
+            &rgba,
+        )
+        .ok()?;
+    Some(format!("<image:{}>", registered.hash))
+}
+
 /// Accept the line only when it contains non-whitespace text.
 /// When the line is empty, Enter is a no-op.
 struct AcceptNonEmpty;
@@ -142,6 +182,11 @@ impl LineEditor {
         editor.set_helper(Some(SlashCommandHelper::new(completions)));
         editor.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
         editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::SHIFT), Cmd::Newline);
+        // Ctrl+V: check clipboard for image data before falling back to QuotedInsert.
+        editor.bind_sequence(
+            KeyEvent(KeyCode::Char('V'), Modifiers::CTRL),
+            EventHandler::Conditional(Box::new(ImagePasteHandler)),
+        );
         editor.bind_sequence(
             KeyEvent(KeyCode::Enter, Modifiers::NONE),
             EventHandler::Conditional(Box::new(AcceptNonEmpty)),
