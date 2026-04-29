@@ -1320,7 +1320,7 @@ fn run_repl(
                 for hash in pasted_images.keys() {
                     println!("  \x1b[2m📎 [Image #{}] attached\x1b[0m", &hash[..12]);
                 }
-                println!("{separator}");
+                println!();
 
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
                     cli.persist_session()?;
