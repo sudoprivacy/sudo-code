@@ -29,13 +29,18 @@ jobs:
             bin: scode
             package_dir: scode-linux-x64
             archive_name: scode-linux-x64.tar.gz
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            bin: scode
+            package_dir: scode-linux-arm64
+            archive_name: scode-linux-arm64.tar.gz
           - name: macos-arm64
             os: macos-14
             bin: scode
             package_dir: scode-macos-arm64
             archive_name: scode-macos-arm64.tar.gz
           - name: macos-x64
-            os: macos-13
+            os: macos-15-intel
             bin: scode
             package_dir: scode-macos-x64
             archive_name: scode-macos-x64.tar.gz
@@ -44,6 +49,11 @@ jobs:
             bin: scode.exe
             package_dir: scode-windows-x64
             archive_name: scode-windows-x64.zip
+          - name: windows-arm64
+            os: windows-11-arm
+            bin: scode.exe
+            package_dir: scode-windows-arm64
+            archive_name: scode-windows-arm64.zip
     defaults:
       run:
         working-directory: rust
@@ -92,9 +102,29 @@ jobs:
           name: ${{ matrix.package_dir }}
           path: rust/dist/${{ matrix.archive_name }}
 
-      - name: Upload release asset
-        if: startsWith(github.ref, 'refs/tags/')
+  publish-release:
+    name: publish-release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum scode-* > SHA256SUMS.txt
+
+      - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: rust/dist/${{ matrix.archive_name }}
+          files: |
+            dist/scode-*
+            dist/SHA256SUMS.txt
           fail_on_unmatched_files: true
