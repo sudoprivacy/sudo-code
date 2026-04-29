@@ -2333,56 +2333,11 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let turn_start = Instant::now();
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
-        let mut spinner = Spinner::new();
-        let mut stdout = io::stdout();
-        spinner.start(
-            "🦀 Thinking...",
-            Some(self.config.model.as_str()),
-            TerminalRenderer::new().color_theme(),
-        );
-        let pause_flag = spinner.pause_flag();
-        runtime
-            .api_client_mut()
-            .set_spinner_pause(pause_flag.clone());
-        runtime.tool_executor_mut().set_spinner_pause(pause_flag);
-        let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
-        hook_abort_monitor.stop();
-        match result {
-            Ok(summary) => {
-                self.replace_runtime(runtime)?;
-                spinner.clear(&mut stdout)?;
-                if let Some(event) = summary.auto_compaction {
-                    println!(
-                        "{}",
-                        format_auto_compaction_notice(event.removed_message_count)
-                    );
-                }
-                let elapsed = turn_start.elapsed();
-                let usage = self.runtime.usage().current_turn_usage();
-                let turns = self.runtime.usage().turns();
-                println!(
-                    "{}",
-                    format_turn_status_line(&self.config.model, turns, &usage, elapsed)
-                );
-                self.persist_session()?;
-                Ok(())
-            }
-            Err(error) => {
-                runtime.shutdown_plugins()?;
-                spinner.fail(
-                    "❌ Request failed",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                Err(Box::new(error))
-            }
-        }
+        self.run_turn_with_blocks(vec![ContentBlock::Text {
+            text: input.to_string(),
+        }])
     }
 
-    /// Run a turn with pre-resolved content blocks (text + images).
     fn run_turn_with_blocks(
         &mut self,
         blocks: Vec<ContentBlock>,
