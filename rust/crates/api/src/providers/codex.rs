@@ -270,7 +270,13 @@ fn translate_input_message(message: &InputMessage, input: &mut Vec<Value>) {
                             "output": flatten_tool_result(content),
                         }));
                     }
-                    InputContentBlock::ToolUse { .. } | InputContentBlock::Image { .. } => {}
+                    InputContentBlock::Image { source } => {
+                        input.push(json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{};base64,{}", source.media_type, source.data),
+                        }));
+                    }
+                    InputContentBlock::ToolUse { .. } => {}
                 }
             }
         }
