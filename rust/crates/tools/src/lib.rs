@@ -26,8 +26,8 @@ use runtime::{
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
     GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
     LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket,
-    ToolError, ToolExecutor,
+    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session,
+    SystemPrompt, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2614,7 +2614,7 @@ struct AgentOutput {
 struct AgentJob {
     manifest: AgentOutput,
     prompt: String,
-    system_prompt: Vec<String>,
+    system_prompt: SystemPrompt,
     allowed_tools: BTreeSet<String>,
 }
 
@@ -3617,7 +3617,7 @@ fn build_agent_runtime(
     ))
 }
 
-fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
+fn build_agent_system_prompt(subagent_type: &str) -> Result<SystemPrompt, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     let mut prompt = load_system_prompt(
         cwd,
@@ -3626,7 +3626,7 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
         "unknown",
     )
     .map_err(|error| error.to_string())?;
-    prompt.push(format!(
+    prompt.dynamic_sections.push(format!(
         "You are a background sub-agent of type `{subagent_type}`. Work only on the delegated task, use only the tools available to you, do not ask the user questions, and finish with a concise result."
     ));
     Ok(prompt)
@@ -4591,8 +4591,7 @@ impl ApiClient for ProviderRuntimeClient {
             })
             .collect::<Vec<_>>();
         let messages = convert_messages(&request.messages);
-        let system =
-            (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
+        let system = (!request.system_prompt.is_empty()).then(|| request.system_prompt.render());
         let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
 
         let runtime = &self.runtime;
@@ -8497,7 +8496,7 @@ mod tests {
             },
             SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")])),
             agent_permission_policy(),
-            vec![String::from("system prompt")],
+            vec![String::from("system prompt")].into(),
         );
 
         let summary = runtime

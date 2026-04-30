@@ -41,6 +41,56 @@ pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDA
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 
+/// Structured system prompt with an explicit static/dynamic split.
+///
+/// Static sections are stable across requests and suitable for aggressive
+/// caching (e.g. Anthropic prompt caching with `scope: "global"`).
+/// Dynamic sections change per session or per turn and receive a plain
+/// `ephemeral` cache hint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SystemPrompt {
+    pub static_sections: Vec<String>,
+    pub dynamic_sections: Vec<String>,
+}
+
+impl SystemPrompt {
+    /// Concatenate all sections (static then dynamic) into a single prompt string.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut all = self.static_sections.clone();
+        all.extend(self.dynamic_sections.iter().cloned());
+        all.join("\n\n")
+    }
+
+    /// Concatenated static text suitable for a cacheable system block.
+    #[must_use]
+    pub fn static_text(&self) -> String {
+        self.static_sections.join("\n\n")
+    }
+
+    /// Concatenated dynamic text for the per-session system block.
+    #[must_use]
+    pub fn dynamic_text(&self) -> String {
+        self.dynamic_sections.join("\n\n")
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.static_sections.is_empty() && self.dynamic_sections.is_empty()
+    }
+}
+
+/// Convenience conversion: treats all strings as static sections.
+/// Useful in tests and call sites that don't need the static/dynamic split.
+impl From<Vec<String>> for SystemPrompt {
+    fn from(sections: Vec<String>) -> Self {
+        Self {
+            static_sections: sections,
+            dynamic_sections: Vec::new(),
+        }
+    }
+}
+
 /// Contents of an instruction file included in prompt construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextFile {
@@ -138,34 +188,45 @@ impl SystemPromptBuilder {
         self
     }
 
+    /// Build a structured [`SystemPrompt`] with static and dynamic sections
+    /// separated at the [`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`].
     #[must_use]
-    pub fn build(&self) -> Vec<String> {
-        let mut sections = Vec::new();
-        sections.push(get_simple_intro_section(self.output_style_name.is_some()));
+    pub fn build(&self) -> SystemPrompt {
+        let mut static_sections = Vec::new();
+        static_sections.push(get_simple_intro_section(self.output_style_name.is_some()));
         if let (Some(name), Some(prompt)) = (&self.output_style_name, &self.output_style_prompt) {
-            sections.push(format!("# Output Style: {name}\n{prompt}"));
+            static_sections.push(format!("# Output Style: {name}\n{prompt}"));
         }
-        sections.push(get_simple_system_section());
-        sections.push(get_simple_doing_tasks_section());
-        sections.push(get_actions_section());
-        sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
-        sections.push(self.environment_section());
+        static_sections.push(get_simple_system_section());
+        static_sections.push(get_simple_doing_tasks_section());
+        static_sections.push(get_actions_section());
+        static_sections.push(get_using_tools_section());
+        static_sections.push(get_tone_style_section());
+        static_sections.push(get_output_efficiency_section());
+
+        let mut dynamic_sections = Vec::new();
+        dynamic_sections.push(self.environment_section());
         if let Some(project_context) = &self.project_context {
-            sections.push(render_project_context(project_context));
+            dynamic_sections.push(render_project_context(project_context));
             if !project_context.instruction_files.is_empty() {
-                sections.push(render_instruction_files(&project_context.instruction_files));
+                dynamic_sections.push(render_instruction_files(&project_context.instruction_files));
             }
         }
         if let Some(config) = &self.config {
-            sections.push(render_config_section(config));
+            dynamic_sections.push(render_config_section(config));
         }
-        sections.extend(self.append_sections.iter().cloned());
-        sections
+        dynamic_sections.extend(self.append_sections.iter().cloned());
+
+        SystemPrompt {
+            static_sections,
+            dynamic_sections,
+        }
     }
 
+    /// Legacy helper: build and render into a single string.
     #[must_use]
     pub fn render(&self) -> String {
-        self.build().join("\n\n")
+        self.build().render()
     }
 
     fn environment_section(&self) -> String {
@@ -290,7 +351,7 @@ fn render_project_context(project_context: &ProjectContext) -> String {
     ];
     if !project_context.instruction_files.is_empty() {
         bullets.push(format!(
-            "Claude instruction files discovered: {}.",
+            "Project instruction files discovered: {}.",
             project_context.instruction_files.len()
         ));
     }
@@ -325,7 +386,7 @@ fn render_project_context(project_context: &ProjectContext) -> String {
 }
 
 fn render_instruction_files(files: &[ContextFile]) -> String {
-    let mut sections = vec!["# Claude instructions".to_string()];
+    let mut sections = vec!["# Project instructions".to_string()];
     let mut remaining_chars = MAX_TOTAL_INSTRUCTION_CHARS;
     for file in files {
         if remaining_chars == 0 {
@@ -425,13 +486,13 @@ fn collapse_blank_lines(content: &str) -> String {
     result
 }
 
-/// Loads config and project context, then renders the system prompt text.
+/// Loads config and project context, then builds a structured system prompt.
 pub fn load_system_prompt(
     cwd: impl Into<PathBuf>,
     current_date: impl Into<String>,
     os_name: impl Into<String>,
     os_version: impl Into<String>,
-) -> Result<Vec<String>, PromptBuildError> {
+) -> Result<SystemPrompt, PromptBuildError> {
     let cwd = cwd.into();
     let project_context = ProjectContext::discover_with_git(&cwd, current_date.into())?;
     let config = ConfigLoader::default_for(&cwd).load()?;
@@ -514,12 +575,52 @@ fn get_actions_section() -> String {
     .join("\n")
 }
 
+fn get_using_tools_section() -> String {
+    let items = prepend_bullets(vec![
+        "Use Read instead of cat/head/tail to read files; use Edit instead of sed/awk to edit files; use Write instead of echo/heredoc to create files; use Glob instead of find/ls to search for files; use Grep instead of grep/rg to search file contents.".to_string(),
+        "Reserve Bash for system commands and terminal operations that require shell execution.".to_string(),
+        "When committing with git, always use a HEREDOC for the commit message and never skip hooks (--no-verify).".to_string(),
+        "Call multiple tools in a single response when their inputs are independent.".to_string(),
+    ]);
+
+    std::iter::once("# Using your tools".to_string())
+        .chain(items)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn get_tone_style_section() -> String {
+    let items = prepend_bullets(vec![
+        "Keep responses short and concise.".to_string(),
+        "Do not use emojis unless the user explicitly requests them.".to_string(),
+        "When referencing code, use `file_path:line_number` format so the user can navigate easily.".to_string(),
+    ]);
+
+    std::iter::once("# Tone and style".to_string())
+        .chain(items)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn get_output_efficiency_section() -> String {
+    let items = prepend_bullets(vec![
+        "Lead with the answer or action, not the reasoning.".to_string(),
+        "Skip filler words, preamble, and unnecessary transitions.".to_string(),
+        "If you can say it in one sentence, don't use three.".to_string(),
+    ]);
+
+    std::iter::once("# Output efficiency".to_string())
+        .chain(items)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
         render_instruction_content, render_instruction_files, truncate_instruction_content,
-        ContextFile, ProjectContext, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        ContextFile, ProjectContext, SystemPromptBuilder,
     };
     use crate::config::ConfigLoader;
     use std::fs;
@@ -813,11 +914,7 @@ mod tests {
         std::env::set_current_dir(&root).expect("change cwd");
         let prompt = super::load_system_prompt(&root, "2026-03-31", "linux", "6.8")
             .expect("system prompt should load")
-            .join(
-                "
-
-",
-            );
+            .render();
         std::env::set_current_dir(previous).expect("restore cwd");
         if let Some(value) = original_home {
             std::env::set_var("HOME", value);
@@ -859,11 +956,15 @@ mod tests {
             .render();
 
         assert!(prompt.contains("# System"));
+        assert!(prompt.contains("# Doing tasks"));
+        assert!(prompt.contains("# Executing actions with care"));
+        assert!(prompt.contains("# Using your tools"));
+        assert!(prompt.contains("# Tone and style"));
+        assert!(prompt.contains("# Output efficiency"));
         assert!(prompt.contains("# Project context"));
-        assert!(prompt.contains("# Claude instructions"));
+        assert!(prompt.contains("# Project instructions"));
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("permissionMode"));
-        assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -908,7 +1009,7 @@ mod tests {
             path: PathBuf::from("/tmp/project/CLAUDE.md"),
             content: "Project rules".to_string(),
         }]);
-        assert!(rendered.contains("# Claude instructions"));
+        assert!(rendered.contains("# Project instructions"));
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
     }

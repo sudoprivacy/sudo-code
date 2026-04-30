@@ -102,8 +102,8 @@ use runtime::{
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
     ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
     McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
-    ToolError, ToolExecutor, UsageTracker,
+    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, SystemPrompt,
+    TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -724,22 +724,22 @@ fn print_system_prompt(
     date: String,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sections = load_system_prompt(cwd, date, env::consts::OS, "unknown")?;
-    let message = sections.join(
-        "
-
-",
-    );
+    let prompt = load_system_prompt(cwd, date, env::consts::OS, "unknown")?;
+    let message = prompt.render();
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
-        CliOutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "system-prompt",
-                "message": message,
-                "sections": sections,
-            }))?
-        ),
+        CliOutputFormat::Json => {
+            let mut all_sections = prompt.static_sections.clone();
+            all_sections.extend(prompt.dynamic_sections.iter().cloned());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "system-prompt",
+                    "message": message,
+                    "sections": all_sections,
+                }))?
+            );
+        }
     }
     Ok(())
 }
@@ -1387,7 +1387,7 @@ pub(crate) struct RuntimePluginState {
 #[derive(Clone)]
 struct RuntimeConfig {
     model: String,
-    system_prompt: Vec<String>,
+    system_prompt: SystemPrompt,
     enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
@@ -3307,11 +3307,11 @@ fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_jso
     })
 }
 
-fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+fn build_system_prompt() -> Result<SystemPrompt, Box<dyn std::error::Error>> {
     build_system_prompt_for(&env::current_dir()?)
 }
 
-fn build_system_prompt_for(cwd: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+fn build_system_prompt_for(cwd: &Path) -> Result<SystemPrompt, Box<dyn std::error::Error>> {
     Ok(load_system_prompt(
         cwd.to_path_buf(),
         DEFAULT_DATE,

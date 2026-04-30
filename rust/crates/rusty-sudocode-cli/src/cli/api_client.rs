@@ -4,7 +4,8 @@ use api::{
     resolve_startup_auth_source, AnthropicClient, AuthMode, AuthSource, ContentBlockDelta,
     ImageSource, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
     OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    StreamEvent as ApiStreamEvent, SystemCacheBlock, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
@@ -125,17 +126,30 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
+        let system_cache_blocks = (!request.system_prompt.is_empty()).then(|| {
+            vec![
+                SystemCacheBlock {
+                    text: request.system_prompt.static_text(),
+                    cache_scope: Some("global".to_string()),
+                },
+                SystemCacheBlock {
+                    text: request.system_prompt.dynamic_text(),
+                    cache_scope: None,
+                },
+            ]
+        });
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
-            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
+            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.render()),
             tools: self
                 .enable_tools
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
+            system_cache_blocks,
             ..Default::default()
         };
 

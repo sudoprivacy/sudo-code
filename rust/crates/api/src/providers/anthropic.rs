@@ -417,6 +417,7 @@ impl AnthropicClient {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let mut body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut body);
+        apply_system_cache_blocks(&mut body, request);
         self.prepend_oauth_system_prefix(&mut body);
 
         let mut headers: Vec<(String, String)> =
@@ -447,19 +448,29 @@ impl AnthropicClient {
         let Some(obj) = body.as_object_mut() else {
             return;
         };
-        let mut blocks = vec![serde_json::json!({"type": "text", "text": prefix})];
+        let prefix_block = serde_json::json!({"type": "text", "text": prefix});
         if let Some(system_val) = obj.remove("system") {
-            if let Some(s) = system_val.as_str() {
-                if !s.is_empty() {
-                    blocks.push(serde_json::json!({"type": "text", "text": s}));
+            match system_val {
+                Value::String(s) => {
+                    let mut blocks = vec![prefix_block];
+                    if !s.is_empty() {
+                        blocks.push(serde_json::json!({"type": "text", "text": s}));
+                    }
+                    obj.insert("system".to_string(), Value::Array(blocks));
                 }
-            } else {
-                // Already an array or non-string — put it back as-is.
-                obj.insert("system".to_string(), system_val);
-                return;
+                Value::Array(mut arr) => {
+                    // Already an array (e.g. from cache blocks) — prepend the prefix.
+                    arr.insert(0, prefix_block);
+                    obj.insert("system".to_string(), Value::Array(arr));
+                }
+                other => {
+                    // Unknown format — put it back unchanged.
+                    obj.insert("system".to_string(), other);
+                }
             }
+        } else {
+            obj.insert("system".to_string(), Value::Array(vec![prefix_block]));
         }
-        obj.insert("system".to_string(), Value::Array(blocks));
     }
 
     async fn preflight_message_request(&self, request: &MessageRequest) -> Result<(), ApiError> {
@@ -507,6 +518,7 @@ impl AnthropicClient {
         );
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
+        apply_system_cache_blocks(&mut request_body, request);
         self.prepend_oauth_system_prefix(&mut request_body);
         let mut builder = self
             .http
@@ -1001,6 +1013,42 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
         // Strip thought_signature from tool_use content blocks. The API
         // rejects this field when extended thinking is not enabled.
         strip_thought_signatures(object);
+    }
+}
+
+/// When `system_cache_blocks` is present on the request, replace the flat
+/// `system` string in the JSON body with an array of text content blocks
+/// carrying Anthropic `cache_control` hints.
+///
+/// Static blocks get `{"type": "ephemeral", "scope": "<scope>"}` and
+/// dynamic blocks get `{"type": "ephemeral"}`.
+fn apply_system_cache_blocks(body: &mut Value, request: &MessageRequest) {
+    let Some(blocks) = &request.system_cache_blocks else {
+        return;
+    };
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+
+    let json_blocks: Vec<Value> = blocks
+        .iter()
+        .filter(|b| !b.text.is_empty())
+        .map(|block| {
+            let cache_control = if let Some(scope) = &block.cache_scope {
+                serde_json::json!({"type": "ephemeral", "scope": scope})
+            } else {
+                serde_json::json!({"type": "ephemeral"})
+            };
+            serde_json::json!({
+                "type": "text",
+                "text": block.text,
+                "cache_control": cache_control,
+            })
+        })
+        .collect();
+
+    if !json_blocks.is_empty() {
+        obj.insert("system".to_string(), Value::Array(json_blocks));
     }
 }
 

@@ -31,6 +31,25 @@ pub struct MessageRequest {
     /// Silently ignored by backends that do not support it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+
+    /// Structured system content blocks for providers that support cache
+    /// control (Anthropic). Each entry is `(text, cache_scope)` where
+    /// `cache_scope` is `Some("global")` for static content or `None`
+    /// for ephemeral/session-specific content.
+    ///
+    /// When present, providers that support structured system content
+    /// will use these blocks instead of the flat `system` string.
+    #[serde(skip)]
+    pub system_cache_blocks: Option<Vec<SystemCacheBlock>>,
+}
+
+/// A system content block with optional cache control metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemCacheBlock {
+    pub text: String,
+    /// Anthropic cache scope. `Some("global")` for static content,
+    /// `None` for ephemeral per-session content.
+    pub cache_scope: Option<String>,
 }
 
 impl MessageRequest {
