@@ -241,6 +241,14 @@ impl GlobalToolRegistry {
             }
         }
 
+        if allowed.is_empty() {
+            return Err(
+                "--allowedTools received only empty or whitespace-only tokens; \
+                 pass at least one valid tool name"
+                    .to_string(),
+            );
+        }
+
         Ok(Some(allowed))
     }
 
@@ -9525,6 +9533,46 @@ printf 'pwsh:%s' "$1"
         assert_eq!(
             output["task_packet"]["acceptance_tests"][1],
             "cargo test --workspace"
+        );
+    }
+
+    #[test]
+    fn allowed_tools_rejects_empty_token_lists() {
+        let registry = GlobalToolRegistry::builtin();
+
+        // all-empty string
+        assert!(
+            registry
+                .normalize_allowed_tools(&["".to_string()])
+                .is_err()
+        );
+
+        // commas only
+        assert!(
+            registry
+                .normalize_allowed_tools(&[",,".to_string()])
+                .is_err()
+        );
+
+        // whitespace only
+        assert!(
+            registry
+                .normalize_allowed_tools(&["   ".to_string()])
+                .is_err()
+        );
+
+        // multiple values that are all empty/whitespace
+        assert!(
+            registry
+                .normalize_allowed_tools(&["".to_string(), "  ".to_string(), ",".to_string()])
+                .is_err()
+        );
+
+        // valid tool name should still work fine
+        assert!(
+            registry
+                .normalize_allowed_tools(&["read_file".to_string()])
+                .is_ok()
         );
     }
 

@@ -401,11 +401,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model_flag_raw,
             permission_mode,
             output_format,
+            allowed_tools,
         } => print_status_snapshot(
             &model,
             model_flag_raw.as_deref(),
             permission_mode,
             output_format,
+            allowed_tools.as_ref(),
         )?,
         CliAction::Sandbox { output_format } => print_sandbox_status_snapshot(output_format)?,
         CliAction::Prompt {
@@ -1006,6 +1008,7 @@ fn run_resume_command(
                     default_permission_mode().as_str(),
                     &context,
                     None, // #148: resumed sessions don't have flag provenance
+                    None, // resumed sessions don't have an --allowedTools flag
                 )),
             })
         }

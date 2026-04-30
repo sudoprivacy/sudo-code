@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -46,6 +47,7 @@ pub(crate) fn print_status_snapshot(
     model_flag_raw: Option<&str>,
     permission_mode: runtime::PermissionMode,
     output_format: CliOutputFormat,
+    allowed_tools: Option<&BTreeSet<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let usage = StatusUsage {
         message_count: 0,
@@ -85,6 +87,7 @@ pub(crate) fn print_status_snapshot(
                 permission_mode.as_str(),
                 &context,
                 Some(&provenance),
+                allowed_tools,
             ))?
         ),
     }
@@ -102,6 +105,7 @@ pub(crate) fn status_json_value(
     // that don't have provenance (legacy resume paths) pass None, in which
     // case both new fields are omitted.
     provenance: Option<&ModelProvenance>,
+    allowed_tools: Option<&BTreeSet<String>>,
 ) -> serde_json::Value {
     // #143: top-level `status` marker so consumers can distinguish
     // a clean run from a degraded run (config parse failed but other fields
@@ -111,6 +115,14 @@ pub(crate) fn status_json_value(
     let degraded = context.config_load_error.is_some();
     let model_source = provenance.map(|p| p.source.as_str());
     let model_raw = provenance.and_then(|p| p.raw.clone());
+    let allowed_tools_value = match allowed_tools {
+        None => json!({ "source": "default", "restricted": false, "entries": null }),
+        Some(tools) => json!({
+            "source": "flag",
+            "restricted": true,
+            "entries": tools.iter().collect::<Vec<_>>(),
+        }),
+    };
     json!({
         "kind": "status",
         "status": if degraded { "degraded" } else { "ok" },
@@ -119,6 +131,7 @@ pub(crate) fn status_json_value(
         "model_source": model_source,
         "model_raw": model_raw,
         "permission_mode": permission_mode,
+        "allowed_tools": allowed_tools_value,
         "usage": {
             "messages": usage.message_count,
             "turns": usage.turns,
@@ -373,4 +386,70 @@ pub(crate) fn print_version(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::{status_json_value, StatusContext, StatusUsage};
+    use crate::cli::git::GitWorkspaceSummary;
+
+    fn minimal_context() -> StatusContext {
+        StatusContext {
+            cwd: std::path::PathBuf::from("/tmp"),
+            session_path: None,
+            loaded_config_files: 0,
+            discovered_config_files: 0,
+            memory_file_count: 0,
+            project_root: None,
+            git_branch: None,
+            git_summary: GitWorkspaceSummary::default(),
+            sandbox_status: runtime::SandboxStatus::default(),
+            config_load_error: None,
+        }
+    }
+
+    fn minimal_usage() -> StatusUsage {
+        StatusUsage {
+            message_count: 0,
+            turns: 0,
+            latest: runtime::TokenUsage::default(),
+            cumulative: runtime::TokenUsage::default(),
+            estimated_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn status_json_allowed_tools_default_unrestricted() {
+        let ctx = minimal_context();
+        let val = status_json_value(None, minimal_usage(), "read-only", &ctx, None, None);
+        let at = &val["allowed_tools"];
+        assert_eq!(at["source"], "default");
+        assert_eq!(at["restricted"], false);
+        assert!(at["entries"].is_null());
+    }
+
+    #[test]
+    fn status_json_allowed_tools_flag_restricted() {
+        let ctx = minimal_context();
+        let mut tools = BTreeSet::new();
+        tools.insert("read_file".to_string());
+        tools.insert("write_file".to_string());
+        let val = status_json_value(
+            None,
+            minimal_usage(),
+            "read-only",
+            &ctx,
+            None,
+            Some(&tools),
+        );
+        let at = &val["allowed_tools"];
+        assert_eq!(at["source"], "flag");
+        assert_eq!(at["restricted"], true);
+        let entries = at["entries"].as_array().expect("entries should be an array");
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|e| e == "read_file"));
+        assert!(entries.iter().any(|e| e == "write_file"));
+    }
 }

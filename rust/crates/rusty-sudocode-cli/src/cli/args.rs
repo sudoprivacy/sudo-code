@@ -257,6 +257,7 @@ pub(crate) enum CliAction {
         model_flag_raw: Option<String>,
         permission_mode: PermissionMode,
         output_format: CliOutputFormat,
+        allowed_tools: Option<AllowedToolSet>,
     },
     Sandbox {
         output_format: CliOutputFormat,
@@ -439,6 +440,7 @@ fn convert_cli_to_action(cli: Cli) -> Result<CliAction, String> {
                 model_flag_raw,
                 permission_mode,
                 output_format,
+                allowed_tools: allowed_tools.clone(),
             }),
             Cmd::Sandbox => Ok(CliAction::Sandbox { output_format }),
             Cmd::Doctor => Ok(CliAction::Doctor { output_format }),
