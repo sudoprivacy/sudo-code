@@ -521,7 +521,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn run_login() -> Result<(), Box<dyn std::error::Error>> {
     let token_set = runtime::import_claude_code_credentials()
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    eprintln!("Login successful — imported credentials from Sudo Code.");
+    eprintln!("Login successful — imported credentials from Claude Code.");
     if !token_set.scopes.is_empty() {
         eprintln!("Scopes: {}", token_set.scopes.join(", "));
     }

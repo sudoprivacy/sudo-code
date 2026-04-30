@@ -565,7 +565,7 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  scode login")?;
     writeln!(
         out,
-        "      Import OAuth credentials from Sudo Code's keychain"
+        "      Import OAuth credentials from Claude Code's keychain"
     )?;
     writeln!(out, "  scode logout")?;
     writeln!(
