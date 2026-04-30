@@ -367,6 +367,7 @@ impl AnthropicClient {
             latest_usage: None,
             usage_recorded: false,
             last_prompt_cache_record: Arc::clone(&self.last_prompt_cache_record),
+            session_tracer: self.session_tracer().cloned(),
         })
     }
 
@@ -823,6 +824,7 @@ pub struct MessageStream {
     latest_usage: Option<Usage>,
     usage_recorded: bool,
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
+    session_tracer: Option<SessionTracer>,
 }
 
 impl MessageStream {
@@ -865,14 +867,22 @@ impl MessageStream {
             }
             StreamEvent::MessageStop(_) => {
                 if !self.usage_recorded {
-                    if let (Some(prompt_cache), Some(usage)) =
-                        (&self.prompt_cache, self.latest_usage.as_ref())
-                    {
-                        let record = prompt_cache.record_usage(&self.request, usage);
-                        *self
-                            .last_prompt_cache_record
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+                    if let Some(usage) = self.latest_usage.as_ref() {
+                        if let Some(prompt_cache) = &self.prompt_cache {
+                            let record = prompt_cache.record_usage(&self.request, usage);
+                            *self
+                                .last_prompt_cache_record
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+                        }
+                        if let Some(tracer) = &self.session_tracer {
+                            tracer.record_usage(
+                                usage.input_tokens,
+                                usage.output_tokens,
+                                usage.cache_creation_input_tokens,
+                                usage.cache_read_input_tokens,
+                            );
+                        }
                     }
                     self.usage_recorded = true;
                 }
