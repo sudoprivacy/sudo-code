@@ -165,7 +165,7 @@ fn bootstrap_and_system_prompt_emit_json_when_requested() {
     assert!(prompt["message"]
         .as_str()
         .expect("prompt text")
-        .contains("interactive agent"));
+        .contains("interactive AI coding agent"));
 }
 
 #[test]
