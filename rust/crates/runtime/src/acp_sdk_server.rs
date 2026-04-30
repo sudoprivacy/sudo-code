@@ -94,8 +94,9 @@ pub(crate) struct SetPermissionModeResponse {}
 /// this crate.
 pub trait SdkAcpDelegate: Send + 'static {
     /// Create a new session for the given working directory, returning
-    /// `(session_id, cwd)` on success.
-    fn new_session(&mut self, cwd: PathBuf) -> Result<(String, PathBuf), AcpError>;
+    /// `(session_id, cwd, abort_signal)` on success.
+    fn new_session(&mut self, cwd: PathBuf)
+        -> Result<(String, PathBuf, HookAbortSignal), AcpError>;
 
     /// Run a prompt turn. The implementation should call observer methods
     /// to stream session updates.
@@ -129,14 +130,6 @@ pub trait SdkAcpDelegate: Send + 'static {
     /// Close (drop) a session by ID. Returns true if it existed.
     fn close_session(&mut self, session_id: &str) -> bool;
 
-    /// Cancel a running prompt for the given session by setting its abort
-    /// signal. Returns true if the session exists.
-    fn cancel_session(&mut self, session_id: &str) -> bool;
-
-    /// Return the abort signal for a session so it can be triggered without
-    /// holding the delegate lock.
-    fn get_abort_signal(&self, session_id: &str) -> Option<HookAbortSignal>;
-
     /// Switch the model for a session. Returns a human-readable report.
     fn set_model(&mut self, session_id: &str, model_id: &str) -> Result<String, AcpError>;
 
@@ -158,12 +151,12 @@ pub trait SdkAcpDelegate: Send + 'static {
     ) -> Result<(), AcpError>;
 
     /// Load an existing persisted session by its ID and working directory,
-    /// returning `(session_id, cwd)` on success.
+    /// returning `(session_id, cwd, abort_signal)` on success.
     fn load_session(
         &mut self,
         session_id: &str,
         cwd: PathBuf,
-    ) -> Result<(String, PathBuf), AcpError>;
+    ) -> Result<(String, PathBuf, HookAbortSignal), AcpError>;
 }
 
 /// Observer that streams session update notifications to the ACP client in
@@ -309,7 +302,15 @@ pub type SharedDelegate = Arc<Mutex<Box<dyn SdkAcpDelegate>>>;
 
 /// Separate registry of abort signals so that `session/cancel` can fire
 /// without contending on the main delegate mutex.
-type AbortRegistry = Arc<Mutex<HashMap<String, HookAbortSignal>>>;
+pub type AbortRegistry = Arc<Mutex<HashMap<String, HookAbortSignal>>>;
+
+/// Create a new empty abort registry. Share this across connections so that
+/// cancel notifications on a reconnected transport can still reach sessions
+/// created on a previous connection.
+#[must_use]
+pub fn new_abort_registry() -> AbortRegistry {
+    Arc::new(Mutex::new(HashMap::new()))
+}
 
 /// A permission prompter that bridges to the ACP client over channels.
 ///
@@ -419,10 +420,10 @@ fn uuid_v4() -> String {
 pub(crate) async fn run_acp_on_transport(
     config: &SdkAcpConfig,
     delegate: SharedDelegate,
+    abort_registry: AbortRegistry,
     transport: impl ConnectTo<Agent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let agent_version = config.agent_version.clone();
-    let abort_registry: AbortRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     Agent
         .builder()
@@ -462,23 +463,19 @@ pub(crate) async fn run_acp_on_transport(
                     let registry = Arc::clone(&abort_registry);
                     cx.spawn(async move {
                         let result = tokio::task::spawn_blocking(move || {
-                            let mut delegate =
-                                d.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                            let res = delegate.new_session(req.cwd)?;
-                            let signal = delegate.get_abort_signal(&res.0);
-                            Ok((res.0, res.1, signal))
+                            d.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .new_session(req.cwd)
                         })
                         .await
                         .unwrap_or_else(|e| Err(AcpError::internal(e.to_string())));
 
                         match result {
                             Ok((session_id, _cwd, signal)) => {
-                                if let Some(sig) = signal {
-                                    registry
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .insert(session_id.clone(), sig);
-                                }
+                                registry
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .insert(session_id.clone(), signal);
                                 responder.respond(NewSessionResponse::new(session_id))?;
                             }
                             Err(e) => {
@@ -763,23 +760,19 @@ pub(crate) async fn run_acp_on_transport(
                     let cwd = req.cwd;
                     cx.spawn(async move {
                         let result = tokio::task::spawn_blocking(move || {
-                            let mut delegate =
-                                d.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                            let res = delegate.load_session(&sid, cwd)?;
-                            let signal = delegate.get_abort_signal(&res.0);
-                            Ok((res.0, res.1, signal))
+                            d.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .load_session(&sid, cwd)
                         })
                         .await
                         .unwrap_or_else(|e| Err(AcpError::internal(e.to_string())));
 
                         match result {
                             Ok((session_id, _cwd, signal)) => {
-                                if let Some(sig) = signal {
-                                    registry
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .insert(session_id, sig);
-                                }
+                                registry
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .insert(session_id, signal);
                                 responder.respond(LoadSessionResponse::new())?;
                             }
                             Err(e) => {

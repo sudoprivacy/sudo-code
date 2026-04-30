@@ -64,8 +64,10 @@ body { display: flex; flex-direction: column; }
 .input-bar input { flex: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; font-size: 14px; outline: none; }
 .input-bar input:focus { border-color: var(--accent); }
 .input-bar input:disabled { opacity: 0.5; }
-.send-btn { background: var(--accent); color: var(--bg); border: none; border-radius: 6px; padding: 8px 16px; cursor: pointer; font-weight: 600; font-size: 14px; }
+.send-btn { background: var(--accent); color: var(--bg); border: none; border-radius: 6px; padding: 8px 16px; cursor: pointer; font-weight: 600; font-size: 14px; min-width: 80px; }
 .send-btn:disabled { opacity: 0.4; cursor: default; }
+.send-btn.cancel { background: var(--err); cursor: pointer; opacity: 1; }
+.send-btn.cancelling { background: var(--err); opacity: 0.5; cursor: default; }
 </style>
 </head>
 <body>
@@ -116,6 +118,7 @@ body { display: flex; flex-direction: column; }
   let currentSession = '';
   let pendingCallbacks = {};
   let agentMsgEl = null; // accumulator for streaming agent text
+  let prompting = false; // true while a prompt is in-flight
 
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -151,6 +154,12 @@ body { display: flex; flex-direction: column; }
     logInspector('out', msg);
     ws.send(JSON.stringify(msg));
     return new Promise(resolve => { pendingCallbacks[id] = resolve; });
+  }
+
+  function sendNotification(method, params) {
+    const msg = { jsonrpc: '2.0', method, params: params || {} };
+    logInspector('out', msg);
+    ws.send(JSON.stringify(msg));
   }
 
   async function doInitialize() {
@@ -192,13 +201,38 @@ body { display: flex; flex-direction: column; }
     }
   }
 
+  function setPrompting(active) {
+    prompting = active;
+    inputEl.disabled = active;
+    if (active) {
+      sendBtn.disabled = false;
+      sendBtn.textContent = 'Cancel';
+      sendBtn.classList.remove('cancelling');
+      sendBtn.classList.add('cancel');
+    } else {
+      sendBtn.disabled = false;
+      sendBtn.textContent = 'Send';
+      sendBtn.classList.remove('cancel');
+      sendBtn.classList.remove('cancelling');
+    }
+  }
+
+  function cancelPrompt() {
+    if (!prompting || !currentSession) return;
+    sendNotification('session/cancel', { sessionId: currentSession });
+    // Immediately show "Cancelling..." so the user knows it was received.
+    sendBtn.textContent = 'Cancelling\u2026';
+    sendBtn.classList.remove('cancel');
+    sendBtn.classList.add('cancelling');
+    sendBtn.disabled = true;
+  }
+
   async function sendPrompt(text) {
     if (!currentSession || !text.trim()) return;
     addChatMsg('user', text);
     inputEl.value = '';
-    inputEl.disabled = true;
-    sendBtn.disabled = true;
     agentMsgEl = null;
+    setPrompting(true);
 
     const resp = await sendRpc('session/prompt', {
       sessionId: currentSession,
@@ -207,8 +241,7 @@ body { display: flex; flex-direction: column; }
 
     // Finalize any streaming agent message
     agentMsgEl = null;
-    inputEl.disabled = false;
-    sendBtn.disabled = false;
+    setPrompting(false);
     inputEl.focus();
   }
 
@@ -297,11 +330,16 @@ body { display: flex; flex-direction: column; }
   }
 
   // Event listeners
-  sendBtn.addEventListener('click', () => sendPrompt(inputEl.value));
+  sendBtn.addEventListener('click', () => {
+    if (prompting) { cancelPrompt(); } else { sendPrompt(inputEl.value); }
+  });
   inputEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !inputEl.disabled) {
       e.preventDefault();
       sendPrompt(inputEl.value);
+    }
+    if (e.key === 'Escape' && prompting) {
+      cancelPrompt();
     }
   });
   newSessionBtn.addEventListener('click', createNewSession);
