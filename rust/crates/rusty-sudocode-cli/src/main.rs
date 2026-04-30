@@ -364,7 +364,12 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    match parse_args(&args)? {
+    let action = parse_args(&args)?;
+    // Informational commands (help, version, config, login, logout) are
+    // dispatched immediately and must never block on a credential check.
+    // If an ensure_authenticated() call is ever added below this point it
+    // MUST be guarded by `if !action.is_informational()`.
+    match action {
         CliAction::DumpManifests {
             output_format,
             manifests_dir,

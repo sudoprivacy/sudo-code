@@ -320,6 +320,24 @@ pub(crate) enum CliAction {
     Logout,
 }
 
+impl CliAction {
+    /// Returns `true` for commands that report local state or usage information
+    /// and must never require authentication to run. These variants are
+    /// dispatched before any credential check so they work even when the user
+    /// has not logged in yet.
+    pub(crate) fn is_informational(&self) -> bool {
+        matches!(
+            self,
+            CliAction::Help { .. }
+                | CliAction::Version { .. }
+                | CliAction::HelpTopic(_)
+                | CliAction::Config { .. }
+                | CliAction::Login
+                | CliAction::Logout
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalHelpTopic {
     Status,
@@ -1049,4 +1067,47 @@ pub(crate) fn resolve_repl_model(cli_model: String) -> String {
         return resolve_model_alias_with_config(&config_model);
     }
     cli_model
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn informational_variants_are_whitelisted() {
+        assert!(CliAction::Help {
+            output_format: CliOutputFormat::Text
+        }
+        .is_informational());
+        assert!(CliAction::Version {
+            output_format: CliOutputFormat::Json
+        }
+        .is_informational());
+        assert!(CliAction::HelpTopic(LocalHelpTopic::Status).is_informational());
+        assert!(CliAction::Config {
+            section: None,
+            output_format: CliOutputFormat::Text
+        }
+        .is_informational());
+        assert!(CliAction::Login.is_informational());
+        assert!(CliAction::Logout.is_informational());
+    }
+
+    #[test]
+    fn non_informational_variants_are_not_whitelisted() {
+        assert!(!CliAction::Doctor {
+            output_format: CliOutputFormat::Text
+        }
+        .is_informational());
+        assert!(!CliAction::Repl {
+            model: "opus".to_string(),
+            allowed_tools: None,
+            permission_mode: PermissionMode::DangerFullAccess,
+            base_commit: None,
+            reasoning_effort: None,
+            allow_broad_cwd: false,
+            auth_mode: None,
+        }
+        .is_informational());
+    }
 }
