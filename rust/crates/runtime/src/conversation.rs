@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::pin::Pin;
 
+use async_trait::async_trait;
+use futures::stream::Stream;
+use futures::StreamExt;
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
@@ -18,6 +22,9 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+
+/// Message used in synthetic tool results when a turn is interrupted.
+const INTERRUPT_MESSAGE: &str = "Interrupted · What should Sudo Code do instead?";
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,9 +58,21 @@ pub struct PromptCacheEvent {
     pub token_drop: u32,
 }
 
+/// A boxed asynchronous stream of assistant events, produced by [`ApiClient::stream`].
+///
+/// Dropping the stream cancels the underlying HTTP request, ensuring unused
+/// tokens are not consumed when a turn is aborted.
+pub type AssistantEventStream =
+    Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send>>;
+
 /// Minimal streaming API contract required by [`ConversationRuntime`].
+///
+/// Implementations return an asynchronous stream of events instead of a
+/// collected `Vec`, enabling the runtime to race each event against an
+/// abort signal for instant cancellation.
+#[async_trait]
 pub trait ApiClient: Send {
-    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
+    async fn stream(&mut self, request: ApiRequest) -> Result<AssistantEventStream, RuntimeError>;
 }
 
 /// Optional observer for runtime events emitted while processing a turn.
@@ -123,7 +142,8 @@ impl Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
-/// Summary of one completed runtime turn, including tool results and usage.
+/// Summary of one completed (or cancelled) runtime turn, including tool
+/// results and usage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnSummary {
     pub assistant_messages: Vec<ConversationMessage>,
@@ -132,6 +152,11 @@ pub struct TurnSummary {
     pub iterations: usize,
     pub usage: TokenUsage,
     pub auto_compaction: Option<AutoCompactionEvent>,
+    /// `true` when the turn was interrupted by the abort signal.  Partial
+    /// progress (user message, streamed assistant text, synthetic tool
+    /// results, interruption marker) has already been committed to the
+    /// session so the model has full context on the next turn.
+    pub cancelled: bool,
 }
 
 /// Details about automatic session compaction applied during a turn.
@@ -328,8 +353,79 @@ where
         }
     }
 
+    /// Preserve partial progress when a turn is cancelled.
+    ///
+    /// 1. Build an assistant message from whatever events were collected
+    ///    before the abort signal fired.  An `[interrupted]` text block is
+    ///    appended so the model can see which turn was cancelled.
+    /// 2. Push the partial assistant message to the session.
+    /// 3. For every `tool_use` block in that partial message, generate a
+    ///    synthetic `tool_result` with `is_error: true` so the API contract
+    ///    (every `tool_use` must have a matching `tool_result`) is maintained.
+    fn finalize_cancelled_turn(&mut self, events: Vec<AssistantEvent>) {
+        // Build partial assistant message from whatever events arrived.
+        let mut text = String::new();
+        let mut blocks = Vec::new();
+        for event in events {
+            match event {
+                AssistantEvent::TextDelta(delta) => text.push_str(&delta),
+                AssistantEvent::ToolUse {
+                    id,
+                    name,
+                    input,
+                    thought_signature,
+                } => {
+                    flush_text_block(&mut text, &mut blocks);
+                    blocks.push(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        thought_signature,
+                    });
+                }
+                AssistantEvent::Usage(_)
+                | AssistantEvent::PromptCache(_)
+                | AssistantEvent::MessageStop => {}
+            }
+        }
+        flush_text_block(&mut text, &mut blocks);
+
+        // Append an [interrupted] marker to the assistant message so the
+        // model knows this turn was cancelled.  This stays attached to the
+        // assistant turn (not a separate user message) so attribution is
+        // correct.
+        blocks.push(ContentBlock::Text {
+            text: format!("\n\n[{INTERRUPT_MESSAGE}]"),
+        });
+
+        // Extract tool_use ids before pushing the assistant message.
+        let pending_tool_ids: Vec<(String, String)> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, name, .. } => Some((id.clone(), name.clone())),
+                _ => None,
+            })
+            .collect();
+
+        // Push the partial assistant message.
+        let _ = self
+            .session
+            .push_message(ConversationMessage::assistant(blocks));
+
+        // Generate synthetic error tool_results for any tool_use blocks
+        // that never got real results.
+        for (tool_use_id, tool_name) in pending_tool_ids {
+            let _ = self.session.push_message(ConversationMessage::tool_result(
+                tool_use_id,
+                tool_name,
+                INTERRUPT_MESSAGE,
+                true,
+            ));
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
-    pub fn run_turn(
+    pub async fn run_turn(
         &mut self,
         user_input: impl Into<String>,
         prompter: Option<&mut dyn PermissionPrompter>,
@@ -337,13 +433,19 @@ where
     ) -> Result<TurnSummary, RuntimeError> {
         let text = user_input.into();
         self.run_turn_with_blocks(vec![ContentBlock::Text { text }], prompter, observer)
+            .await
     }
 
     /// Run a conversation turn with pre-built content blocks (e.g. text +
     /// image).  [`run_turn`](Self::run_turn) is a convenience wrapper that
     /// creates a single `Text` block and delegates here.
+    ///
+    /// The stream returned by the API client is consumed event-by-event using
+    /// [`tokio::select!`], racing each event against the hook abort signal.
+    /// When cancellation fires the stream is dropped immediately, which closes
+    /// the underlying HTTP connection and stops token consumption.
     #[allow(clippy::too_many_lines)]
-    pub fn run_turn_with_blocks(
+    pub async fn run_turn_with_blocks(
         &mut self,
         blocks: Vec<ContentBlock>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
@@ -379,7 +481,16 @@ where
 
         loop {
             if self.hook_abort_signal.is_aborted() {
-                return Err(RuntimeError::new("turn cancelled by abort signal"));
+                self.finalize_cancelled_turn(Vec::new());
+                return Ok(TurnSummary {
+                    assistant_messages: Vec::new(),
+                    tool_results: Vec::new(),
+                    prompt_cache_events: Vec::new(),
+                    iterations,
+                    usage: self.usage_tracker.cumulative_usage(),
+                    auto_compaction: None,
+                    cancelled: true,
+                });
             }
 
             iterations += 1;
@@ -395,13 +506,52 @@ where
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
             };
-            let events = match self.api_client.stream(request) {
-                Ok(events) => events,
+            let mut stream = match self.api_client.stream(request).await {
+                Ok(stream) => stream,
                 Err(error) => {
                     self.record_turn_failed(iterations, &error);
                     return Err(error);
                 }
             };
+
+            // Consume the stream event-by-event, racing against the abort
+            // signal so cancellation drops the HTTP connection immediately.
+            let events = {
+                let abort = &self.hook_abort_signal;
+                let mut collected = Vec::new();
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = abort.cancelled() => {
+                            // Drop the stream to close the HTTP connection
+                            // and stop token consumption.
+                            drop(stream);
+                            self.finalize_cancelled_turn(collected);
+                            return Ok(TurnSummary {
+                                assistant_messages: Vec::new(),
+                                tool_results: Vec::new(),
+                                prompt_cache_events: Vec::new(),
+                                iterations,
+                                usage: self.usage_tracker.cumulative_usage(),
+                                auto_compaction: None,
+                                cancelled: true,
+                            });
+                        }
+                        next = stream.next() => {
+                            match next {
+                                Some(Ok(event)) => collected.push(event),
+                                Some(Err(error)) => {
+                                    self.record_turn_failed(iterations, &error);
+                                    return Err(error);
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                }
+                collected
+            };
+
             let (assistant_message, usage, turn_prompt_cache_events) =
                 match build_assistant_message(events, runtime_observer_mut(&mut observer)) {
                     Ok(result) => result,
@@ -551,6 +701,7 @@ where
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
+            cancelled: false,
         };
         self.record_turn_completed(&summary);
 
@@ -927,8 +1078,8 @@ impl ToolExecutor for StaticToolExecutor {
 mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        RuntimeObserver, StaticToolExecutor, ToolExecutor,
+        AssistantEvent, AssistantEventStream, AutoCompactionEvent, ConversationRuntime,
+        PromptCacheEvent, RuntimeError, RuntimeObserver, StaticToolExecutor, ToolExecutor,
         DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
@@ -941,18 +1092,28 @@ mod tests {
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
     use crate::ToolError;
+    use async_trait::async_trait;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
+    /// Helper: convert a `Vec<AssistantEvent>` into an [`AssistantEventStream`].
+    fn events_to_stream(events: Vec<AssistantEvent>) -> AssistantEventStream {
+        Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
+    }
+
     struct ScriptedApiClient {
         call_count: usize,
     }
 
+    #[async_trait]
     impl ApiClient for ScriptedApiClient {
-        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        async fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Result<AssistantEventStream, RuntimeError> {
             self.call_count += 1;
             match self.call_count {
                 1 => {
@@ -960,7 +1121,7 @@ mod tests {
                         .messages
                         .iter()
                         .any(|message| message.role == MessageRole::User));
-                    Ok(vec![
+                    Ok(events_to_stream(vec![
                         AssistantEvent::TextDelta("Let me calculate that.".to_string()),
                         AssistantEvent::ToolUse {
                             id: "tool-1".to_string(),
@@ -975,7 +1136,7 @@ mod tests {
                             cache_read_input_tokens: 2,
                         }),
                         AssistantEvent::MessageStop,
-                    ])
+                    ]))
                 }
                 2 => {
                     let last_message = request
@@ -983,7 +1144,7 @@ mod tests {
                         .last()
                         .expect("tool result should be present");
                     assert_eq!(last_message.role, MessageRole::Tool);
-                    Ok(vec![
+                    Ok(events_to_stream(vec![
                         AssistantEvent::TextDelta("The answer is 4.".to_string()),
                         AssistantEvent::Usage(TokenUsage {
                             input_tokens: 24,
@@ -1001,7 +1162,7 @@ mod tests {
                             token_drop: 5_000,
                         }),
                         AssistantEvent::MessageStop,
-                    ])
+                    ]))
                 }
                 _ => unreachable!("extra API call"),
             }
@@ -1068,8 +1229,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn runs_user_to_tool_to_result_loop_end_to_end_and_tracks_usage() {
+    #[tokio::test]
+    async fn runs_user_to_tool_to_result_loop_end_to_end_and_tracks_usage() {
         let api_client = ScriptedApiClient { call_count: 0 };
         let tool_executor = StaticToolExecutor::new().register("add", |input| {
             let total = input
@@ -1100,6 +1261,7 @@ mod tests {
 
         let summary = runtime
             .run_turn("what is 2 + 2?", Some(&mut PromptAllowOnce), None)
+            .await
             .expect("conversation loop should succeed");
 
         assert_eq!(summary.iterations, 2);
@@ -1122,8 +1284,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn records_runtime_session_trace_events() {
+    #[tokio::test]
+    async fn records_runtime_session_trace_events() {
         let sink = Arc::new(MemoryTelemetrySink::default());
         let tracer = SessionTracer::new("session-runtime", sink.clone());
         let mut runtime = ConversationRuntime::new(
@@ -1137,6 +1299,7 @@ mod tests {
 
         runtime
             .run_turn("what is 2 + 2?", Some(&mut PromptAllowOnce), None)
+            .await
             .expect("conversation loop should succeed");
 
         let events = sink.events();
@@ -1155,8 +1318,8 @@ mod tests {
         assert!(trace_names.contains(&"turn_completed"));
     }
 
-    #[test]
-    fn records_denied_tool_results_when_prompt_rejects() {
+    #[tokio::test]
+    async fn records_denied_tool_results_when_prompt_rejects() {
         struct RejectPrompter;
         impl PermissionPrompter for RejectPrompter {
             fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
@@ -1167,19 +1330,23 @@ mod tests {
         }
 
         struct SingleCallApiClient;
+        #[async_trait]
         impl ApiClient for SingleCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            async fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<AssistantEventStream, RuntimeError> {
                 if request
                     .messages
                     .iter()
                     .any(|message| message.role == MessageRole::Tool)
                 {
-                    return Ok(vec![
+                    return Ok(events_to_stream(vec![
                         AssistantEvent::TextDelta("I could not use the tool.".to_string()),
                         AssistantEvent::MessageStop,
-                    ]);
+                    ]));
                 }
-                Ok(vec![
+                Ok(events_to_stream(vec![
                     AssistantEvent::ToolUse {
                         id: "tool-1".to_string(),
                         name: "blocked".to_string(),
@@ -1187,7 +1354,7 @@ mod tests {
                         thought_signature: None,
                     },
                     AssistantEvent::MessageStop,
-                ])
+                ]))
             }
         }
 
@@ -1201,6 +1368,7 @@ mod tests {
 
         let summary = runtime
             .run_turn("use the tool", Some(&mut RejectPrompter), None)
+            .await
             .expect("conversation should continue after denied tool");
 
         assert_eq!(summary.tool_results.len(), 1);
@@ -1210,22 +1378,26 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn denies_tool_use_when_pre_tool_hook_blocks() {
+    #[tokio::test]
+    async fn denies_tool_use_when_pre_tool_hook_blocks() {
         struct SingleCallApiClient;
+        #[async_trait]
         impl ApiClient for SingleCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            async fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<AssistantEventStream, RuntimeError> {
                 if request
                     .messages
                     .iter()
                     .any(|message| message.role == MessageRole::Tool)
                 {
-                    return Ok(vec![
+                    return Ok(events_to_stream(vec![
                         AssistantEvent::TextDelta("blocked".to_string()),
                         AssistantEvent::MessageStop,
-                    ]);
+                    ]));
                 }
-                Ok(vec![
+                Ok(events_to_stream(vec![
                     AssistantEvent::ToolUse {
                         id: "tool-1".to_string(),
                         name: "blocked".to_string(),
@@ -1233,7 +1405,7 @@ mod tests {
                         thought_signature: None,
                     },
                     AssistantEvent::MessageStop,
-                ])
+                ]))
             }
         }
 
@@ -1254,6 +1426,7 @@ mod tests {
 
         let summary = runtime
             .run_turn("use the tool", None, None)
+            .await
             .expect("conversation should continue after hook denial");
 
         assert_eq!(summary.tool_results.len(), 1);
@@ -1273,22 +1446,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn denies_tool_use_when_pre_tool_hook_fails() {
+    #[tokio::test]
+    async fn denies_tool_use_when_pre_tool_hook_fails() {
         struct SingleCallApiClient;
+        #[async_trait]
         impl ApiClient for SingleCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            async fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<AssistantEventStream, RuntimeError> {
                 if request
                     .messages
                     .iter()
                     .any(|message| message.role == MessageRole::Tool)
                 {
-                    return Ok(vec![
+                    return Ok(events_to_stream(vec![
                         AssistantEvent::TextDelta("failed".to_string()),
                         AssistantEvent::MessageStop,
-                    ]);
+                    ]));
                 }
-                Ok(vec![
+                Ok(events_to_stream(vec![
                     AssistantEvent::ToolUse {
                         id: "tool-1".to_string(),
                         name: "blocked".to_string(),
@@ -1296,7 +1473,7 @@ mod tests {
                         thought_signature: None,
                     },
                     AssistantEvent::MessageStop,
-                ])
+                ]))
             }
         }
 
@@ -1319,6 +1496,7 @@ mod tests {
         // when
         let summary = runtime
             .run_turn("use the tool", None, None)
+            .await
             .expect("conversation should continue after hook failure");
 
         // then
@@ -1339,17 +1517,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn appends_post_tool_hook_feedback_to_tool_result() {
+    #[tokio::test]
+    async fn appends_post_tool_hook_feedback_to_tool_result() {
         struct TwoCallApiClient {
             calls: usize,
         }
 
+        #[async_trait]
         impl ApiClient for TwoCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            async fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<AssistantEventStream, RuntimeError> {
                 self.calls += 1;
                 match self.calls {
-                    1 => Ok(vec![
+                    1 => Ok(events_to_stream(vec![
                         AssistantEvent::ToolUse {
                             id: "tool-1".to_string(),
                             name: "add".to_string(),
@@ -1357,16 +1539,16 @@ mod tests {
                             thought_signature: None,
                         },
                         AssistantEvent::MessageStop,
-                    ]),
+                    ])),
                     2 => {
                         assert!(request
                             .messages
                             .iter()
                             .any(|message| message.role == MessageRole::Tool));
-                        Ok(vec![
+                        Ok(events_to_stream(vec![
                             AssistantEvent::TextDelta("done".to_string()),
                             AssistantEvent::MessageStop,
-                        ])
+                        ]))
                     }
                     _ => unreachable!("extra API call"),
                 }
@@ -1388,6 +1570,7 @@ mod tests {
 
         let summary = runtime
             .run_turn("use add", None, None)
+            .await
             .expect("tool loop succeeds");
 
         assert_eq!(summary.tool_results.len(), 1);
@@ -1415,17 +1598,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn appends_post_tool_use_failure_hook_feedback_to_tool_result() {
+    #[tokio::test]
+    async fn appends_post_tool_use_failure_hook_feedback_to_tool_result() {
         struct TwoCallApiClient {
             calls: usize,
         }
 
+        #[async_trait]
         impl ApiClient for TwoCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            async fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<AssistantEventStream, RuntimeError> {
                 self.calls += 1;
                 match self.calls {
-                    1 => Ok(vec![
+                    1 => Ok(events_to_stream(vec![
                         AssistantEvent::ToolUse {
                             id: "tool-1".to_string(),
                             name: "fail".to_string(),
@@ -1433,16 +1620,16 @@ mod tests {
                             thought_signature: None,
                         },
                         AssistantEvent::MessageStop,
-                    ]),
+                    ])),
                     2 => {
                         assert!(request
                             .messages
                             .iter()
                             .any(|message| message.role == MessageRole::Tool));
-                        Ok(vec![
+                        Ok(events_to_stream(vec![
                             AssistantEvent::TextDelta("done".to_string()),
                             AssistantEvent::MessageStop,
-                        ])
+                        ]))
                     }
                     _ => unreachable!("extra API call"),
                 }
@@ -1467,6 +1654,7 @@ mod tests {
         // when
         let summary = runtime
             .run_turn("use fail", None, None)
+            .await
             .expect("tool loop succeeds");
 
         // then
@@ -1495,8 +1683,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn runtime_observer_receives_text_delta_tool_use_and_tool_result_in_order() {
+    #[tokio::test]
+    async fn runtime_observer_receives_text_delta_tool_use_and_tool_result_in_order() {
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             ScriptedApiClient { call_count: 0 },
@@ -1508,6 +1696,7 @@ mod tests {
 
         runtime
             .run_turn("what is 2 + 2?", None, Some(&mut observer))
+            .await
             .expect("conversation loop should succeed");
 
         assert_eq!(
@@ -1530,8 +1719,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn runtime_observer_receives_denied_tool_result() {
+    #[tokio::test]
+    async fn runtime_observer_receives_denied_tool_result() {
         struct RejectPrompter;
         impl PermissionPrompter for RejectPrompter {
             fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
@@ -1542,19 +1731,23 @@ mod tests {
         }
 
         struct ToolUseApiClient;
+        #[async_trait]
         impl ApiClient for ToolUseApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            async fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<AssistantEventStream, RuntimeError> {
                 if request
                     .messages
                     .iter()
                     .any(|message| message.role == MessageRole::Tool)
                 {
-                    return Ok(vec![
+                    return Ok(events_to_stream(vec![
                         AssistantEvent::TextDelta("blocked".to_string()),
                         AssistantEvent::MessageStop,
-                    ]);
+                    ]));
                 }
-                Ok(vec![
+                Ok(events_to_stream(vec![
                     AssistantEvent::ToolUse {
                         id: "tool-1".to_string(),
                         name: "blocked".to_string(),
@@ -1562,7 +1755,7 @@ mod tests {
                         thought_signature: None,
                     },
                     AssistantEvent::MessageStop,
-                ])
+                ]))
             }
         }
 
@@ -1582,6 +1775,7 @@ mod tests {
                 Some(&mut RejectPrompter),
                 Some(&mut observer),
             )
+            .await
             .expect("conversation should continue after denied tool");
 
         assert!(observer.events.contains(&ObservedRuntimeEvent::ToolResult {
@@ -1592,22 +1786,26 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn runtime_observer_receives_error_tool_result() {
+    #[tokio::test]
+    async fn runtime_observer_receives_error_tool_result() {
         struct ToolUseApiClient;
+        #[async_trait]
         impl ApiClient for ToolUseApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            async fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<AssistantEventStream, RuntimeError> {
                 if request
                     .messages
                     .iter()
                     .any(|message| message.role == MessageRole::Tool)
                 {
-                    return Ok(vec![
+                    return Ok(events_to_stream(vec![
                         AssistantEvent::TextDelta("failed".to_string()),
                         AssistantEvent::MessageStop,
-                    ]);
+                    ]));
                 }
-                Ok(vec![
+                Ok(events_to_stream(vec![
                     AssistantEvent::ToolUse {
                         id: "tool-1".to_string(),
                         name: "fail".to_string(),
@@ -1615,7 +1813,7 @@ mod tests {
                         thought_signature: None,
                     },
                     AssistantEvent::MessageStop,
-                ])
+                ]))
             }
         }
 
@@ -1630,6 +1828,7 @@ mod tests {
 
         runtime
             .run_turn("use the tool", None, Some(&mut observer))
+            .await
             .expect("conversation should continue after tool error");
 
         assert!(observer.events.contains(&ObservedRuntimeEvent::ToolResult {
@@ -1640,18 +1839,19 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn reconstructs_usage_tracker_from_restored_session() {
+    #[tokio::test]
+    async fn reconstructs_usage_tracker_from_restored_session() {
         struct SimpleApi;
+        #[async_trait]
         impl ApiClient for SimpleApi {
-            fn stream(
+            async fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                Ok(vec![
+            ) -> Result<AssistantEventStream, RuntimeError> {
+                Ok(events_to_stream(vec![
                     AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::MessageStop,
-                ])
+                ]))
             }
         }
 
@@ -1682,18 +1882,19 @@ mod tests {
         assert_eq!(runtime.usage().cumulative_usage().total_tokens(), 21);
     }
 
-    #[test]
-    fn compacts_session_after_turns() {
+    #[tokio::test]
+    async fn compacts_session_after_turns() {
         struct SimpleApi;
+        #[async_trait]
         impl ApiClient for SimpleApi {
-            fn stream(
+            async fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                Ok(vec![
+            ) -> Result<AssistantEventStream, RuntimeError> {
+                Ok(events_to_stream(vec![
                     AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::MessageStop,
-                ])
+                ]))
             }
         }
 
@@ -1704,9 +1905,9 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             SystemPrompt::default(),
         );
-        runtime.run_turn("a", None, None).expect("turn a");
-        runtime.run_turn("b", None, None).expect("turn b");
-        runtime.run_turn("c", None, None).expect("turn c");
+        runtime.run_turn("a", None, None).await.expect("turn a");
+        runtime.run_turn("b", None, None).await.expect("turn b");
+        runtime.run_turn("c", None, None).await.expect("turn c");
 
         let result = runtime.compact(CompactionConfig {
             preserve_recent_messages: 2,
@@ -1724,18 +1925,19 @@ mod tests {
         assert!(result.compacted_session.compaction.is_some());
     }
 
-    #[test]
-    fn persists_conversation_turn_messages_to_jsonl_session() {
+    #[tokio::test]
+    async fn persists_conversation_turn_messages_to_jsonl_session() {
         struct SimpleApi;
+        #[async_trait]
         impl ApiClient for SimpleApi {
-            fn stream(
+            async fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                Ok(vec![
+            ) -> Result<AssistantEventStream, RuntimeError> {
+                Ok(events_to_stream(vec![
                     AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::MessageStop,
-                ])
+                ]))
             }
         }
 
@@ -1751,6 +1953,7 @@ mod tests {
 
         runtime
             .run_turn("persist this turn", None, None)
+            .await
             .expect("turn should succeed");
 
         let restored = Session::load_from_path(&path).expect("persisted session should reload");
@@ -1762,8 +1965,8 @@ mod tests {
         assert_eq!(restored.session_id, runtime.session().session_id);
     }
 
-    #[test]
-    fn forks_runtime_session_without_mutating_original() {
+    #[tokio::test]
+    async fn forks_runtime_session_without_mutating_original() {
         let mut session = Session::new();
         session
             .push_user_text("branch me")
@@ -1809,15 +2012,16 @@ mod tests {
         script.to_string()
     }
 
-    #[test]
-    fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
+    #[tokio::test]
+    async fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
         struct SimpleApi;
+        #[async_trait]
         impl ApiClient for SimpleApi {
-            fn stream(
+            async fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                Ok(vec![
+            ) -> Result<AssistantEventStream, RuntimeError> {
+                Ok(events_to_stream(vec![
                     AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::Usage(TokenUsage {
                         input_tokens: 120_000,
@@ -1826,7 +2030,7 @@ mod tests {
                         cache_read_input_tokens: 0,
                     }),
                     AssistantEvent::MessageStop,
-                ])
+                ]))
             }
         }
 
@@ -1853,6 +2057,7 @@ mod tests {
 
         let summary = runtime
             .run_turn("trigger", None, None)
+            .await
             .expect("turn should succeed");
 
         assert_eq!(
@@ -1864,15 +2069,16 @@ mod tests {
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
     }
 
-    #[test]
-    fn skips_auto_compaction_below_threshold() {
+    #[tokio::test]
+    async fn skips_auto_compaction_below_threshold() {
         struct SimpleApi;
+        #[async_trait]
         impl ApiClient for SimpleApi {
-            fn stream(
+            async fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                Ok(vec![
+            ) -> Result<AssistantEventStream, RuntimeError> {
+                Ok(events_to_stream(vec![
                     AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::Usage(TokenUsage {
                         input_tokens: 99_999,
@@ -1881,7 +2087,7 @@ mod tests {
                         cache_read_input_tokens: 0,
                     }),
                     AssistantEvent::MessageStop,
-                ])
+                ]))
             }
         }
 
@@ -1896,13 +2102,14 @@ mod tests {
 
         let summary = runtime
             .run_turn("trigger", None, None)
+            .await
             .expect("turn should succeed");
         assert_eq!(summary.auto_compaction, None);
         assert_eq!(runtime.session().messages.len(), 2);
     }
 
-    #[test]
-    fn auto_compaction_threshold_defaults_and_parses_values() {
+    #[tokio::test]
+    async fn auto_compaction_threshold_defaults_and_parses_values() {
         assert_eq!(
             parse_auto_compaction_threshold(None),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
@@ -1918,14 +2125,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compaction_health_probe_blocks_turn_when_tool_executor_is_broken() {
+    #[tokio::test]
+    async fn compaction_health_probe_blocks_turn_when_tool_executor_is_broken() {
         struct SimpleApi;
+        #[async_trait]
         impl ApiClient for SimpleApi {
-            fn stream(
+            async fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            ) -> Result<AssistantEventStream, RuntimeError> {
                 panic!("API should not run when health probe fails");
             }
         }
@@ -1949,6 +2157,7 @@ mod tests {
 
         let error = runtime
             .run_turn("trigger", None, None)
+            .await
             .expect_err("health probe failure should abort the turn");
         assert!(
             error
@@ -1962,18 +2171,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compaction_health_probe_skips_empty_compacted_session() {
+    #[tokio::test]
+    async fn compaction_health_probe_skips_empty_compacted_session() {
         struct SimpleApi;
+        #[async_trait]
         impl ApiClient for SimpleApi {
-            fn stream(
+            async fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                Ok(vec![
+            ) -> Result<AssistantEventStream, RuntimeError> {
+                Ok(events_to_stream(vec![
                     AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::MessageStop,
-                ])
+                ]))
             }
         }
 
@@ -1995,13 +2205,14 @@ mod tests {
 
         let summary = runtime
             .run_turn("trigger", None, None)
+            .await
             .expect("empty compacted session should not fail health probe");
         assert_eq!(summary.auto_compaction, None);
         assert_eq!(runtime.session().messages.len(), 2);
     }
 
-    #[test]
-    fn build_assistant_message_requires_message_stop_event() {
+    #[tokio::test]
+    async fn build_assistant_message_requires_message_stop_event() {
         // given
         let events = vec![AssistantEvent::TextDelta("hello".to_string())];
 
@@ -2015,8 +2226,8 @@ mod tests {
             .contains("assistant stream ended without a message stop event"));
     }
 
-    #[test]
-    fn build_assistant_message_requires_content() {
+    #[tokio::test]
+    async fn build_assistant_message_requires_content() {
         // given
         let events = vec![AssistantEvent::MessageStop];
 
@@ -2030,8 +2241,8 @@ mod tests {
             .contains("assistant stream produced no content"));
     }
 
-    #[test]
-    fn static_tool_executor_rejects_unknown_tools() {
+    #[tokio::test]
+    async fn static_tool_executor_rejects_unknown_tools() {
         // given
         let mut executor = StaticToolExecutor::new();
 
@@ -2044,16 +2255,17 @@ mod tests {
         assert_eq!(error.to_string(), "unknown tool: missing");
     }
 
-    #[test]
-    fn run_turn_errors_when_max_iterations_is_exceeded() {
+    #[tokio::test]
+    async fn run_turn_errors_when_max_iterations_is_exceeded() {
         struct LoopingApi;
 
+        #[async_trait]
         impl ApiClient for LoopingApi {
-            fn stream(
+            async fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                Ok(vec![
+            ) -> Result<AssistantEventStream, RuntimeError> {
+                Ok(events_to_stream(vec![
                     AssistantEvent::ToolUse {
                         id: "tool-1".to_string(),
                         name: "echo".to_string(),
@@ -2061,7 +2273,7 @@ mod tests {
                         thought_signature: None,
                     },
                     AssistantEvent::MessageStop,
-                ])
+                ]))
             }
         }
 
@@ -2078,6 +2290,7 @@ mod tests {
         // when
         let error = runtime
             .run_turn("loop", None, None)
+            .await
             .expect_err("conversation loop should stop after the configured limit");
 
         // then
@@ -2086,21 +2299,22 @@ mod tests {
             .contains("conversation loop exceeded the maximum number of iterations"));
     }
 
-    #[test]
-    fn conversation_runtime_is_send() {
+    #[tokio::test]
+    async fn conversation_runtime_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<ConversationRuntime<ScriptedApiClient, StaticToolExecutor>>();
     }
 
-    #[test]
-    fn run_turn_propagates_api_errors() {
+    #[tokio::test]
+    async fn run_turn_propagates_api_errors() {
         struct FailingApi;
 
+        #[async_trait]
         impl ApiClient for FailingApi {
-            fn stream(
+            async fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            ) -> Result<AssistantEventStream, RuntimeError> {
                 Err(RuntimeError::new("upstream failed"))
             }
         }
@@ -2117,6 +2331,7 @@ mod tests {
         // when
         let error = runtime
             .run_turn("hello", None, None)
+            .await
             .expect_err("API failures should propagate");
 
         // then

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{self, Write};
 
 use api::{
@@ -6,9 +7,11 @@ use api::{
     MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
+use async_trait::async_trait;
+use futures::StreamExt;
 use runtime::{
-    ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
-    PromptCacheEvent, RuntimeError, TokenUsage,
+    ApiClient, ApiRequest, AssistantEvent, AssistantEventStream, ContentBlock, ConversationMessage,
+    MessageRole, PromptCacheEvent, RuntimeError, TokenUsage,
 };
 use telemetry::{JsonlTelemetrySink, SessionTracer};
 use tools::GlobalToolRegistry;
@@ -118,9 +121,10 @@ pub(crate) fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiEr
     resolve_startup_auth_source(|| Ok(None))
 }
 
+#[async_trait]
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
-    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+    async fn stream(&mut self, request: ApiRequest) -> Result<AssistantEventStream, RuntimeError> {
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
@@ -145,51 +149,80 @@ impl ApiClient for AnthropicRuntimeClient {
             ..Default::default()
         };
 
-        self.runtime.block_on(async {
-            // When resuming after tool execution, apply a stall timeout on the
-            // first stream event.  If the model does not respond within the
-            // deadline we drop the stalled connection and re-send the request as
-            // a continuation nudge (one retry only).
-            let max_attempts: usize = if is_post_tool { 2 } else { 1 };
+        // When resuming after tool execution, apply a stall timeout on the
+        // first stream event.  If the model does not respond within the
+        // deadline we drop the stalled connection and re-send the request as
+        // a continuation nudge (one retry only).
+        let max_attempts: usize = if is_post_tool { 2 } else { 1 };
 
-            for attempt in 1..=max_attempts {
-                let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
-                    .await;
-                match result {
-                    Ok(events) => return Ok(events),
-                    Err(error)
-                        if error.to_string().contains("post-tool stall")
-                            && attempt < max_attempts =>
-                    {
-                        // Stalled after tool completion — nudge the model by
-                        // re-sending the same request.
-                    }
-                    Err(error) => return Err(error),
+        for attempt in 1..=max_attempts {
+            let result = self
+                .try_start_stream(&message_request, is_post_tool && attempt == 1)
+                .await;
+            match result {
+                Ok(stream) => return Ok(stream),
+                Err(error)
+                    if error.to_string().contains("post-tool stall") && attempt < max_attempts =>
+                {
+                    // Stalled after tool completion — nudge the model by
+                    // re-sending the same request.
                 }
+                Err(error) => return Err(error),
             }
+        }
 
-            Err(RuntimeError::new("post-tool continuation nudge exhausted"))
-        })
+        Err(RuntimeError::new("post-tool continuation nudge exhausted"))
     }
 }
 
-impl AnthropicRuntimeClient {
-    /// Consume a single streaming response, optionally applying a stall
-    /// timeout on the first event for post-tool continuations.
+/// Internal state for the unfold-based `AssistantEventStream` produced by
+/// [`AnthropicRuntimeClient::try_start_stream`].
+#[allow(clippy::struct_excessive_bools)]
+struct CliStreamState {
+    provider_stream: api::MessageStream,
+    session_id: String,
+    emit_output: bool,
+    progress_reporter: Option<InternalPromptProgressReporter>,
+    spinner_pause: Option<Arc<AtomicBool>>,
+    pending_tool: Option<(String, String, String, Option<String>)>,
+    block_has_thinking_summary: bool,
+    markdown_stream: MarkdownStreamState,
+    renderer: TerminalRenderer,
+    glyph_state: ResponseGlyphState,
+    buffer: VecDeque<AssistantEvent>,
+    saw_stop: bool,
+    has_content: bool,
+    received_any_event: bool,
+    apply_stall_timeout: bool,
+    done: bool,
+    /// Clone of the provider client used to extract prompt cache at end of stream.
+    client: ApiProviderClient,
+    /// Non-streaming fallback request (used when streaming yields no events).
+    fallback_request: Option<MessageRequest>,
+}
+
+impl CliStreamState {
+    fn pause_spinner(&self) {
+        if let Some(flag) = &self.spinner_pause {
+            flag.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let _ = write!(io::stdout(), "\r\x1b[2K");
+            let _ = io::stdout().flush();
+        }
+    }
+
+    fn resume_spinner(&self) {
+        if let Some(flag) = &self.spinner_pause {
+            flag.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Process a single provider event, converting it into zero or more
+    /// [`AssistantEvent`]s pushed onto `self.buffer`.  All I/O (terminal
+    /// rendering) happens synchronously here so that no `dyn Write` reference
+    /// is held across an `.await` point.
     #[allow(clippy::too_many_lines)]
-    async fn consume_stream(
-        &self,
-        message_request: &MessageRequest,
-        apply_stall_timeout: bool,
-    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut stream = self
-            .client
-            .stream_message(message_request)
-            .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
+    fn process_provider_event(&mut self, event: ApiStreamEvent) -> Result<(), RuntimeError> {
         let mut stdout = io::stdout();
         let mut sink = io::sink();
         let out: &mut dyn Write = if self.emit_output {
@@ -197,168 +230,254 @@ impl AnthropicRuntimeClient {
         } else {
             &mut sink
         };
-        let renderer = TerminalRenderer::new();
-        let mut markdown_stream = MarkdownStreamState::default();
-        let mut events = Vec::new();
-        let mut pending_tool: Option<(String, String, String, Option<String>)> = None;
-        let mut block_has_thinking_summary = false;
-        let mut saw_stop = false;
-        let mut received_any_event = false;
-        let mut glyph_state = ResponseGlyphState::new(query_terminal_width());
-
-        loop {
-            let next = if apply_stall_timeout && !received_any_event {
-                match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
-                    Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                    })?,
-                    Err(_elapsed) => {
-                        return Err(RuntimeError::new(
-                            "post-tool stall: model did not respond within timeout",
-                        ));
-                    }
-                }
-            } else {
-                stream.next_event().await.map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?
-            };
-
-            let Some(event) = next else {
-                break;
-            };
-            received_any_event = true;
-
-            match event {
-                ApiStreamEvent::MessageStart(start) => {
-                    for block in start.message.content {
-                        push_output_block(
-                            block,
-                            out,
-                            &mut events,
-                            &mut pending_tool,
-                            true,
-                            &mut block_has_thinking_summary,
-                            &mut glyph_state,
-                        )?;
-                    }
-                }
-                ApiStreamEvent::ContentBlockStart(start) => {
+        match event {
+            ApiStreamEvent::MessageStart(start) => {
+                for block in start.message.content {
                     push_output_block(
-                        start.content_block,
+                        block,
                         out,
-                        &mut events,
-                        &mut pending_tool,
+                        &mut self.buffer,
+                        &mut self.pending_tool,
                         true,
-                        &mut block_has_thinking_summary,
-                        &mut glyph_state,
+                        &mut self.block_has_thinking_summary,
+                        &mut self.glyph_state,
                     )?;
                 }
-                ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
-                    ContentBlockDelta::TextDelta { text } => {
-                        if !text.is_empty() {
-                            if let Some(progress_reporter) = &self.progress_reporter {
-                                progress_reporter.mark_text_phase(&text);
-                            }
-                            if let Some(rendered) = markdown_stream.push(&renderer, &text) {
-                                self.pause_spinner();
-                                let prefixed = glyph_state.apply(&rendered);
-                                write!(out, "{prefixed}")
-                                    .and_then(|()| out.flush())
-                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                            }
-                            events.push(AssistantEvent::TextDelta(text));
-                        }
-                    }
-                    ContentBlockDelta::InputJsonDelta { partial_json } => {
-                        if let Some((_, _, input, _)) = &mut pending_tool {
-                            input.push_str(&partial_json);
-                        }
-                    }
-                    ContentBlockDelta::ThinkingDelta { .. } => {
-                        if !block_has_thinking_summary {
-                            self.pause_spinner();
-                            render_thinking_block_summary(out, None, false)?;
-                            block_has_thinking_summary = true;
-                            glyph_state.visible_col = 0;
-                        }
-                    }
-                    ContentBlockDelta::SignatureDelta { .. } => {}
-                },
-                ApiStreamEvent::ContentBlockStop(_) => {
-                    block_has_thinking_summary = false;
-                    if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        let prefixed = glyph_state.apply(&rendered);
-                        write!(out, "{prefixed}")
-                            .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
-                    }
-                    if let Some((id, name, input, thought_signature)) = pending_tool.take() {
+            }
+            ApiStreamEvent::ContentBlockStart(start) => {
+                push_output_block(
+                    start.content_block,
+                    out,
+                    &mut self.buffer,
+                    &mut self.pending_tool,
+                    true,
+                    &mut self.block_has_thinking_summary,
+                    &mut self.glyph_state,
+                )?;
+            }
+            ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
+                ContentBlockDelta::TextDelta { text } => {
+                    if !text.is_empty() {
                         if let Some(progress_reporter) = &self.progress_reporter {
-                            progress_reporter.mark_tool_phase(&name, &input);
+                            progress_reporter.mark_text_phase(&text);
                         }
+                        if let Some(rendered) = self.markdown_stream.push(&self.renderer, &text) {
+                            self.pause_spinner();
+                            let prefixed = self.glyph_state.apply(&rendered);
+                            write!(out, "{prefixed}")
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
+                        self.has_content = true;
+                        self.buffer.push_back(AssistantEvent::TextDelta(text));
+                    }
+                }
+                ContentBlockDelta::InputJsonDelta { partial_json } => {
+                    if let Some((_, _, input, _)) = &mut self.pending_tool {
+                        input.push_str(&partial_json);
+                    }
+                }
+                ContentBlockDelta::ThinkingDelta { .. } => {
+                    if !self.block_has_thinking_summary {
                         self.pause_spinner();
-                        writeln!(out, "\n{}", format_tool_call_start(&name, &input))
-                            .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        glyph_state.visible_col = 0;
-                        // Resume spinner so it shows during tool execution.
-                        self.resume_spinner();
-                        events.push(AssistantEvent::ToolUse {
-                            id,
-                            name,
-                            input,
-                            thought_signature,
-                        });
+                        render_thinking_block_summary(out, None, false)?;
+                        self.block_has_thinking_summary = true;
+                        self.glyph_state.visible_col = 0;
                     }
                 }
-                ApiStreamEvent::MessageDelta(delta) => {
-                    events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                ContentBlockDelta::SignatureDelta { .. } => {}
+            },
+            ApiStreamEvent::ContentBlockStop(_) => {
+                self.block_has_thinking_summary = false;
+                if let Some(rendered) = self.markdown_stream.flush(&self.renderer) {
+                    let prefixed = self.glyph_state.apply(&rendered);
+                    write!(out, "{prefixed}")
+                        .and_then(|()| out.flush())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
                 }
-                ApiStreamEvent::MessageStop(_) => {
-                    saw_stop = true;
-                    if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        let prefixed = glyph_state.apply(&rendered);
-                        write!(out, "{prefixed}")
-                            .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                if let Some((id, name, input, thought_signature)) = self.pending_tool.take() {
+                    if let Some(progress_reporter) = &self.progress_reporter {
+                        progress_reporter.mark_tool_phase(&name, &input);
                     }
-                    events.push(AssistantEvent::MessageStop);
+                    self.pause_spinner();
+                    writeln!(out, "\n{}", format_tool_call_start(&name, &input))
+                        .and_then(|()| out.flush())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    self.glyph_state.visible_col = 0;
+                    self.resume_spinner();
+                    self.has_content = true;
+                    self.buffer.push_back(AssistantEvent::ToolUse {
+                        id,
+                        name,
+                        input,
+                        thought_signature,
+                    });
                 }
             }
+            ApiStreamEvent::MessageDelta(delta) => {
+                self.buffer
+                    .push_back(AssistantEvent::Usage(delta.usage.token_usage()));
+            }
+            ApiStreamEvent::MessageStop(_) => {
+                self.saw_stop = true;
+                if let Some(rendered) = self.markdown_stream.flush(&self.renderer) {
+                    let prefixed = self.glyph_state.apply(&rendered);
+                    write!(out, "{prefixed}")
+                        .and_then(|()| out.flush())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                }
+                self.buffer.push_back(AssistantEvent::MessageStop);
+            }
         }
+        Ok(())
+    }
+}
 
-        push_prompt_cache_record(&self.client, &mut events);
+impl AnthropicRuntimeClient {
+    /// Start a streaming response, optionally applying a stall timeout on the
+    /// first event for post-tool continuations.  Returns an incremental stream
+    /// of [`AssistantEvent`]s.  Dropping the stream cancels the underlying
+    /// HTTP request.
+    async fn try_start_stream(
+        &mut self,
+        message_request: &MessageRequest,
+        apply_stall_timeout: bool,
+    ) -> Result<AssistantEventStream, RuntimeError> {
+        let provider_stream =
+            self.client
+                .stream_message(message_request)
+                .await
+                .map_err(|error| {
+                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                })?;
 
-        if !saw_stop
-            && events.iter().any(|event| {
-                matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
-                    || matches!(event, AssistantEvent::ToolUse { .. })
-            })
-        {
-            events.push(AssistantEvent::MessageStop);
-        }
-
-        if events
-            .iter()
-            .any(|event| matches!(event, AssistantEvent::MessageStop))
-        {
-            return Ok(events);
-        }
-
-        let response = self
-            .client
-            .send_message(&MessageRequest {
+        let state = CliStreamState {
+            provider_stream,
+            session_id: self.session_id.clone(),
+            emit_output: self.emit_output,
+            progress_reporter: self.progress_reporter.clone(),
+            spinner_pause: self.spinner_pause.clone(),
+            pending_tool: None,
+            block_has_thinking_summary: false,
+            markdown_stream: MarkdownStreamState::default(),
+            renderer: TerminalRenderer::new(),
+            glyph_state: ResponseGlyphState::new(query_terminal_width()),
+            buffer: VecDeque::new(),
+            saw_stop: false,
+            has_content: false,
+            received_any_event: false,
+            apply_stall_timeout,
+            done: false,
+            client: self.client.clone(),
+            fallback_request: Some(MessageRequest {
                 stream: false,
                 ..message_request.clone()
-            })
-            .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
-        let mut events = response_to_events(response, out)?;
-        push_prompt_cache_record(&self.client, &mut events);
-        Ok(events)
+            }),
+        };
+
+        Ok(Box::pin(futures::stream::try_unfold(
+            state,
+            |mut state| async move {
+                // Yield buffered events first.
+                if let Some(event) = state.buffer.pop_front() {
+                    return Ok(Some((event, state)));
+                }
+                if state.done {
+                    return Ok(None);
+                }
+
+                loop {
+                    let next = if state.apply_stall_timeout && !state.received_any_event {
+                        match tokio::time::timeout(
+                            POST_TOOL_STALL_TIMEOUT,
+                            state.provider_stream.next_event(),
+                        )
+                        .await
+                        {
+                            Ok(inner) => inner.map_err(|error| {
+                                RuntimeError::new(format_user_visible_api_error(
+                                    &state.session_id,
+                                    &error,
+                                ))
+                            })?,
+                            Err(_elapsed) => {
+                                return Err(RuntimeError::new(
+                                    "post-tool stall: model did not respond within timeout",
+                                ));
+                            }
+                        }
+                    } else {
+                        state.provider_stream.next_event().await.map_err(|error| {
+                            RuntimeError::new(format_user_visible_api_error(
+                                &state.session_id,
+                                &error,
+                            ))
+                        })?
+                    };
+
+                    let Some(event) = next else {
+                        // Provider stream ended — emit prompt cache and
+                        // synthetic stop if needed, then signal done.
+                        if let Some(record) = state.client.take_last_prompt_cache_record() {
+                            if let Some(evt) = prompt_cache_record_to_runtime_event(record) {
+                                state.buffer.push_back(AssistantEvent::PromptCache(evt));
+                            }
+                        }
+                        if !state.saw_stop && state.has_content {
+                            state.buffer.push_back(AssistantEvent::MessageStop);
+                        }
+
+                        // If stream produced nothing useful, fall back to
+                        // non-streaming request.
+                        if state.buffer.is_empty() && !state.saw_stop {
+                            if let Some(fallback_request) = state.fallback_request.take() {
+                                let response =
+                                    state.client.send_message(&fallback_request).await.map_err(
+                                        |error| {
+                                            RuntimeError::new(format_user_visible_api_error(
+                                                &state.session_id,
+                                                &error,
+                                            ))
+                                        },
+                                    )?;
+                                // response_to_events does sync I/O (no await),
+                                // so the dyn Write borrow is safe here.
+                                let mut stdout = io::stdout();
+                                let mut sink = io::sink();
+                                let out: &mut dyn Write = if state.emit_output {
+                                    &mut stdout
+                                } else {
+                                    &mut sink
+                                };
+                                let events = response_to_events(response, out)?;
+                                state.buffer.extend(events);
+                                if let Some(record) = state.client.take_last_prompt_cache_record() {
+                                    if let Some(evt) = prompt_cache_record_to_runtime_event(record)
+                                    {
+                                        state.buffer.push_back(AssistantEvent::PromptCache(evt));
+                                    }
+                                }
+                            }
+                        }
+
+                        state.done = true;
+                        return Ok(state.buffer.pop_front().map(|evt| (evt, state)));
+                    };
+                    state.received_any_event = true;
+
+                    // Process the provider event synchronously (all I/O
+                    // happens inside this call, no dyn Write held across
+                    // await points).
+                    state.process_provider_event(event)?;
+
+                    // If we produced any buffered events, yield the first one.
+                    if let Some(event) = state.buffer.pop_front() {
+                        return Ok(Some((event, state)));
+                    }
+                    // Otherwise loop to read more from the provider.
+                }
+            },
+        )))
     }
 }
 
@@ -565,7 +684,7 @@ fn query_terminal_width() -> usize {
 pub(crate) fn push_output_block(
     block: OutputContentBlock,
     out: &mut (impl Write + ?Sized),
-    events: &mut Vec<AssistantEvent>,
+    events: &mut VecDeque<AssistantEvent>,
     pending_tool: &mut Option<(String, String, String, Option<String>)>,
     streaming_tool_input: bool,
     block_has_thinking_summary: &mut bool,
@@ -579,7 +698,7 @@ pub(crate) fn push_output_block(
                 write!(out, "{prefixed}")
                     .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
-                events.push(AssistantEvent::TextDelta(text));
+                events.push_back(AssistantEvent::TextDelta(text));
             }
         }
         OutputContentBlock::ToolUse {
@@ -588,9 +707,6 @@ pub(crate) fn push_output_block(
             input,
             thought_signature,
         } => {
-            // During streaming, the initial content_block_start has an empty input ({}).
-            // The real input arrives via input_json_delta events. In
-            // non-streaming responses, preserve a legitimate empty object.
             let initial_input = if streaming_tool_input
                 && input.is_object()
                 && input.as_object().is_some_and(serde_json::Map::is_empty)
@@ -618,8 +734,8 @@ pub(crate) fn push_output_block(
 pub(crate) fn response_to_events(
     response: MessageResponse,
     out: &mut (impl Write + ?Sized),
-) -> Result<Vec<AssistantEvent>, RuntimeError> {
-    let mut events = Vec::new();
+) -> Result<VecDeque<AssistantEvent>, RuntimeError> {
+    let mut events = VecDeque::new();
     let mut pending_tool = None;
     let mut glyph_state = ResponseGlyphState::new(query_terminal_width());
 
@@ -635,7 +751,7 @@ pub(crate) fn response_to_events(
             &mut glyph_state,
         )?;
         if let Some((id, name, input, thought_signature)) = pending_tool.take() {
-            events.push(AssistantEvent::ToolUse {
+            events.push_back(AssistantEvent::ToolUse {
                 id,
                 name,
                 input,
@@ -644,25 +760,9 @@ pub(crate) fn response_to_events(
         }
     }
 
-    events.push(AssistantEvent::Usage(response.usage.token_usage()));
-    events.push(AssistantEvent::MessageStop);
+    events.push_back(AssistantEvent::Usage(response.usage.token_usage()));
+    events.push_back(AssistantEvent::MessageStop);
     Ok(events)
-}
-
-pub(crate) fn push_prompt_cache_record(
-    client: &ApiProviderClient,
-    events: &mut Vec<AssistantEvent>,
-) {
-    // `ApiProviderClient::take_last_prompt_cache_record` is a pass-through
-    // to the Anthropic variant and returns `None` for OpenAI-compat /
-    // xAI variants, which do not have a prompt cache. So this helper
-    // remains a no-op on non-Anthropic providers without any extra
-    // branching here.
-    if let Some(record) = client.take_last_prompt_cache_record() {
-        if let Some(event) = prompt_cache_record_to_runtime_event(record) {
-            events.push(AssistantEvent::PromptCache(event));
-        }
-    }
 }
 
 pub(crate) fn prompt_cache_record_to_runtime_event(

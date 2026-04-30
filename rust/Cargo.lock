@@ -2241,6 +2241,7 @@ dependencies = [
  "agent-client-protocol",
  "agent-client-protocol-schema",
  "agent-client-protocol-tokio",
+ "async-trait",
  "axum",
  "base64",
  "futures",
@@ -2346,12 +2347,14 @@ version = "0.1.1"
 dependencies = [
  "api",
  "arboard",
+ "async-trait",
  "base64",
  "clap",
  "commands",
  "compat-harness",
  "crossterm",
  "dialoguer",
+ "futures",
  "futures-util",
  "mock-anthropic-service",
  "plugins",
@@ -2965,8 +2968,10 @@ name = "tools"
 version = "0.1.1"
 dependencies = [
  "api",
+ "async-trait",
  "commands",
  "flate2",
+ "futures",
  "plugins",
  "reqwest",
  "runtime",
