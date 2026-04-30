@@ -3815,40 +3815,46 @@ fn execute_agent_inline(input: AgentInput) -> Result<AgentOutput, String> {
 }
 
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
-    let thread_name = format!("sudocode-agent-{}", job.manifest.agent_id);
-    std::thread::Builder::new()
-        .name(thread_name)
-        .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_agent_job_returning_text(&job).and_then(|text| {
-                    persist_agent_terminal_state(
-                        &job.manifest,
-                        "completed",
-                        Some(text.as_str()),
-                        None,
-                    )
-                })
-            }));
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    let _ =
-                        persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
-                }
-                Err(_) => {
-                    let _ = persist_agent_terminal_state(
-                        &job.manifest,
-                        "failed",
-                        None,
-                        Some(String::from("sub-agent thread panicked")),
-                    );
-                }
-            }
-            // Signal the completion registry so TaskOutput(agent_id, block=true) callers unblock.
-            notify_agent_completion(&job.manifest);
+    // Use tokio's managed blocking thread pool (default 512, configurable via
+    // TOKIO_BLOCKING_THREADS) when a runtime is available. This scales to 100+
+    // concurrent agents without hitting OS thread limits. Falls back to a raw
+    // OS thread when no tokio runtime is present (e.g. plain CLI mode).
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(move || run_spawned_agent_job(job));
+        Ok(())
+    } else {
+        let thread_name = format!("sudocode-agent-{}", job.manifest.agent_id);
+        std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || run_spawned_agent_job(job))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)] // ownership required for move into spawn_blocking
+fn run_spawned_agent_job(job: AgentJob) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_agent_job_returning_text(&job).and_then(|text| {
+            persist_agent_terminal_state(&job.manifest, "completed", Some(text.as_str()), None)
         })
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    }));
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
+        }
+        Err(_) => {
+            let _ = persist_agent_terminal_state(
+                &job.manifest,
+                "failed",
+                None,
+                Some(String::from("sub-agent thread panicked")),
+            );
+        }
+    }
+    // Signal the completion registry so TaskOutput(agent_id, block=true) callers unblock.
+    notify_agent_completion(&job.manifest);
 }
 
 /// Re-read the persisted manifest and notify the global completion registry.
@@ -3871,9 +3877,9 @@ fn run_agent_job_returning_text(job: &AgentJob) -> Result<String, String> {
         build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
     let prompt = job.prompt.clone();
 
-    // When inside a tokio context, spawn a fresh OS thread so we can create a new
-    // tokio Runtime without nesting. block_in_place is not used here because it
-    // panics on current_thread runtimes (the MCP server entry path uses one).
+    // When inside a tokio context, spawn a scoped thread to avoid nesting
+    // runtimes. block_in_place is not used because it panics on current_thread
+    // runtimes (the MCP server entry path uses one).
     let summary = if tokio::runtime::Handle::try_current().is_ok() {
         std::thread::scope(|s| {
             s.spawn(|| {
