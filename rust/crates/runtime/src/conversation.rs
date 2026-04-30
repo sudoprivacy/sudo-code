@@ -395,7 +395,7 @@ where
         // assistant turn (not a separate user message) so attribution is
         // correct.
         blocks.push(ContentBlock::Text {
-            text: "\n\n[Interrupted · What should Sudo Code do instead?]".to_string(),
+            text: format!("\n\n[{INTERRUPT_MESSAGE}]"),
         });
 
         // Extract tool_use ids before pushing the assistant message.
