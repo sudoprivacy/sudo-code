@@ -366,6 +366,39 @@ fn resumed_version_and_init_emit_structured_json_when_requested() {
     assert!(root.join("CLAUDE.md").exists());
 }
 
+#[test]
+fn clap_parse_error_emits_json_envelope_to_stdout() {
+    let root = unique_temp_dir("clap-error-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let output = run_scode(
+        &root,
+        &["--output-format", "json", "--unknown-flag-that-does-not-exist"],
+        &[],
+    );
+    assert!(
+        !output.status.success(),
+        "a bad flag should exit non-zero"
+    );
+    // JSON envelope must land on stdout so ACP can parse it.
+    assert!(
+        !output.stdout.is_empty(),
+        "stdout should contain a JSON error envelope, got empty stdout\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be valid JSON");
+    assert_eq!(parsed["type"], "error", "envelope type should be 'error'");
+    assert!(
+        parsed["error"].is_string(),
+        "envelope should have an 'error' string field"
+    );
+    assert!(
+        parsed["kind"].is_string(),
+        "envelope should have a 'kind' string field"
+    );
+}
+
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {
     assert_json_command_with_env(current_dir, args, &[])
 }
