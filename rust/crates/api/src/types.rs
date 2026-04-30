@@ -32,24 +32,30 @@ pub struct MessageRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 
-    /// Structured system content blocks for providers that support cache
-    /// control (Anthropic). Each entry is `(text, cache_scope)` where
-    /// `cache_scope` is `Some("global")` for static content or `None`
-    /// for ephemeral/session-specific content.
-    ///
-    /// When present, providers that support structured system content
-    /// will use these blocks instead of the flat `system` string.
+    /// Provider-agnostic cache hints. Providers that support caching will
+    /// translate these into their specific wire format. Providers that
+    /// don't support caching ignore them.
     #[serde(skip)]
-    pub system_cache_blocks: Option<Vec<SystemCacheBlock>>,
+    pub cache_hints: Option<CacheHints>,
 }
 
-/// A system content block with optional cache control metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SystemCacheBlock {
-    pub text: String,
-    /// Anthropic cache scope. `Some("global")` for static content,
-    /// `None` for ephemeral per-session content.
-    pub cache_scope: Option<String>,
+/// Provider-agnostic description of what to cache in a request.
+///
+/// Each provider translates these hints into its own caching mechanism:
+/// - Anthropic: `cache_control` markers on system blocks and messages
+/// - OpenAI-compatible: ignored (automatic prefix caching)
+/// - Others: ignored or provider-specific
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheHints {
+    /// Static system prompt text — identical across all sessions.
+    /// Providers may cache this globally (e.g. Anthropic `scope: "global"`).
+    pub system_static: Option<String>,
+    /// Dynamic system prompt text — stable within a session but varies
+    /// across sessions. Providers may cache this per-session.
+    pub system_dynamic: Option<String>,
+    /// When true, place a cache breakpoint on the last message so the
+    /// conversation prefix is cached between turns.
+    pub breakpoint_last_message: bool,
 }
 
 impl MessageRequest {

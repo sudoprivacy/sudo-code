@@ -1,11 +1,10 @@
 use std::io::{self, Write};
 
 use api::{
-    resolve_startup_auth_source, AnthropicClient, AuthMode, AuthSource, ContentBlockDelta,
-    ImageSource, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
-    StreamEvent as ApiStreamEvent, SystemCacheBlock, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    resolve_startup_auth_source, AnthropicClient, AuthMode, AuthSource, CacheHints,
+    ContentBlockDelta, ImageSource, InputContentBlock, InputMessage, MessageRequest,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
@@ -126,17 +125,10 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
-        let system_cache_blocks = (!request.system_prompt.is_empty()).then(|| {
-            vec![
-                SystemCacheBlock {
-                    text: request.system_prompt.static_text(),
-                    cache_scope: Some("global".to_string()),
-                },
-                SystemCacheBlock {
-                    text: request.system_prompt.dynamic_text(),
-                    cache_scope: None,
-                },
-            ]
+        let cache_hints = (!request.system_prompt.is_empty()).then(|| CacheHints {
+            system_static: Some(request.system_prompt.static_text()),
+            system_dynamic: Some(request.system_prompt.dynamic_text()),
+            breakpoint_last_message: true,
         });
         let message_request = MessageRequest {
             model: self.model.clone(),
@@ -149,7 +141,7 @@ impl ApiClient for AnthropicRuntimeClient {
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
-            system_cache_blocks,
+            cache_hints,
             ..Default::default()
         };
 

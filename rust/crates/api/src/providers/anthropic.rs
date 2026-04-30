@@ -417,7 +417,7 @@ impl AnthropicClient {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let mut body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut body);
-        apply_system_cache_blocks(&mut body, request);
+        apply_cache_hints(&mut body, request);
         self.prepend_oauth_system_prefix(&mut body);
 
         let mut headers: Vec<(String, String)> =
@@ -518,7 +518,7 @@ impl AnthropicClient {
         );
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
-        apply_system_cache_blocks(&mut request_body, request);
+        apply_cache_hints(&mut request_body, request);
         self.prepend_oauth_system_prefix(&mut request_body);
         let mut builder = self
             .http
@@ -1016,39 +1016,61 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
     }
 }
 
-/// When `system_cache_blocks` is present on the request, replace the flat
-/// `system` string in the JSON body with an array of text content blocks
-/// carrying Anthropic `cache_control` hints.
+/// Translate provider-agnostic [`CacheHints`] into Anthropic-specific
+/// `cache_control` markers on the JSON body.
 ///
-/// Static blocks get `{"type": "ephemeral", "scope": "<scope>"}` and
-/// dynamic blocks get `{"type": "ephemeral"}`.
-fn apply_system_cache_blocks(body: &mut Value, request: &MessageRequest) {
-    let Some(blocks) = &request.system_cache_blocks else {
+/// - `system_static` → system block with `cache_control: {type: "ephemeral", scope: "global"}`
+/// - `system_dynamic` → system block with `cache_control: {type: "ephemeral"}`
+/// - `breakpoint_last_message` → `cache_control: {type: "ephemeral"}` on the last
+///   content block of the last message
+fn apply_cache_hints(body: &mut Value, request: &MessageRequest) {
+    let Some(hints) = &request.cache_hints else {
         return;
     };
     let Some(obj) = body.as_object_mut() else {
         return;
     };
 
-    let json_blocks: Vec<Value> = blocks
-        .iter()
-        .filter(|b| !b.text.is_empty())
-        .map(|block| {
-            let cache_control = if let Some(scope) = &block.cache_scope {
-                serde_json::json!({"type": "ephemeral", "scope": scope})
-            } else {
-                serde_json::json!({"type": "ephemeral"})
-            };
-            serde_json::json!({
+    // --- System blocks ---
+    let mut system_blocks: Vec<Value> = Vec::new();
+    if let Some(text) = &hints.system_static {
+        if !text.is_empty() {
+            system_blocks.push(serde_json::json!({
                 "type": "text",
-                "text": block.text,
-                "cache_control": cache_control,
-            })
-        })
-        .collect();
+                "text": text,
+                "cache_control": { "type": "ephemeral", "scope": "global" },
+            }));
+        }
+    }
+    if let Some(text) = &hints.system_dynamic {
+        if !text.is_empty() {
+            system_blocks.push(serde_json::json!({
+                "type": "text",
+                "text": text,
+                "cache_control": { "type": "ephemeral" },
+            }));
+        }
+    }
+    if !system_blocks.is_empty() {
+        obj.insert("system".to_string(), Value::Array(system_blocks));
+    }
 
-    if !json_blocks.is_empty() {
-        obj.insert("system".to_string(), Value::Array(json_blocks));
+    // --- Message breakpoint ---
+    if hints.breakpoint_last_message {
+        if let Some(Value::Array(messages)) = obj.get_mut("messages") {
+            if let Some(last_msg) = messages.last_mut() {
+                if let Some(Value::Array(content)) = last_msg.get_mut("content") {
+                    if let Some(last_block) = content.last_mut() {
+                        if let Some(block_obj) = last_block.as_object_mut() {
+                            block_obj.insert(
+                                "cache_control".to_string(),
+                                serde_json::json!({ "type": "ephemeral" }),
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1736,54 +1758,52 @@ mod tests {
     }
 
     #[test]
-    fn apply_system_cache_blocks_produces_array_with_cache_control() {
-        use crate::types::SystemCacheBlock;
+    fn apply_cache_hints_produces_system_blocks_and_message_breakpoint() {
+        use crate::types::{CacheHints, InputMessage};
         use telemetry::AnthropicRequestProfile;
 
         let request = MessageRequest {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
-            messages: vec![],
-            system: Some("ignored when blocks present".to_string()),
+            messages: vec![
+                InputMessage::user_text("first question"),
+                InputMessage::user_text("second question"),
+            ],
+            system: Some("flat fallback".to_string()),
             stream: true,
-            system_cache_blocks: Some(vec![
-                SystemCacheBlock {
-                    text: "static core instructions".to_string(),
-                    cache_scope: Some("global".to_string()),
-                },
-                SystemCacheBlock {
-                    text: "dynamic session context".to_string(),
-                    cache_scope: None,
-                },
-            ]),
+            cache_hints: Some(CacheHints {
+                system_static: Some("static core instructions".to_string()),
+                system_dynamic: Some("dynamic session context".to_string()),
+                breakpoint_last_message: true,
+            }),
             ..Default::default()
         };
 
         let mut body = AnthropicRequestProfile::default()
             .render_json_body(&request)
             .expect("render body");
-        super::apply_system_cache_blocks(&mut body, &request);
+        super::apply_cache_hints(&mut body, &request);
 
+        // --- System blocks ---
         let system = body.get("system").expect("system field should exist");
-        let blocks = system.as_array().expect("system should be an array");
-        assert_eq!(blocks.len(), 2);
+        let sys_blocks = system.as_array().expect("system should be an array");
+        assert_eq!(sys_blocks.len(), 2);
 
-        // Static block: has cache_control with scope "global".
-        assert_eq!(blocks[0]["type"], "text");
-        assert_eq!(blocks[0]["text"], "static core instructions");
-        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
-        assert_eq!(blocks[0]["cache_control"]["scope"], "global");
+        assert_eq!(sys_blocks[0]["text"], "static core instructions");
+        assert_eq!(sys_blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(sys_blocks[0]["cache_control"]["scope"], "global");
 
-        // Dynamic block: has cache_control without scope.
-        assert_eq!(blocks[1]["type"], "text");
-        assert_eq!(blocks[1]["text"], "dynamic session context");
-        assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
-        assert!(blocks[1]["cache_control"].get("scope").is_none());
+        assert_eq!(sys_blocks[1]["text"], "dynamic session context");
+        assert_eq!(sys_blocks[1]["cache_control"]["type"], "ephemeral");
+        assert!(sys_blocks[1]["cache_control"].get("scope").is_none());
 
-        // Dump for manual inspection.
-        eprintln!(
-            "=== system field JSON ===\n{}",
-            serde_json::to_string_pretty(system).unwrap()
-        );
+        // --- Message breakpoint on last message ---
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+        // First message: no cache_control.
+        assert!(messages[0]["content"][0].get("cache_control").is_none());
+        // Last message's last content block: has cache_control.
+        let last_block = &messages[1]["content"][0];
+        assert_eq!(last_block["cache_control"]["type"], "ephemeral");
     }
 }
