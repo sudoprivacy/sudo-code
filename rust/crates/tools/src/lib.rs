@@ -4916,7 +4916,7 @@ fn build_provider_entry_with_config(
         .map_err(|e| e.to_string())?;
     let wire_model = resolved_provider.model_id.clone();
     let client =
-        ProviderClient::from_resolved(&resolved_provider, None).map_err(|e| e.to_string())?;
+        ProviderClient::from_resolved(&resolved_provider, auth_mode).map_err(|e| e.to_string())?;
     Ok(ProviderEntry {
         model: wire_model,
         client,
