@@ -2806,6 +2806,9 @@ struct AgentJob {
     /// config as the parent, regardless of CWD changes.
     sudocode_config: SudoCodeConfig,
     fallback_config: ProviderFallbackConfig,
+    /// Auth mode detected from env vars at spawn time so the subagent uses the
+    /// same credential path (api-key / proxy / subscription) as the parent.
+    auth_mode: Option<api::AuthMode>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3745,6 +3748,7 @@ fn prepare_agent_job(input: AgentInput) -> Result<PreparedAgent, String> {
     // parent's auth/credential settings rather than re-loading from CWD.
     let sudocode_config = load_sudocode_config();
     let fallback_config = load_provider_fallback_config();
+    let auth_mode = detect_auth_mode_from_env();
     let job = AgentJob {
         manifest: manifest.clone(),
         prompt: input.prompt,
@@ -3752,6 +3756,7 @@ fn prepare_agent_job(input: AgentInput) -> Result<PreparedAgent, String> {
         allowed_tools,
         sudocode_config,
         fallback_config,
+        auth_mode,
     };
     Ok(PreparedAgent { manifest, job })
 }
@@ -3884,6 +3889,7 @@ fn build_agent_runtime(
         allowed_tools.clone(),
         &job.sudocode_config,
         &job.fallback_config,
+        job.auth_mode,
     )?;
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
@@ -4827,12 +4833,13 @@ impl ProviderRuntimeClient {
         allowed_tools: BTreeSet<String>,
         sudocode_config: &SudoCodeConfig,
         fallback_config: &ProviderFallbackConfig,
+        auth_mode: Option<api::AuthMode>,
     ) -> Result<Self, String> {
         let primary_model = fallback_config.primary().map_or(model, str::to_string);
-        let primary = build_provider_entry_with_config(&primary_model, sudocode_config)?;
+        let primary = build_provider_entry_with_config(&primary_model, sudocode_config, auth_mode)?;
         let mut chain = vec![primary];
         for fallback_model in fallback_config.fallbacks() {
-            match build_provider_entry_with_config(fallback_model, sudocode_config) {
+            match build_provider_entry_with_config(fallback_model, sudocode_config, auth_mode) {
                 Ok(entry) => chain.push(entry),
                 Err(error) => {
                     eprintln!(
@@ -4876,15 +4883,16 @@ impl ProviderRuntimeClient {
 #[allow(dead_code)]
 fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
     let sudocode_config = load_sudocode_config();
-    build_provider_entry_with_config(model, &sudocode_config)
+    build_provider_entry_with_config(model, &sudocode_config, None)
 }
 
 fn build_provider_entry_with_config(
     model: &str,
     sudocode_config: &SudoCodeConfig,
+    auth_mode: Option<api::AuthMode>,
 ) -> Result<ProviderEntry, String> {
-    let resolved_provider =
-        resolve_provider_from_config(model, None, sudocode_config).map_err(|e| e.to_string())?;
+    let resolved_provider = resolve_provider_from_config(model, auth_mode, sudocode_config)
+        .map_err(|e| e.to_string())?;
     let wire_model = resolved_provider.model_id.clone();
     let client =
         ProviderClient::from_resolved(&resolved_provider, None).map_err(|e| e.to_string())?;
@@ -4892,6 +4900,26 @@ fn build_provider_entry_with_config(
         model: wire_model,
         client,
     })
+}
+
+/// Detect the auth mode from environment variables, mirroring the priority
+/// in `resolve_startup_auth_source`: `ANTHROPIC_API_KEY` → api-key,
+/// `PROXY_AUTH_TOKEN` → proxy, `CLAUDE_CODE_OAUTH_TOKEN` → subscription.
+fn detect_auth_mode_from_env() -> Option<api::AuthMode> {
+    fn env_set(name: &str) -> bool {
+        std::env::var(name)
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+    }
+    if env_set("ANTHROPIC_API_KEY") {
+        Some(api::AuthMode::ApiKey)
+    } else if env_set("PROXY_AUTH_TOKEN") {
+        Some(api::AuthMode::Proxy)
+    } else if env_set("CLAUDE_CODE_OAUTH_TOKEN") {
+        Some(api::AuthMode::Subscription)
+    } else {
+        None
+    }
 }
 
 fn load_sudocode_config() -> SudoCodeConfig {
