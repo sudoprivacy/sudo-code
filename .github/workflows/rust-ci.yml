@@ -25,6 +25,16 @@ on:
       - .github/workflows/rust-ci.yml
       - .github/workflows/release.yml
       - .github/scripts/check_doc_source_of_truth.py
+      - README.md
+      - USAGE.md
+      - PARITY.md
+      - PHILOSOPHY.md
+      - ROADMAP.md
+      - LAST_PARITY_SYNC_COMMIT
+      - docs/**
+      - rust/**
+      - .github/workflows/release.yml
+      - .github/scripts/check_doc_source_of_truth.py
       - .github/FUNDING.yml
       - README.md
       - USAGE.md
