@@ -237,9 +237,11 @@ fn main() {
         if json_output {
             // #77: classify error by prefix so downstream consumers can route without
             // regex-scraping the prose. Split short-reason from hint-runbook.
+            // #64: emit to stdout (not stderr) so JSON-mode consumers capturing only
+            // stdout receive errors with the same envelope as success responses.
             let kind = classify_error_kind(&message);
             let (short_reason, hint) = split_error_hint(&message);
-            eprintln!(
+            println!(
                 "{}",
                 serde_json::json!({
                     "type": "error",
