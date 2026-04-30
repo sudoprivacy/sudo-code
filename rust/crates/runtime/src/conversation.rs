@@ -23,6 +23,11 @@ use crate::usage::{TokenUsage, UsageTracker};
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 
+/// Message appended to the conversation when a turn is interrupted by the
+/// user.  This tells the model that the previous response was cut short.
+const INTERRUPT_MESSAGE: &str = "User interrupted the response. \
+    You may continue where you left off or start a new approach.";
+
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -344,6 +349,83 @@ where
         }
     }
 
+    /// Preserve partial progress when a turn is cancelled.
+    ///
+    /// 1. Build an assistant message from whatever events were collected
+    ///    before the abort signal fired and push it to the session.
+    /// 2. For every `tool_use` block in that partial message, generate a
+    ///    synthetic `tool_result` with `is_error: true` so the API contract
+    ///    (every `tool_use` must have a matching `tool_result`) is maintained.
+    /// 3. Append a user interruption message so the model knows the previous
+    ///    response was cut short.
+    fn finalize_cancelled_turn(&mut self, events: Vec<AssistantEvent>) {
+        // Build partial assistant message from whatever events arrived.
+        let mut text = String::new();
+        let mut blocks = Vec::new();
+        for event in events {
+            match event {
+                AssistantEvent::TextDelta(delta) => text.push_str(&delta),
+                AssistantEvent::ToolUse {
+                    id,
+                    name,
+                    input,
+                    thought_signature,
+                } => {
+                    flush_text_block(&mut text, &mut blocks);
+                    blocks.push(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        thought_signature,
+                    });
+                }
+                AssistantEvent::Usage(_)
+                | AssistantEvent::PromptCache(_)
+                | AssistantEvent::MessageStop => {}
+            }
+        }
+        flush_text_block(&mut text, &mut blocks);
+
+        if blocks.is_empty() {
+            // No content was streamed — nothing to preserve except the
+            // interruption marker.
+            let _ = self
+                .session
+                .push_message(ConversationMessage::user_text(INTERRUPT_MESSAGE));
+            return;
+        }
+
+        // Extract tool_use ids before pushing the assistant message.
+        let pending_tool_ids: Vec<(String, String)> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, name, .. } => Some((id.clone(), name.clone())),
+                _ => None,
+            })
+            .collect();
+
+        // Push the partial assistant message.
+        let _ = self
+            .session
+            .push_message(ConversationMessage::assistant(blocks));
+
+        // Generate synthetic error tool_results for any tool_use blocks
+        // that never got real results.
+        for (tool_use_id, tool_name) in pending_tool_ids {
+            let _ = self.session.push_message(ConversationMessage::tool_result(
+                tool_use_id,
+                tool_name,
+                "Interrupted by user",
+                true,
+            ));
+        }
+
+        // Tell the model the response was interrupted.
+        let _ = self
+            .session
+            .push_message(ConversationMessage::user_text(INTERRUPT_MESSAGE));
+    }
+
     #[allow(clippy::too_many_lines)]
     pub async fn run_turn(
         &mut self,
@@ -393,10 +475,6 @@ where
         self.session
             .push_user_blocks(blocks)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
-        // The user message is now part of the session. On cancellation we
-        // keep it but discard any assistant / tool-result messages that
-        // were added during this turn's iterations.
-        let session_len_after_user = self.session.messages.len();
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
@@ -405,9 +483,7 @@ where
 
         loop {
             if self.hook_abort_signal.is_aborted() {
-                // Keep the user prompt but discard incomplete assistant /
-                // tool-result messages from the cancelled iterations.
-                self.session.messages.truncate(session_len_after_user);
+                self.finalize_cancelled_turn(Vec::new());
                 return Err(RuntimeError::new("turn cancelled by abort signal"));
             }
 
@@ -444,9 +520,7 @@ where
                             // Drop the stream to close the HTTP connection
                             // and stop token consumption.
                             drop(stream);
-                            // Keep the user prompt but discard incomplete
-                            // assistant / tool-result messages.
-                            self.session.messages.truncate(session_len_after_user);
+                            self.finalize_cancelled_turn(collected);
                             return Err(RuntimeError::new(
                                 "turn cancelled by abort signal",
                             ));
