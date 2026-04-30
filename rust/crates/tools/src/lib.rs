@@ -680,7 +680,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "subagent_type": { "type": "string", "description": "Agent type specialization (e.g. Explore, general-purpose)" },
                     "name": { "type": "string", "description": "Optional human-readable label for this agent" },
                     "model": { "type": "string", "description": "Model ID override; defaults to the system default" },
-                    "run_in_background": { "type": "boolean", "description": "When true (default), launch async and retrieve result later with TaskOutput(agent_id=..., block=true). When false, run synchronously and return the result." }
+                    "run_in_background": { "type": "boolean", "description": "When true (default), launch async and retrieve result later with TaskOutput(agent_id=..., block=true). When false, run synchronously and return the result." },
+                    "auth_mode": { "type": "string", "enum": ["api-key", "proxy", "subscription"], "description": "Explicit auth mode for the subagent. Overrides auto-detection from config." }
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": false
@@ -2476,6 +2477,9 @@ struct AgentInput {
     model: Option<String>,
     #[serde(default)]
     run_in_background: Option<bool>,
+    /// Explicit auth mode: `"api-key"`, `"proxy"`, or `"subscription"`.
+    /// When set, overrides the config's auto-detect priority.
+    auth_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3748,7 +3752,11 @@ fn prepare_agent_job(input: AgentInput) -> Result<PreparedAgent, String> {
     // parent's auth/credential settings rather than re-loading from CWD.
     let sudocode_config = load_sudocode_config();
     let fallback_config = load_provider_fallback_config();
-    let auth_mode = detect_auth_mode_from_env();
+    let auth_mode = input
+        .auth_mode
+        .as_deref()
+        .map(api::AuthMode::parse)
+        .transpose()?;
     let job = AgentJob {
         manifest: manifest.clone(),
         prompt: input.prompt,
@@ -4900,26 +4908,6 @@ fn build_provider_entry_with_config(
         model: wire_model,
         client,
     })
-}
-
-/// Detect the auth mode from environment variables, mirroring the priority
-/// in `resolve_startup_auth_source`: `ANTHROPIC_API_KEY` → api-key,
-/// `PROXY_AUTH_TOKEN` → proxy, `CLAUDE_CODE_OAUTH_TOKEN` → subscription.
-fn detect_auth_mode_from_env() -> Option<api::AuthMode> {
-    fn env_set(name: &str) -> bool {
-        std::env::var(name)
-            .ok()
-            .is_some_and(|v| !v.trim().is_empty())
-    }
-    if env_set("ANTHROPIC_API_KEY") {
-        Some(api::AuthMode::ApiKey)
-    } else if env_set("PROXY_AUTH_TOKEN") {
-        Some(api::AuthMode::Proxy)
-    } else if env_set("CLAUDE_CODE_OAUTH_TOKEN") {
-        Some(api::AuthMode::Subscription)
-    } else {
-        None
-    }
 }
 
 fn load_sudocode_config() -> SudoCodeConfig {
@@ -8167,6 +8155,7 @@ mod tests {
                 name: Some("ship-audit".to_string()),
                 model: None,
                 run_in_background: None,
+                auth_mode: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -8249,6 +8238,7 @@ mod tests {
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
                 run_in_background: None,
+                auth_mode: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8307,6 +8297,7 @@ mod tests {
                 name: Some("fail-task".to_string()),
                 model: None,
                 run_in_background: None,
+                auth_mode: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8355,6 +8346,7 @@ mod tests {
                 name: Some("summary-floor".to_string()),
                 model: None,
                 run_in_background: None,
+                auth_mode: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8401,6 +8393,7 @@ mod tests {
                 name: Some("recovery-lane".to_string()),
                 model: None,
                 run_in_background: None,
+                auth_mode: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8450,6 +8443,7 @@ mod tests {
                 name: Some("review-lane".to_string()),
                 model: None,
                 run_in_background: None,
+                auth_mode: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8491,6 +8485,7 @@ mod tests {
                 name: Some("backlog-scan".to_string()),
                 model: None,
                 run_in_background: None,
+                auth_mode: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8538,6 +8533,7 @@ mod tests {
                 name: Some("artifact-lane".to_string()),
                 model: None,
                 run_in_background: None,
+                auth_mode: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8609,6 +8605,7 @@ mod tests {
                 name: Some("cron-closeout".to_string()),
                 model: None,
                 run_in_background: None,
+                auth_mode: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8651,6 +8648,7 @@ mod tests {
                 name: Some("spawn-error".to_string()),
                 model: None,
                 run_in_background: None,
+                auth_mode: None,
             },
             |_| Err(String::from("thread creation failed")),
         )
@@ -8949,6 +8947,7 @@ mod tests {
                 name: Some("calc-task".to_string()),
                 model: None,
                 run_in_background: None,
+                auth_mode: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8993,6 +8992,7 @@ mod tests {
                 name: Some("fail-calc".to_string()),
                 model: None,
                 run_in_background: None,
+                auth_mode: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9034,6 +9034,7 @@ mod tests {
                 name: Some("slow-calc".to_string()),
                 model: None,
                 run_in_background: None,
+                auth_mode: None,
             },
             |job| {
                 let thread_name = format!("sudocode-agent-{}", job.manifest.agent_id);
@@ -9079,6 +9080,7 @@ mod tests {
                 name: None,
                 model: None,
                 run_in_background: None,
+                auth_mode: None,
             },
             |_job| Ok(()), // spawn but don't complete — manifest stays "running"
         )
@@ -9108,6 +9110,7 @@ mod tests {
                 name: None,
                 model: None,
                 run_in_background: None,
+                auth_mode: None,
             },
             |_job| Ok(()),
         )
@@ -9158,6 +9161,7 @@ mod tests {
                 name: None,
                 model: None,
                 run_in_background: None,
+                auth_mode: None,
             },
             |_job| Ok(()),
         )
