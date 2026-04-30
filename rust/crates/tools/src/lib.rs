@@ -32,6 +32,15 @@ use runtime::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// Global abort flag for agent polling loops. Callers (e.g. Ctrl-C handlers) set this to true
+/// to unblock any in-progress `await_agent_output` poll.
+static AGENT_POLL_ABORT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_agent_poll_abort(aborted: bool) {
+    AGENT_POLL_ABORT.store(aborted, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Global task registry shared across tool invocations within a session.
 fn global_lsp_registry() -> &'static LspRegistry {
     use std::sync::OnceLock;
@@ -575,12 +584,12 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "description": { "type": "string" },
-                    "prompt": { "type": "string" },
-                    "subagent_type": { "type": "string" },
-                    "name": { "type": "string" },
-                    "model": { "type": "string" },
-                    "run_in_background": { "type": "boolean" }
+                    "description": { "type": "string", "description": "A short (3-5 word) description of the task" },
+                    "prompt": { "type": "string", "description": "The full task prompt for the agent" },
+                    "subagent_type": { "type": "string", "description": "Agent type specialization (e.g. Explore, general-purpose)" },
+                    "name": { "type": "string", "description": "Optional human-readable label for this agent" },
+                    "model": { "type": "string", "description": "Model ID override; defaults to the system default" },
+                    "run_in_background": { "type": "boolean", "description": "Set true to launch async and retrieve result later with TaskOutput(agent_id=..., block=true); defaults to false (synchronous)" }
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": false
@@ -847,10 +856,10 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "task_id": { "type": "string" },
-                    "agent_id": { "type": "string" },
-                    "block": { "type": "boolean" },
-                    "timeout_ms": { "type": "integer", "minimum": 0 }
+                    "task_id": { "type": "string", "description": "ID of a TaskRegistry task to retrieve output from" },
+                    "agent_id": { "type": "string", "description": "ID of a background agent launched with Agent(run_in_background=true)" },
+                    "block": { "type": "boolean", "description": "When true (default), wait until the agent finishes before returning" },
+                    "timeout_ms": { "type": "integer", "minimum": 0, "description": "Maximum milliseconds to wait when block=true (default 30000)" }
                 },
                 "additionalProperties": false
             }),
@@ -1507,11 +1516,17 @@ fn await_agent_output(agent_id: &str, block: bool, timeout_ms: u64) -> Result<Va
         std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
     loop {
-        if !manifest_path.exists() {
-            return Err(format!("agent not found: {agent_id}"));
+        if AGENT_POLL_ABORT.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(String::from("agent polling aborted by shutdown signal"));
         }
-        let contents =
-            std::fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
+
+        let contents = match std::fs::read_to_string(&manifest_path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!("agent not found: {agent_id}"));
+            }
+            Err(e) => return Err(e.to_string()),
+        };
         let manifest: AgentOutput =
             serde_json::from_str(&contents).map_err(|e| e.to_string())?;
 
@@ -2483,10 +2498,14 @@ struct TaskUpdateInput {
 struct TaskOutputInput {
     task_id: Option<String>,
     agent_id: Option<String>,
-    #[serde(default)]
+    #[serde(default = "default_block_true")]
     block: bool,
     #[serde(default = "default_task_output_timeout_ms")]
     timeout_ms: u64,
+}
+
+const fn default_block_true() -> bool {
+    true
 }
 
 const fn default_task_output_timeout_ms() -> u64 {
@@ -3708,10 +3727,21 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
 
 fn run_agent_job_returning_text(job: &AgentJob) -> Result<String, String> {
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
-    let tokio_rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    let summary = tokio_rt
-        .block_on(runtime.run_turn(job.prompt.clone(), None, None))
-        .map_err(|error| error.to_string())?;
+    // When called from within a tokio context (inline agent), use block_in_place to avoid
+    // "Cannot start a runtime from within a runtime". When called from a plain std thread
+    // (background agent via spawn_agent_job), fall back to a fresh runtime.
+    let summary = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle
+                .block_on(runtime.run_turn(job.prompt.clone(), None, None))
+                .map_err(|e| e.to_string())
+        })?,
+        Err(_) => {
+            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+            rt.block_on(runtime.run_turn(job.prompt.clone(), None, None))
+                .map_err(|e| e.to_string())?
+        }
+    };
     Ok(final_assistant_text(&summary))
 }
 
@@ -3851,11 +3881,12 @@ fn agent_permission_policy() -> PermissionPolicy {
 fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
     let mut normalized = manifest.clone();
     normalized.lane_events = dedupe_superseded_commit_events(&normalized.lane_events);
-    std::fs::write(
-        &normalized.manifest_file,
-        serde_json::to_string_pretty(&normalized).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())
+    let json = serde_json::to_string_pretty(&normalized).map_err(|e| e.to_string())?;
+    // Write to a temp file then rename for atomic visibility — prevents a poller
+    // reading a partially-written file during truncate-then-write.
+    let tmp_path = format!("{}.tmp", normalized.manifest_file);
+    std::fs::write(&tmp_path, &json).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp_path, &normalized.manifest_file).map_err(|e| e.to_string())
 }
 
 fn persist_agent_terminal_state(
