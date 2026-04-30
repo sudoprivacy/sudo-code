@@ -3815,21 +3815,13 @@ fn execute_agent_inline(input: AgentInput) -> Result<AgentOutput, String> {
 }
 
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
-    // Use tokio's managed blocking thread pool (default 512, configurable via
-    // TOKIO_BLOCKING_THREADS) when a runtime is available. This scales to 100+
-    // concurrent agents without hitting OS thread limits. Falls back to a raw
-    // OS thread when no tokio runtime is present (e.g. plain CLI mode).
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn_blocking(move || run_spawned_agent_job(job));
-        Ok(())
-    } else {
-        let thread_name = format!("sudocode-agent-{}", job.manifest.agent_id);
-        std::thread::Builder::new()
-            .name(thread_name)
-            .spawn(move || run_spawned_agent_job(job))
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    }
+    // Tool executors always run inside a tokio runtime, so spawn on tokio's
+    // managed blocking thread pool (default 512, configurable via
+    // TOKIO_BLOCKING_THREADS). Scales to 100+ concurrent agents.
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| String::from("no tokio runtime available for spawning agent"))?;
+    handle.spawn_blocking(move || run_spawned_agent_job(job));
+    Ok(())
 }
 
 #[allow(clippy::needless_pass_by_value)] // ownership required for move into spawn_blocking
@@ -8156,8 +8148,9 @@ mod tests {
         assert_eq!(selected_with_alias_output["matches"][1], "Skill");
     }
 
-    #[test]
-    fn agent_persists_handoff_metadata() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn agent_persists_handoff_metadata() {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
