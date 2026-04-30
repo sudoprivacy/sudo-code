@@ -259,10 +259,8 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
     let mut files = Vec::new();
     for dir in directories {
         for candidate in [
-            dir.join("CLAUDE.md"),
-            dir.join("CLAUDE.local.md"),
-            dir.join(".nexus").join("sudocode").join("CLAUDE.md"),
-            dir.join(".nexus").join("sudocode").join("instructions.md"),
+            dir.join("AGENTS.md"),
+            dir.join(".nexus").join("sudocode").join("AGENTS.md"),
         ] {
             push_context_file(&mut files, candidate)?;
         }
@@ -662,36 +660,25 @@ mod tests {
     fn discovers_instruction_files_from_ancestor_chain() {
         let root = temp_dir();
         let nested = root.join("apps").join("api");
+        fs::create_dir_all(&nested).expect("nested dir");
+        // Root: AGENTS.md + .nexus/sudocode/AGENTS.md
+        fs::create_dir_all(root.join(".nexus").join("sudocode")).expect("root sudocode dir");
+        fs::write(root.join("AGENTS.md"), "root agents").expect("write root AGENTS.md");
+        fs::write(
+            root.join(".nexus").join("sudocode").join("AGENTS.md"),
+            "root nexus agents",
+        )
+        .expect("write root nexus AGENTS.md");
+        // apps/: AGENTS.md only
+        fs::write(root.join("apps").join("AGENTS.md"), "apps agents")
+            .expect("write apps AGENTS.md");
+        // apps/api/: .nexus/sudocode/AGENTS.md only
         fs::create_dir_all(nested.join(".nexus").join("sudocode")).expect("nested sudocode dir");
-        fs::write(root.join("CLAUDE.md"), "root instructions").expect("write root instructions");
-        fs::write(root.join("CLAUDE.local.md"), "local instructions")
-            .expect("write local instructions");
-        fs::create_dir_all(root.join("apps")).expect("apps dir");
-        fs::create_dir_all(root.join("apps").join(".nexus").join("sudocode"))
-            .expect("apps sudocode dir");
-        fs::write(root.join("apps").join("CLAUDE.md"), "apps instructions")
-            .expect("write apps instructions");
         fs::write(
-            root.join("apps")
-                .join(".nexus")
-                .join("sudocode")
-                .join("instructions.md"),
-            "apps dot claude instructions",
+            nested.join(".nexus").join("sudocode").join("AGENTS.md"),
+            "nested nexus agents",
         )
-        .expect("write apps dot claude instructions");
-        fs::write(
-            nested.join(".nexus").join("sudocode").join("CLAUDE.md"),
-            "nested rules",
-        )
-        .expect("write nested rules");
-        fs::write(
-            nested
-                .join(".nexus")
-                .join("sudocode")
-                .join("instructions.md"),
-            "nested instructions",
-        )
-        .expect("write nested instructions");
+        .expect("write nested nexus AGENTS.md");
 
         let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
         let contents = context
@@ -703,12 +690,10 @@ mod tests {
         assert_eq!(
             contents,
             vec![
-                "root instructions",
-                "local instructions",
-                "apps instructions",
-                "apps dot claude instructions",
-                "nested rules",
-                "nested instructions"
+                "root agents",
+                "root nexus agents",
+                "apps agents",
+                "nested nexus agents",
             ]
         );
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -719,8 +704,8 @@ mod tests {
         let root = temp_dir();
         let nested = root.join("apps").join("api");
         fs::create_dir_all(&nested).expect("nested dir");
-        fs::write(root.join("CLAUDE.md"), "same rules\n\n").expect("write root");
-        fs::write(nested.join("CLAUDE.md"), "same rules\n").expect("write nested");
+        fs::write(root.join("AGENTS.md"), "same rules\n\n").expect("write root");
+        fs::write(nested.join("AGENTS.md"), "same rules\n").expect("write nested");
 
         let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
         assert_eq!(context.instruction_files.len(), 1);
@@ -748,8 +733,8 @@ mod tests {
     #[test]
     fn displays_context_paths_compactly() {
         assert_eq!(
-            display_context_path(Path::new("/tmp/project/.nexus/sudocode/CLAUDE.md")),
-            "CLAUDE.md"
+            display_context_path(Path::new("/tmp/project/.nexus/sudocode/AGENTS.md")),
+            "AGENTS.md"
         );
     }
 
@@ -764,7 +749,6 @@ mod tests {
             .current_dir(&root)
             .status()
             .expect("git init should run");
-        fs::write(root.join("CLAUDE.md"), "rules").expect("write instructions");
         fs::write(root.join("tracked.txt"), "hello").expect("write tracked file");
 
         let context =
@@ -772,7 +756,6 @@ mod tests {
 
         let status = context.git_status.expect("git status should be present");
         assert!(status.contains("## No commits yet on") || status.contains("## "));
-        assert!(status.contains("?? CLAUDE.md"));
         assert!(status.contains("?? tracked.txt"));
         assert!(context.git_diff.is_none());
 
@@ -906,10 +889,10 @@ mod tests {
     }
 
     #[test]
-    fn load_system_prompt_reads_claude_files_and_config() {
+    fn load_system_prompt_reads_instruction_files_and_config() {
         let root = temp_dir();
         fs::create_dir_all(root.join(".nexus").join("sudocode")).expect("scode dir");
-        fs::write(root.join("CLAUDE.md"), "Project rules").expect("write instructions");
+        fs::write(root.join("AGENTS.md"), "Project rules").expect("write AGENTS.md");
         fs::write(
             root.join(".nexus").join("sudocode").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
@@ -945,10 +928,10 @@ mod tests {
     }
 
     #[test]
-    fn renders_claude_code_style_sections_with_project_context() {
+    fn renders_sections_with_project_context() {
         let root = temp_dir();
         fs::create_dir_all(root.join(".nexus").join("sudocode")).expect("scode dir");
-        fs::write(root.join("CLAUDE.md"), "Project rules").expect("write CLAUDE.md");
+        fs::write(root.join("AGENTS.md"), "Project rules").expect("write AGENTS.md");
         fs::write(
             root.join(".nexus").join("sudocode").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
@@ -990,27 +973,23 @@ mod tests {
     }
 
     #[test]
-    fn discovers_dot_claude_instructions_markdown() {
+    fn discovers_nexus_agents_md() {
         let root = temp_dir();
         let nested = root.join("apps").join("api");
         fs::create_dir_all(nested.join(".nexus").join("sudocode")).expect("nested sudocode dir");
         fs::write(
-            nested
-                .join(".nexus")
-                .join("sudocode")
-                .join("instructions.md"),
-            "instruction markdown",
+            nested.join(".nexus").join("sudocode").join("AGENTS.md"),
+            "nexus agent instructions",
         )
-        .expect("write instructions.md");
+        .expect("write AGENTS.md");
 
         let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
         assert!(context
             .instruction_files
             .iter()
-            .any(|file| file.path.ends_with(".nexus/sudocode/instructions.md")));
-        assert!(
-            render_instruction_files(&context.instruction_files).contains("instruction markdown")
-        );
+            .any(|file| file.path.ends_with(".nexus/sudocode/AGENTS.md")));
+        assert!(render_instruction_files(&context.instruction_files)
+            .contains("nexus agent instructions"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -1018,7 +997,7 @@ mod tests {
     #[test]
     fn renders_instruction_file_metadata() {
         let rendered = render_instruction_files(&[ContextFile {
-            path: PathBuf::from("/tmp/project/CLAUDE.md"),
+            path: PathBuf::from("/tmp/project/AGENTS.md"),
             content: "Project rules".to_string(),
         }]);
         assert!(rendered.contains("# Project instructions"));
