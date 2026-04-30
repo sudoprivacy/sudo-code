@@ -3707,6 +3707,12 @@ fn build_runtime_with_plugin_state(
         system_prompt,
         &feature_config,
     );
+    if let Some(secs) = feature_config.turn_timeout_secs() {
+        runtime = runtime.with_turn_timeout(Duration::from_secs(secs));
+    }
+    if let Some(secs) = feature_config.stream_stall_timeout_secs() {
+        runtime = runtime.with_stream_stall_timeout(Duration::from_secs(secs));
+    }
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }

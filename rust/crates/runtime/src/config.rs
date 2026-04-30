@@ -136,6 +136,10 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    /// Wall-clock limit for an entire turn in seconds (`turnTimeoutSecs`).
+    pub turn_timeout_secs: Option<u64>,
+    /// Maximum idle time between SSE events in seconds (`streamStallTimeoutSecs`).
+    pub stream_stall_timeout_secs: Option<u64>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -390,6 +394,12 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            turn_timeout_secs: optional_u64(&merged, "turnTimeoutSecs", "merged settings")?,
+            stream_stall_timeout_secs: optional_u64(
+                &merged,
+                "streamStallTimeoutSecs",
+                "merged settings",
+            )?,
         };
 
         Ok(RuntimeConfig {
@@ -578,6 +588,16 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
+    }
+
+    #[must_use]
+    pub fn turn_timeout_secs(&self) -> Option<u64> {
+        self.turn_timeout_secs
+    }
+
+    #[must_use]
+    pub fn stream_stall_timeout_secs(&self) -> Option<u64> {
+        self.stream_stall_timeout_secs
     }
 }
 
