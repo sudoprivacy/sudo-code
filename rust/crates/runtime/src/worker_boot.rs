@@ -30,6 +30,7 @@ fn now_secs() -> u64 {
 pub enum WorkerStatus {
     Spawning,
     TrustRequired,
+    ToolPermissionRequired,
     ReadyForPrompt,
     Running,
     Finished,
@@ -41,6 +42,7 @@ impl std::fmt::Display for WorkerStatus {
         match self {
             Self::Spawning => write!(f, "spawning"),
             Self::TrustRequired => write!(f, "trust_required"),
+            Self::ToolPermissionRequired => write!(f, "tool_permission_required"),
             Self::ReadyForPrompt => write!(f, "ready_for_prompt"),
             Self::Running => write!(f, "running"),
             Self::Finished => write!(f, "finished"),
@@ -53,6 +55,7 @@ impl std::fmt::Display for WorkerStatus {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerFailureKind {
     TrustGate,
+    ToolPermissionGate,
     PromptDelivery,
     Protocol,
     Provider,
@@ -72,6 +75,7 @@ pub enum WorkerEventKind {
     Spawning,
     TrustRequired,
     TrustResolved,
+    ToolPermissionRequired,
     ReadyForPrompt,
     PromptMisdelivery,
     PromptReplayArmed,
@@ -98,12 +102,27 @@ pub enum WorkerPromptTarget {
     Unknown,
 }
 
+/// Scope of the tool permission allow action offered in the prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPermissionAllowScope {
+    /// Only allow the tool for the current session
+    SessionOnly,
+    /// Allow the tool for this session or always (both options visible)
+    SessionOrAlways,
+    /// Scope could not be determined from screen text
+    #[default]
+    Unknown,
+}
+
 /// Classification of startup failure when no evidence is available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupFailureClassification {
     /// Trust prompt is required but not detected/resolved
     TrustRequired,
+    /// MCP/tool permission prompt is blocking startup
+    ToolPermissionRequired,
     /// Prompt was delivered to wrong target (shell misdelivery)
     PromptMisdelivery,
     /// Prompt was sent but acceptance timed out
@@ -130,6 +149,13 @@ pub struct StartupEvidenceBundle {
     pub prompt_acceptance_state: bool,
     /// Result of trust prompt detection at timeout
     pub trust_prompt_detected: bool,
+    /// Whether a tool/MCP permission prompt was detected during startup
+    pub tool_permission_prompt_detected: bool,
+    /// Seconds since the tool permission prompt was first detected, if applicable
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_permission_prompt_age_seconds: Option<u64>,
+    /// Scope of the allow action offered in the tool permission prompt
+    pub tool_permission_allow_scope: ToolPermissionAllowScope,
     /// Transport health summary (true = healthy/responsive)
     pub transport_healthy: bool,
     /// MCP health summary (true = all servers healthy)
@@ -145,6 +171,13 @@ pub enum WorkerEventPayload {
         cwd: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         resolution: Option<WorkerTrustResolution>,
+    },
+    ToolPermissionPrompt {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        allow_scope: ToolPermissionAllowScope,
     },
     PromptDelivery {
         prompt_preview: String,
@@ -311,6 +344,32 @@ impl WorkerRegistry {
             } else {
                 return Ok(worker.clone());
             }
+        }
+
+        if let Some(detection) = detect_tool_permission_prompt(screen_text, &lowered) {
+            if worker.status != WorkerStatus::ToolPermissionRequired {
+                worker.last_error = Some(WorkerFailure {
+                    kind: WorkerFailureKind::ToolPermissionGate,
+                    message: format!(
+                        "worker boot blocked on tool permission prompt: server={}, tool={}",
+                        detection.server_name.as_deref().unwrap_or("unknown"),
+                        detection.tool_name.as_deref().unwrap_or("unknown"),
+                    ),
+                    created_at: now_secs(),
+                });
+                push_event(
+                    worker,
+                    WorkerEventKind::ToolPermissionRequired,
+                    WorkerStatus::ToolPermissionRequired,
+                    Some("tool permission prompt detected".to_string()),
+                    Some(WorkerEventPayload::ToolPermissionPrompt {
+                        server_name: detection.server_name,
+                        tool_name: detection.tool_name,
+                        allow_scope: detection.allow_scope,
+                    }),
+                );
+            }
+            return Ok(worker.clone());
         }
 
         if let Some(observation) = prompt_misdelivery_is_relevant(worker)
@@ -503,7 +562,9 @@ impl WorkerRegistry {
             ready: worker.status == WorkerStatus::ReadyForPrompt,
             blocked: matches!(
                 worker.status,
-                WorkerStatus::TrustRequired | WorkerStatus::Failed
+                WorkerStatus::TrustRequired
+                    | WorkerStatus::ToolPermissionRequired
+                    | WorkerStatus::Failed
             ),
             replay_prompt_ready: worker.replay_prompt.is_some(),
             last_error: worker.last_error.clone(),
@@ -625,6 +686,23 @@ impl WorkerRegistry {
         let now = now_secs();
         let elapsed = now.saturating_sub(worker.created_at);
 
+        let tool_permission_event = worker
+            .events
+            .iter()
+            .filter(|e| e.kind == WorkerEventKind::ToolPermissionRequired)
+            .last();
+        let tool_permission_prompt_detected = tool_permission_event.is_some();
+        let tool_permission_prompt_age_seconds =
+            tool_permission_event.map(|e| now.saturating_sub(e.timestamp));
+        let tool_permission_allow_scope = tool_permission_event
+            .and_then(|e| match &e.payload {
+                Some(WorkerEventPayload::ToolPermissionPrompt { allow_scope, .. }) => {
+                    Some(*allow_scope)
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+
         // Build evidence bundle
         let evidence = StartupEvidenceBundle {
             last_lifecycle_state: worker.status,
@@ -640,6 +718,9 @@ impl WorkerRegistry {
                 .events
                 .iter()
                 .any(|e| e.kind == WorkerEventKind::TrustRequired),
+            tool_permission_prompt_detected,
+            tool_permission_prompt_age_seconds,
+            tool_permission_allow_scope,
             transport_healthy,
             mcp_healthy,
             elapsed_seconds: elapsed,
@@ -692,6 +773,13 @@ fn classify_startup_failure(evidence: &StartupEvidenceBundle) -> StartupFailureC
         && evidence.last_lifecycle_state == WorkerStatus::TrustRequired
     {
         return StartupFailureClassification::TrustRequired;
+    }
+
+    // Check for tool/MCP permission prompt blocking startup
+    if evidence.tool_permission_prompt_detected
+        && evidence.last_lifecycle_state == WorkerStatus::ToolPermissionRequired
+    {
+        return StartupFailureClassification::ToolPermissionRequired;
     }
 
     // Check for prompt acceptance timeout
@@ -815,6 +903,83 @@ fn path_matches_allowlist(cwd: &str, trusted_root: &str) -> bool {
 
 fn normalize_path(path: &str) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| Path::new(path).to_path_buf())
+}
+
+struct ToolPermissionDetection {
+    server_name: Option<String>,
+    tool_name: Option<String>,
+    allow_scope: ToolPermissionAllowScope,
+}
+
+fn detect_tool_permission_prompt(
+    screen_text: &str,
+    lowered: &str,
+) -> Option<ToolPermissionDetection> {
+    let has_prompt = [
+        "allow this tool",
+        "tool permission",
+        "allow tool use",
+        "approve tool",
+        "mcp tool needs",
+        "allow mcp",
+        "grant permission to",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle));
+
+    if !has_prompt {
+        return None;
+    }
+
+    let allow_scope = if lowered.contains("allow always") || lowered.contains("always allow") {
+        ToolPermissionAllowScope::SessionOrAlways
+    } else if lowered.contains("allow for this session") || lowered.contains("session only") {
+        ToolPermissionAllowScope::SessionOnly
+    } else {
+        ToolPermissionAllowScope::Unknown
+    };
+
+    Some(ToolPermissionDetection {
+        server_name: extract_mcp_server_name(screen_text),
+        tool_name: extract_mcp_tool_name(screen_text),
+        allow_scope,
+    })
+}
+
+fn extract_mcp_server_name(screen_text: &str) -> Option<String> {
+    screen_text.lines().find_map(|line| {
+        let lowered = line.to_ascii_lowercase();
+        if lowered.contains("server:") || lowered.contains("mcp server") {
+            line.split_whitespace()
+                .skip_while(|token| !token.to_ascii_lowercase().starts_with("server"))
+                .nth(1)
+                .map(|s| {
+                    s.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                        .to_string()
+                })
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        }
+    })
+}
+
+fn extract_mcp_tool_name(screen_text: &str) -> Option<String> {
+    screen_text.lines().find_map(|line| {
+        let lowered = line.to_ascii_lowercase();
+        if lowered.contains("tool:") || lowered.contains("tool use") {
+            line.split_whitespace()
+                .skip_while(|token| !token.to_ascii_lowercase().starts_with("tool"))
+                .nth(1)
+                .map(|s| {
+                    s.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                        .to_string()
+                })
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        }
+    })
 }
 
 fn detect_trust_prompt(lowered: &str) -> bool {
@@ -1639,6 +1804,9 @@ mod tests {
             prompt_sent_at: Some(1_234_567_890),
             prompt_acceptance_state: false,
             trust_prompt_detected: true,
+            tool_permission_prompt_detected: false,
+            tool_permission_prompt_age_seconds: None,
+            tool_permission_allow_scope: ToolPermissionAllowScope::Unknown,
             transport_healthy: true,
             mcp_healthy: false,
             elapsed_seconds: 60,
@@ -1666,6 +1834,9 @@ mod tests {
             prompt_sent_at: None,
             prompt_acceptance_state: false,
             trust_prompt_detected: false,
+            tool_permission_prompt_detected: false,
+            tool_permission_prompt_age_seconds: None,
+            tool_permission_allow_scope: ToolPermissionAllowScope::Unknown,
             transport_healthy: false,
             mcp_healthy: true,
             elapsed_seconds: 30,
@@ -1683,6 +1854,9 @@ mod tests {
             prompt_sent_at: None,
             prompt_acceptance_state: false,
             trust_prompt_detected: false,
+            tool_permission_prompt_detected: false,
+            tool_permission_prompt_age_seconds: None,
+            tool_permission_allow_scope: ToolPermissionAllowScope::Unknown,
             transport_healthy: true,
             mcp_healthy: true,
             elapsed_seconds: 10,
@@ -1702,6 +1876,9 @@ mod tests {
             prompt_sent_at: None, // No prompt sent yet
             prompt_acceptance_state: false,
             trust_prompt_detected: false,
+            tool_permission_prompt_detected: false,
+            tool_permission_prompt_age_seconds: None,
+            tool_permission_allow_scope: ToolPermissionAllowScope::Unknown,
             transport_healthy: true,
             mcp_healthy: false, // MCP unhealthy but transport healthy suggests crash
             elapsed_seconds: 45,
@@ -1709,5 +1886,121 @@ mod tests {
 
         let classification = classify_startup_failure(&evidence);
         assert_eq!(classification, StartupFailureClassification::WorkerCrashed);
+    }
+
+    #[test]
+    fn tool_permission_prompt_blocks_worker_and_emits_structured_event() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-tool-perm", &[], true);
+
+        let blocked = registry
+            .observe(
+                &worker.worker_id,
+                "MCP tool needs approval\nAllow tool use for: filesystem/read_file\nAllow for this session | Allow always | Deny",
+            )
+            .expect("tool permission observe should succeed");
+
+        assert_eq!(blocked.status, WorkerStatus::ToolPermissionRequired);
+        let error = blocked
+            .last_error
+            .expect("tool permission error should exist");
+        assert_eq!(error.kind, WorkerFailureKind::ToolPermissionGate);
+        assert!(error.message.contains("tool permission prompt"));
+
+        let event = blocked
+            .events
+            .iter()
+            .find(|e| e.kind == WorkerEventKind::ToolPermissionRequired)
+            .expect("tool permission event should exist");
+        assert_eq!(event.status, WorkerStatus::ToolPermissionRequired);
+        match event.payload.as_ref() {
+            Some(WorkerEventPayload::ToolPermissionPrompt { allow_scope, .. }) => {
+                assert_eq!(
+                    *allow_scope,
+                    ToolPermissionAllowScope::SessionOrAlways,
+                    "should detect session-or-always scope from 'Allow always'"
+                );
+            }
+            _ => panic!(
+                "expected ToolPermissionPrompt payload, got {:?}",
+                event.payload
+            ),
+        }
+
+        // Verify await_ready marks it as blocked
+        let snapshot = registry
+            .await_ready(&worker.worker_id)
+            .expect("await ready should succeed");
+        assert!(snapshot.blocked, "tool permission required should be blocked");
+        assert!(!snapshot.ready);
+
+        // Second observe with same screen text should not emit a duplicate event
+        registry
+            .observe(
+                &worker.worker_id,
+                "MCP tool needs approval\nAllow tool use for: filesystem/read_file\nAllow for this session | Allow always | Deny",
+            )
+            .expect("repeated observe should succeed");
+        let after_repeat = registry.get(&worker.worker_id).expect("worker should exist");
+        assert_eq!(
+            after_repeat
+                .events
+                .iter()
+                .filter(|e| e.kind == WorkerEventKind::ToolPermissionRequired)
+                .count(),
+            1,
+            "should not emit duplicate tool permission events"
+        );
+    }
+
+    #[test]
+    fn startup_timeout_classifies_tool_permission_required_when_prompt_detected() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-tool-timeout", &[], true);
+
+        // Simulate tool permission prompt detected during startup
+        registry
+            .observe(
+                &worker.worker_id,
+                "MCP tool needs approval\nGrant permission to server: github tool: create_pull_request\nAllow for this session | Deny",
+            )
+            .expect("tool permission observe should succeed");
+        assert_eq!(
+            registry
+                .get(&worker.worker_id)
+                .expect("worker should exist")
+                .status,
+            WorkerStatus::ToolPermissionRequired
+        );
+
+        // Simulate startup timeout while blocked on tool permission
+        let timed_out = registry
+            .observe_startup_timeout(&worker.worker_id, "scode prompt", true, true)
+            .expect("startup timeout should succeed");
+
+        assert_eq!(timed_out.status, WorkerStatus::Failed);
+        let event = timed_out
+            .events
+            .iter()
+            .find(|e| e.kind == WorkerEventKind::StartupNoEvidence)
+            .expect("startup no evidence event should exist");
+
+        match event.payload.as_ref() {
+            Some(WorkerEventPayload::StartupNoEvidence {
+                evidence,
+                classification,
+            }) => {
+                assert!(
+                    evidence.tool_permission_prompt_detected,
+                    "evidence should record tool permission prompt"
+                );
+                assert_eq!(
+                    *classification,
+                    StartupFailureClassification::ToolPermissionRequired,
+                    "should classify as tool_permission_required"
+                );
+            }
+            _ => panic!("expected StartupNoEvidence payload"),
+        }
     }
 }
