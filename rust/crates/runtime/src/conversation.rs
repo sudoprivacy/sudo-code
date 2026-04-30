@@ -390,10 +390,13 @@ where
         }
 
         self.record_turn_started(&label);
-        let session_len_before_turn = self.session.messages.len();
         self.session
             .push_user_blocks(blocks)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+        // The user message is now part of the session. On cancellation we
+        // keep it but discard any assistant / tool-result messages that
+        // were added during this turn's iterations.
+        let session_len_after_user = self.session.messages.len();
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
@@ -402,9 +405,9 @@ where
 
         loop {
             if self.hook_abort_signal.is_aborted() {
-                // Roll back the session to discard the cancelled turn so the
-                // next prompt does not inherit orphaned messages.
-                self.session.messages.truncate(session_len_before_turn);
+                // Keep the user prompt but discard incomplete assistant /
+                // tool-result messages from the cancelled iterations.
+                self.session.messages.truncate(session_len_after_user);
                 return Err(RuntimeError::new("turn cancelled by abort signal"));
             }
 
@@ -441,10 +444,9 @@ where
                             // Drop the stream to close the HTTP connection
                             // and stop token consumption.
                             drop(stream);
-                            // Roll back the session to discard the cancelled
-                            // turn so the next prompt does not inherit
-                            // orphaned messages.
-                            self.session.messages.truncate(session_len_before_turn);
+                            // Keep the user prompt but discard incomplete
+                            // assistant / tool-result messages.
+                            self.session.messages.truncate(session_len_after_user);
                             return Err(RuntimeError::new(
                                 "turn cancelled by abort signal",
                             ));
