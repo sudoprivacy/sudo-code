@@ -1921,6 +1921,13 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
         }
     }
 
+    fn get_abort_signal(&self, session_id: &str) -> Option<runtime::HookAbortSignal> {
+        self.inner
+            .sessions
+            .get(session_id)
+            .map(|s| s.abort_signal.clone())
+    }
+
     fn set_model(&mut self, session_id: &str, model_id: &str) -> Result<String, runtime::AcpError> {
         self.inner
             .handle_acp_model_switch(session_id, Some(model_id.to_string()))

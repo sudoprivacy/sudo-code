@@ -539,7 +539,23 @@ where
                         }
                         next = stream.next() => {
                             match next {
-                                Some(Ok(event)) => collected.push(event),
+                                Some(Ok(event)) => {
+                                    // Notify the observer in real time as events
+                                    // arrive from the API stream so ACP clients
+                                    // receive incremental updates.
+                                    if let Some(obs) = observer.as_mut() {
+                                        match &event {
+                                            AssistantEvent::TextDelta(delta) => {
+                                                obs.on_text_delta(delta);
+                                            }
+                                            AssistantEvent::ToolUse { id, name, input, .. } => {
+                                                obs.on_tool_use(id, name, input);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    collected.push(event);
+                                }
                                 Some(Err(error)) => {
                                     self.record_turn_failed(iterations, &error);
                                     return Err(error);
@@ -553,7 +569,7 @@ where
             };
 
             let (assistant_message, usage, turn_prompt_cache_events) =
-                match build_assistant_message(events, runtime_observer_mut(&mut observer)) {
+                match build_assistant_message(events) {
                     Ok(result) => result,
                     Err(error) => {
                         self.record_turn_failed(iterations, &error);
@@ -913,7 +929,6 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
 
 fn build_assistant_message(
     events: Vec<AssistantEvent>,
-    mut observer: Option<&mut dyn RuntimeObserver>,
 ) -> Result<
     (
         ConversationMessage,
@@ -931,9 +946,6 @@ fn build_assistant_message(
     for event in events {
         match event {
             AssistantEvent::TextDelta(delta) => {
-                if let Some(observer) = observer.as_mut() {
-                    observer.on_text_delta(&delta);
-                }
                 text.push_str(&delta);
             }
             AssistantEvent::ToolUse {
@@ -942,9 +954,6 @@ fn build_assistant_message(
                 input,
                 thought_signature,
             } => {
-                if let Some(observer) = observer.as_mut() {
-                    observer.on_tool_use(&id, &name, &input);
-                }
                 flush_text_block(&mut text, &mut blocks);
                 blocks.push(ContentBlock::ToolUse {
                     id,
@@ -2217,7 +2226,7 @@ mod tests {
         let events = vec![AssistantEvent::TextDelta("hello".to_string())];
 
         // when
-        let error = build_assistant_message(events, None)
+        let error = build_assistant_message(events)
             .expect_err("assistant messages should require a stop event");
 
         // then
@@ -2232,8 +2241,8 @@ mod tests {
         let events = vec![AssistantEvent::MessageStop];
 
         // when
-        let error = build_assistant_message(events, None)
-            .expect_err("assistant messages should require content");
+        let error =
+            build_assistant_message(events).expect_err("assistant messages should require content");
 
         // then
         assert!(error
