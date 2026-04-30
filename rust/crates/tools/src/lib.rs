@@ -69,6 +69,106 @@ fn global_worker_registry() -> &'static WorkerRegistry {
     REGISTRY.get_or_init(WorkerRegistry::new)
 }
 
+/// In-process registry that tracks running agent threads and allows callers
+/// to block until an agent reaches a terminal state ("completed" or "failed").
+struct AgentCompletionRegistry {
+    inner: std::sync::Mutex<BTreeMap<String, AgentCompletionEntry>>,
+    condvar: std::sync::Condvar,
+}
+
+struct AgentCompletionEntry {
+    terminal_manifest: Option<AgentOutput>,
+}
+
+impl AgentCompletionRegistry {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(BTreeMap::new()),
+            condvar: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Register an agent before spawning its thread.
+    fn register(&self, agent_id: &str) {
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.insert(
+            agent_id.to_string(),
+            AgentCompletionEntry {
+                terminal_manifest: None,
+            },
+        );
+    }
+
+    /// Mark an agent as finished and wake any waiters.
+    fn mark_done(&self, manifest: &AgentOutput) {
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = map.get_mut(&manifest.agent_id) {
+            entry.terminal_manifest = Some(manifest.clone());
+        }
+        self.condvar.notify_all();
+    }
+
+    /// Block until the agent reaches a terminal state or the timeout expires.
+    /// Returns the terminal manifest on success, or an error message.
+    fn await_agent(&self, agent_id: &str, timeout: Duration) -> Result<AgentOutput, String> {
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !map.contains_key(agent_id) {
+            // Not registered in-process — try to read from the manifest file.
+            drop(map);
+            return read_manifest_from_store(agent_id);
+        }
+        let (map, wait_result) = self
+            .condvar
+            .wait_timeout_while(map, timeout, |map| {
+                map.get(agent_id)
+                    .is_none_or(|e| e.terminal_manifest.is_none())
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if wait_result.timed_out() {
+            return Err(format!(
+                "timed out waiting for agent {agent_id} after {}s",
+                timeout.as_secs()
+            ));
+        }
+        map.get(agent_id)
+            .and_then(|e| e.terminal_manifest.clone())
+            .ok_or_else(|| format!("agent {agent_id} not found after wait"))
+    }
+}
+
+/// Fall back to reading the manifest from the agent store on disk.
+fn read_manifest_from_store(agent_id: &str) -> Result<AgentOutput, String> {
+    let store = agent_store_dir()?;
+    let manifest_path = store.join(format!("{agent_id}.json"));
+    let contents = std::fs::read_to_string(&manifest_path).map_err(|e| {
+        format!("agent {agent_id} not found (no in-process record, no manifest file): {e}")
+    })?;
+    let manifest: AgentOutput = serde_json::from_str(&contents).map_err(|e| e.to_string())?;
+    if manifest.status == "completed" || manifest.status == "failed" {
+        Ok(manifest)
+    } else {
+        Err(format!(
+            "agent {agent_id} exists on disk but is still '{}'",
+            manifest.status
+        ))
+    }
+}
+
+fn global_agent_registry() -> &'static AgentCompletionRegistry {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<AgentCompletionRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(AgentCompletionRegistry::new)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolManifestEntry {
     pub name: String,
@@ -571,15 +671,16 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Agent",
-            description: "Launch a specialized agent task and persist its handoff metadata.",
+            description: "Launch a specialized agent task. By default runs in the background and returns immediately. Set run_in_background=false to run synchronously. Use TaskOutput(agent_id=..., block=true) to await a background agent.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "description": { "type": "string" },
-                    "prompt": { "type": "string" },
-                    "subagent_type": { "type": "string" },
-                    "name": { "type": "string" },
-                    "model": { "type": "string" }
+                    "description": { "type": "string", "description": "A short (3-5 word) description of the task" },
+                    "prompt": { "type": "string", "description": "The full task prompt for the agent" },
+                    "subagent_type": { "type": "string", "description": "Agent type specialization (e.g. Explore, general-purpose)" },
+                    "name": { "type": "string", "description": "Optional human-readable label for this agent" },
+                    "model": { "type": "string", "description": "Model ID override; defaults to the system default" },
+                    "run_in_background": { "type": "boolean", "description": "When true (default), launch async and retrieve result later with TaskOutput(agent_id=..., block=true). When false, run synchronously and return the result." }
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": false
@@ -842,13 +943,15 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskOutput",
-            description: "Retrieve the output produced by a background task.",
+            description: "Retrieve output from a background task or agent. Use task_id for TaskRegistry tasks. Use agent_id to retrieve (and optionally await) a background agent launched with Agent(run_in_background=true). Set block=true to wait until the agent finishes.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "task_id": { "type": "string" }
+                    "task_id": { "type": "string", "description": "ID of a TaskRegistry task to retrieve output from" },
+                    "agent_id": { "type": "string", "description": "ID of a background agent launched with Agent(run_in_background=true)" },
+                    "block": { "type": "boolean", "description": "When true (default), wait until the agent finishes before returning" },
+                    "timeout_ms": { "type": "integer", "minimum": 0, "description": "Maximum milliseconds to wait when block=true (default 30000)" }
                 },
-                "required": ["task_id"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -1256,7 +1359,7 @@ fn execute_tool_with_enforcer(
         "TaskList" => run_task_list(input.clone()),
         "TaskStop" => from_value::<TaskIdInput>(input).and_then(run_task_stop),
         "TaskUpdate" => from_value::<TaskUpdateInput>(input).and_then(run_task_update),
-        "TaskOutput" => from_value::<TaskIdInput>(input).and_then(run_task_output),
+        "TaskOutput" => from_value::<TaskOutputInput>(input).and_then(run_task_output),
         "WorkerCreate" => from_value::<WorkerCreateInput>(input).and_then(run_worker_create),
         "WorkerGet" => from_value::<WorkerIdInput>(input).and_then(run_worker_get),
         "WorkerObserve" => from_value::<WorkerObserveInput>(input).and_then(run_worker_observe),
@@ -1477,16 +1580,77 @@ fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_task_output(input: TaskIdInput) -> Result<String, String> {
+fn run_task_output(input: TaskOutputInput) -> Result<String, String> {
+    if let Some(agent_id) = &input.agent_id {
+        return await_agent_output(agent_id, input.block, input.timeout_ms);
+    }
+    let task_id = input
+        .task_id
+        .as_deref()
+        .ok_or_else(|| String::from("either task_id or agent_id is required"))?;
     let registry = global_task_registry();
-    match registry.output(&input.task_id) {
+    match registry.output(task_id) {
         Ok(output) => to_pretty_json(json!({
-            "task_id": input.task_id,
+            "task_id": task_id,
             "output": output,
             "has_output": !output.is_empty()
         })),
         Err(e) => Err(e),
     }
+}
+
+const DEFAULT_AGENT_AWAIT_TIMEOUT_MS: u64 = 30_000;
+
+fn await_agent_output(agent_id: &str, block: bool, timeout_ms: u64) -> Result<String, String> {
+    let agent_id = agent_id.trim();
+    if agent_id.is_empty() {
+        return Err(String::from("agent_id must not be empty"));
+    }
+
+    if !block {
+        // Non-blocking: read manifest from disk and return current state.
+        if let Ok(manifest) = read_manifest_from_store(agent_id) {
+            return to_pretty_json(agent_output_json(&manifest, "success"));
+        }
+        // Try reading the manifest even if status is still running.
+        let store = agent_store_dir()?;
+        let path = store.join(format!("{agent_id}.json"));
+        return match std::fs::read_to_string(&path) {
+            Ok(contents) => {
+                let manifest: AgentOutput =
+                    serde_json::from_str(&contents).map_err(|e| e.to_string())?;
+                to_pretty_json(agent_output_json(&manifest, "not_ready"))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(format!("agent not found: {agent_id}"))
+            }
+            Err(e) => Err(e.to_string()),
+        };
+    }
+
+    // Blocking: use condvar registry for instant wake.
+    let timeout = Duration::from_millis(timeout_ms);
+    match global_agent_registry().await_agent(agent_id, timeout) {
+        Ok(manifest) => to_pretty_json(agent_output_json(&manifest, "success")),
+        Err(e) if e.contains("timed out") => to_pretty_json(json!({
+            "agent_id": agent_id,
+            "status": "running",
+            "retrieval_status": "timeout",
+        })),
+        Err(e) => Err(e),
+    }
+}
+
+fn agent_output_json(manifest: &AgentOutput, retrieval_status: &str) -> Value {
+    json!({
+        "agent_id": manifest.agent_id,
+        "status": manifest.status,
+        "retrieval_status": retrieval_status,
+        "result": manifest.result,
+        "error": manifest.error,
+        "output_file": manifest.output_file,
+        "manifest_file": manifest.manifest_file,
+    })
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2310,6 +2474,8 @@ struct AgentInput {
     subagent_type: Option<String>,
     name: Option<String>,
     model: Option<String>,
+    #[serde(default)]
+    run_in_background: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2425,6 +2591,24 @@ struct TaskIdInput {
 struct TaskUpdateInput {
     task_id: String,
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskOutputInput {
+    task_id: Option<String>,
+    agent_id: Option<String>,
+    #[serde(default = "default_block_true")]
+    block: bool,
+    #[serde(default = "default_agent_await_timeout_ms")]
+    timeout_ms: u64,
+}
+
+const fn default_block_true() -> bool {
+    true
+}
+
+const fn default_agent_await_timeout_ms() -> u64 {
+    DEFAULT_AGENT_AWAIT_TIMEOUT_MS
 }
 
 #[derive(Debug, Deserialize)]
@@ -2608,6 +2792,8 @@ struct AgentOutput {
     derived_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2616,6 +2802,10 @@ struct AgentJob {
     prompt: String,
     system_prompt: SystemPrompt,
     allowed_tools: BTreeSet<String>,
+    /// Captured at spawn time so the subagent thread uses the same provider
+    /// config as the parent, regardless of CWD changes.
+    sudocode_config: SudoCodeConfig,
+    fallback_config: ProviderFallbackConfig,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3476,13 +3666,19 @@ const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
-    execute_agent_with_spawn(input, spawn_agent_job)
+    if input.run_in_background.unwrap_or(true) {
+        execute_agent_with_spawn(input, spawn_agent_job)
+    } else {
+        execute_agent_inline(input)
+    }
 }
 
-fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
-where
-    F: FnOnce(AgentJob) -> Result<(), String>,
-{
+struct PreparedAgent {
+    manifest: AgentOutput,
+    job: AgentJob,
+}
+
+fn prepare_agent_job(input: AgentInput) -> Result<PreparedAgent, String> {
     if input.description.trim().is_empty() {
         return Err(String::from("description must not be empty"));
     }
@@ -3493,6 +3689,7 @@ where
     let agent_id = make_agent_id();
     let output_dir = agent_store_dir()?;
     std::fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
+    sweep_orphaned_tmp_files(&output_dir);
     let output_file = output_dir.join(format!("{agent_id}.md"));
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
@@ -3540,23 +3737,55 @@ where
         current_blocker: None,
         derived_state: String::from("working"),
         error: None,
+        result: None,
     };
     write_agent_manifest(&manifest)?;
 
-    let manifest_for_spawn = manifest.clone();
+    // Capture provider config at spawn time so the subagent thread inherits the
+    // parent's auth/credential settings rather than re-loading from CWD.
+    let sudocode_config = load_sudocode_config();
+    let fallback_config = load_provider_fallback_config();
     let job = AgentJob {
-        manifest: manifest_for_spawn,
+        manifest: manifest.clone(),
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
+        sudocode_config,
+        fallback_config,
     };
+    Ok(PreparedAgent { manifest, job })
+}
+
+fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
+where
+    F: FnOnce(AgentJob) -> Result<(), String>,
+{
+    let PreparedAgent { manifest, job } = prepare_agent_job(input)?;
+    global_agent_registry().register(&manifest.agent_id);
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
         persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
         return Err(error);
     }
-
     Ok(manifest)
+}
+
+fn execute_agent_inline(input: AgentInput) -> Result<AgentOutput, String> {
+    let PreparedAgent { manifest, job } = prepare_agent_job(input)?;
+    match run_agent_job_returning_text(&job) {
+        Ok(final_text) => {
+            persist_agent_terminal_state(&manifest, "completed", Some(final_text.as_str()), None)?;
+            // Re-read manifest so lane events and result written by persist are present.
+            std::fs::read_to_string(&manifest.manifest_file)
+                .map_err(|e| e.to_string())
+                .and_then(|s| serde_json::from_str::<AgentOutput>(&s).map_err(|e| e.to_string()))
+                .or(Ok(manifest))
+        }
+        Err(error) => {
+            let _ = persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()));
+            Err(format!("sub-agent failed: {error}"))
+        }
+    }
 }
 
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
@@ -3564,8 +3793,16 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_agent_job_returning_text(&job).and_then(|text| {
+                    persist_agent_terminal_state(
+                        &job.manifest,
+                        "completed",
+                        Some(text.as_str()),
+                        None,
+                    )
+                })
+            }));
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -3581,19 +3818,52 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                     );
                 }
             }
+            // Signal the completion registry so TaskOutput(agent_id, block=true) callers unblock.
+            notify_agent_completion(&job.manifest);
         })
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
-fn run_agent_job(job: &AgentJob) -> Result<(), String> {
-    let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
-    let tokio_rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    let summary = tokio_rt
-        .block_on(runtime.run_turn(job.prompt.clone(), None, None))
-        .map_err(|error| error.to_string())?;
-    let final_text = final_assistant_text(&summary);
-    persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
+/// Re-read the persisted manifest and notify the global completion registry.
+fn notify_agent_completion(original_manifest: &AgentOutput) {
+    let manifest = std::fs::read_to_string(&original_manifest.manifest_file)
+        .ok()
+        .and_then(|s| serde_json::from_str::<AgentOutput>(&s).ok())
+        .unwrap_or_else(|| {
+            // Fall back to a minimal failed manifest so waiters always unblock.
+            let mut fallback = original_manifest.clone();
+            fallback.status = String::from("failed");
+            fallback.completed_at = Some(iso8601_now());
+            fallback
+        });
+    global_agent_registry().mark_done(&manifest);
+}
+
+fn run_agent_job_returning_text(job: &AgentJob) -> Result<String, String> {
+    let mut conv_runtime =
+        build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+    let prompt = job.prompt.clone();
+
+    // When inside a tokio context, spawn a fresh OS thread so we can create a new
+    // tokio Runtime without nesting. block_in_place is not used here because it
+    // panics on current_thread runtimes (the MCP server entry path uses one).
+    let summary = if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+                rt.block_on(conv_runtime.run_turn(prompt, None, None))
+                    .map_err(|e| e.to_string())
+            })
+            .join()
+            .map_err(|_| String::from("sub-agent thread panicked"))?
+        })?
+    } else {
+        let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+        rt.block_on(conv_runtime.run_turn(prompt, None, None))
+            .map_err(|e| e.to_string())?
+    };
+    Ok(final_assistant_text(&summary))
 }
 
 fn build_agent_runtime(
@@ -3605,7 +3875,16 @@ fn build_agent_runtime(
         .clone()
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
-    let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
+    // Use the config captured at spawn time instead of re-loading from disk.
+    // This ensures the subagent thread inherits the parent's auth tokens and
+    // provider configuration, preventing 401 Unauthorized errors when the CWD
+    // or config state differs between threads.
+    let api_client = ProviderRuntimeClient::new_with_config(
+        model,
+        allowed_tools.clone(),
+        &job.sudocode_config,
+        &job.fallback_config,
+    )?;
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
@@ -3729,14 +4008,29 @@ fn agent_permission_policy() -> PermissionPolicy {
     )
 }
 
+/// Best-effort removal of `*.tmp` files left behind by a previous crash between
+/// `fs::write` and `fs::rename` in `write_agent_manifest`. Called once per agent
+/// launch so the directory stays clean without a separate startup sweep.
+fn sweep_orphaned_tmp_files(dir: &std::path::Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
 fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
     let mut normalized = manifest.clone();
     normalized.lane_events = dedupe_superseded_commit_events(&normalized.lane_events);
-    std::fs::write(
-        &normalized.manifest_file,
-        serde_json::to_string_pretty(&normalized).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())
+    let json = serde_json::to_string_pretty(&normalized).map_err(|e| e.to_string())?;
+    // Write to a temp file then rename for atomic visibility — prevents a reader
+    // seeing a partially-written file during truncate-then-write.
+    let tmp_path = format!("{}.tmp", normalized.manifest_file);
+    std::fs::write(&tmp_path, &json).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp_path, &normalized.manifest_file).map_err(|e| e.to_string())
 }
 
 fn persist_agent_terminal_state(
@@ -3756,6 +4050,10 @@ fn persist_agent_terminal_state(
     next_manifest.current_blocker.clone_from(&blocker);
     next_manifest.derived_state =
         derive_agent_state(status, result, error.as_deref(), blocker.as_ref()).to_string();
+    next_manifest.result = result
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     next_manifest.error = error;
     if let Some(blocker) = blocker {
         next_manifest
@@ -4514,13 +4812,42 @@ struct ProviderRuntimeClient {
 }
 
 impl ProviderRuntimeClient {
-    #[allow(clippy::needless_pass_by_value)]
+    #[allow(dead_code, clippy::needless_pass_by_value)]
     fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
         let fallback_config = load_provider_fallback_config();
         Self::new_with_fallback_config(model, allowed_tools, &fallback_config)
     }
 
+    /// Build a client using explicitly provided configs instead of loading from
+    /// the current working directory.  Used by subagent threads to inherit the
+    /// parent's auth / provider settings.
     #[allow(clippy::needless_pass_by_value)]
+    fn new_with_config(
+        model: String,
+        allowed_tools: BTreeSet<String>,
+        sudocode_config: &SudoCodeConfig,
+        fallback_config: &ProviderFallbackConfig,
+    ) -> Result<Self, String> {
+        let primary_model = fallback_config.primary().map_or(model, str::to_string);
+        let primary = build_provider_entry_with_config(&primary_model, sudocode_config)?;
+        let mut chain = vec![primary];
+        for fallback_model in fallback_config.fallbacks() {
+            match build_provider_entry_with_config(fallback_model, sudocode_config) {
+                Ok(entry) => chain.push(entry),
+                Err(error) => {
+                    eprintln!(
+                        "warning: skipping unavailable fallback provider {fallback_model}: {error}"
+                    );
+                }
+            }
+        }
+        Ok(Self {
+            chain,
+            allowed_tools,
+        })
+    }
+
+    #[allow(dead_code, clippy::needless_pass_by_value)]
     fn new_with_fallback_config(
         model: String,
         allowed_tools: BTreeSet<String>,
@@ -4546,10 +4873,18 @@ impl ProviderRuntimeClient {
     }
 }
 
+#[allow(dead_code)]
 fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
     let sudocode_config = load_sudocode_config();
+    build_provider_entry_with_config(model, &sudocode_config)
+}
+
+fn build_provider_entry_with_config(
+    model: &str,
+    sudocode_config: &SudoCodeConfig,
+) -> Result<ProviderEntry, String> {
     let resolved_provider =
-        resolve_provider_from_config(model, None, &sudocode_config).map_err(|e| e.to_string())?;
+        resolve_provider_from_config(model, None, sudocode_config).map_err(|e| e.to_string())?;
     let wire_model = resolved_provider.model_id.clone();
     let client =
         ProviderClient::from_resolved(&resolved_provider, None).map_err(|e| e.to_string())?;
@@ -5036,8 +5371,16 @@ fn canonical_tool_token(value: &str) -> String {
 }
 
 fn agent_store_dir() -> Result<std::path::PathBuf, String> {
-    if let Ok(path) = std::env::var("SUDOCODE_AGENT_STORE") {
-        return Ok(std::path::PathBuf::from(path));
+    if let Ok(raw) = std::env::var("SUDOCODE_AGENT_STORE") {
+        let path = std::path::PathBuf::from(&raw);
+        // Ensure the returned path is always absolute so that the output_file
+        // and manifest_file fields in AgentOutput are reliable regardless of
+        // any subsequent CWD changes.
+        if path.is_absolute() {
+            return Ok(path);
+        }
+        let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+        return Ok(cwd.join(path));
     }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     if let Some(workspace_root) = cwd.ancestors().nth(2) {
@@ -6177,11 +6520,12 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        derive_agent_state, execute_agent_with_spawn, execute_tool, extract_recovery_outcome,
-        final_assistant_text, global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
+        agent_permission_policy, allowed_tools_for_subagent, await_agent_output,
+        classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
+        extract_recovery_outcome, final_assistant_text, global_cron_registry,
+        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        persist_agent_terminal_state, push_output_block, run_task_packet, sweep_orphaned_tmp_files,
+        AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
         SubagentToolExecutor,
     };
     use api::OutputContentBlock;
@@ -7794,6 +8138,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
+                run_in_background: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -7875,6 +8220,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
+                run_in_background: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -7932,6 +8278,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
+                run_in_background: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -7979,6 +8326,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("summary-floor".to_string()),
                 model: None,
+                run_in_background: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8024,6 +8372,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("recovery-lane".to_string()),
                 model: None,
+                run_in_background: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8072,6 +8421,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("review-lane".to_string()),
                 model: None,
+                run_in_background: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8112,6 +8462,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("backlog-scan".to_string()),
                 model: None,
+                run_in_background: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8158,6 +8509,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("artifact-lane".to_string()),
                 model: None,
+                run_in_background: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8228,6 +8580,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("cron-closeout".to_string()),
                 model: None,
+                run_in_background: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8269,6 +8622,7 @@ mod tests {
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
+                run_in_background: None,
             },
             |_| Err(String::from("thread creation failed")),
         )
@@ -8551,6 +8905,267 @@ mod tests {
         )
         .expect_err("blank prompt should fail");
         assert!(missing_prompt.contains("prompt must not be empty"));
+    }
+
+    #[test]
+    fn task_output_returns_completed_agent_via_condvar() {
+        let _guard = env_guard();
+        let dir = temp_path("agent-taskoutput-completed");
+        std::env::set_var("SUDOCODE_AGENT_STORE", &dir);
+
+        let manifest = execute_agent_with_spawn(
+            AgentInput {
+                description: "Calculate 2+2".to_string(),
+                prompt: "What is 2+2?".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("calc-task".to_string()),
+                model: None,
+                run_in_background: None,
+            },
+            |job| {
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "completed",
+                    Some("The answer is 4"),
+                    None,
+                )?;
+                super::notify_agent_completion(&job.manifest);
+                Ok(())
+            },
+        )
+        .expect("spawn should succeed");
+
+        let result = await_agent_output(&manifest.agent_id, true, 5_000)
+            .expect("blocking await should succeed");
+        let value: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["retrieval_status"], "success");
+        assert_eq!(value["result"], "The answer is 4");
+
+        assert!(
+            PathBuf::from(value["output_file"].as_str().unwrap()).is_absolute(),
+            "output_file should be an absolute path"
+        );
+
+        std::env::remove_var("SUDOCODE_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn task_output_returns_failed_agent() {
+        let _guard = env_guard();
+        let dir = temp_path("agent-taskoutput-failed");
+        std::env::set_var("SUDOCODE_AGENT_STORE", &dir);
+
+        let manifest = execute_agent_with_spawn(
+            AgentInput {
+                description: "Failing calc".to_string(),
+                prompt: "Divide by zero".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("fail-calc".to_string()),
+                model: None,
+                run_in_background: None,
+            },
+            |job| {
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "failed",
+                    None,
+                    Some(String::from("division by zero")),
+                )?;
+                super::notify_agent_completion(&job.manifest);
+                Ok(())
+            },
+        )
+        .expect("spawn should succeed");
+
+        let result = await_agent_output(&manifest.agent_id, true, 5_000)
+            .expect("blocking await of failed agent should succeed");
+        let value: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(value["status"], "failed");
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .contains("division by zero"));
+
+        std::env::remove_var("SUDOCODE_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn task_output_blocks_until_thread_completes() {
+        let _guard = env_guard();
+        let dir = temp_path("agent-taskoutput-threaded");
+        std::env::set_var("SUDOCODE_AGENT_STORE", &dir);
+
+        let manifest = execute_agent_with_spawn(
+            AgentInput {
+                description: "Slow calculation".to_string(),
+                prompt: "What is 6*7?".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("slow-calc".to_string()),
+                model: None,
+                run_in_background: None,
+            },
+            |job| {
+                let thread_name = format!("sudocode-agent-{}", job.manifest.agent_id);
+                std::thread::Builder::new()
+                    .name(thread_name)
+                    .spawn(move || {
+                        std::thread::sleep(Duration::from_millis(100));
+                        let _ = persist_agent_terminal_state(
+                            &job.manifest,
+                            "completed",
+                            Some("The answer is 42"),
+                            None,
+                        );
+                        super::notify_agent_completion(&job.manifest);
+                    })
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            },
+        )
+        .expect("spawn should succeed");
+
+        let result = await_agent_output(&manifest.agent_id, true, 10_000)
+            .expect("blocking await should succeed after thread finishes");
+        let value: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["result"], "The answer is 42");
+
+        std::env::remove_var("SUDOCODE_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn task_output_non_blocking_returns_not_ready_for_running_agent() {
+        let _guard = env_guard();
+        let dir = temp_path("agent-taskoutput-nonblocking");
+        std::env::set_var("SUDOCODE_AGENT_STORE", &dir);
+
+        let manifest = execute_agent_with_spawn(
+            AgentInput {
+                description: "Slow task".to_string(),
+                prompt: "Run slowly".to_string(),
+                subagent_type: None,
+                name: None,
+                model: None,
+                run_in_background: None,
+            },
+            |_job| Ok(()), // spawn but don't complete — manifest stays "running"
+        )
+        .expect("spawn should succeed");
+
+        let result = await_agent_output(&manifest.agent_id, false, 5_000)
+            .expect("non-blocking poll should not error");
+        let value: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(value["retrieval_status"], "not_ready");
+        assert_eq!(value["status"], "running");
+
+        std::env::remove_var("SUDOCODE_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn task_output_returns_timeout_when_deadline_exceeded() {
+        let _guard = env_guard();
+        let dir = temp_path("agent-taskoutput-timeout");
+        std::env::set_var("SUDOCODE_AGENT_STORE", &dir);
+
+        let manifest = execute_agent_with_spawn(
+            AgentInput {
+                description: "Never completes".to_string(),
+                prompt: "Spin forever".to_string(),
+                subagent_type: None,
+                name: None,
+                model: None,
+                run_in_background: None,
+            },
+            |_job| Ok(()),
+        )
+        .expect("spawn should succeed");
+
+        let result =
+            await_agent_output(&manifest.agent_id, true, 1).expect("timeout path should return Ok");
+        let value: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(value["retrieval_status"], "timeout");
+        assert_eq!(value["status"], "running");
+
+        std::env::remove_var("SUDOCODE_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn task_output_returns_error_for_missing_agent() {
+        let _guard = env_guard();
+        let dir = temp_path("agent-taskoutput-missing");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::env::set_var("SUDOCODE_AGENT_STORE", &dir);
+
+        let err = await_agent_output("agent-nonexistent", false, 5_000)
+            .expect_err("missing agent should error");
+        assert!(err.contains("agent not found"), "got: {err}");
+
+        std::env::remove_var("SUDOCODE_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn task_output_rejects_blank_agent_id() {
+        let err = await_agent_output("  ", true, 5_000).expect_err("blank agent_id should fail");
+        assert!(err.contains("agent_id must not be empty"));
+    }
+
+    #[test]
+    fn agent_output_file_path_is_absolute_even_with_relative_store_env() {
+        let _guard = env_guard();
+        let dir = temp_path("agent-abs-path");
+        std::env::set_var("SUDOCODE_AGENT_STORE", &dir);
+
+        let manifest = execute_agent_with_spawn(
+            AgentInput {
+                description: "Path test".to_string(),
+                prompt: "Test path".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: None,
+                model: None,
+                run_in_background: None,
+            },
+            |_job| Ok(()),
+        )
+        .expect("spawn should succeed");
+
+        assert!(
+            PathBuf::from(&manifest.output_file).is_absolute(),
+            "output_file should always be absolute, got: {}",
+            manifest.output_file
+        );
+        assert!(
+            PathBuf::from(&manifest.manifest_file).is_absolute(),
+            "manifest_file should always be absolute, got: {}",
+            manifest.manifest_file
+        );
+
+        std::env::remove_var("SUDOCODE_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sweep_orphaned_tmp_files_removes_tmp_and_leaves_json() {
+        let dir = temp_path("agent-sweep-tmp");
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let tmp_path = dir.join("agent-123.json.tmp");
+        let json_path = dir.join("agent-123.json");
+        std::fs::write(&tmp_path, b"partial").expect("write tmp");
+        std::fs::write(&json_path, b"{}").expect("write json");
+
+        sweep_orphaned_tmp_files(&dir);
+
+        assert!(!tmp_path.exists(), ".tmp file should be removed");
+        assert!(json_path.exists(), ".json file should be kept");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
