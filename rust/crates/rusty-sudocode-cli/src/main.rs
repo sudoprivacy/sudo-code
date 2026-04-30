@@ -1372,6 +1372,8 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    /// Shared tokio runtime used to drive async `run_turn` calls.
+    tokio_runtime: tokio::runtime::Runtime,
 }
 
 pub(crate) struct RuntimePluginState {
@@ -1491,6 +1493,7 @@ struct AcpCliAgent {
     reasoning_effort: Option<String>,
     auth_mode: Option<AuthMode>,
     sessions: HashMap<String, AcpCliSession>,
+    tokio_runtime: tokio::runtime::Runtime,
 }
 
 impl AcpCliAgent {
@@ -1510,6 +1513,8 @@ impl AcpCliAgent {
             reasoning_effort,
             auth_mode,
             sessions: HashMap::new(),
+            tokio_runtime: tokio::runtime::Runtime::new()
+                .expect("failed to create tokio runtime for ACP agent"),
         }
     }
 
@@ -2054,9 +2059,9 @@ impl AcpSdkDelegate {
         let _guard = ScopedCurrentDir::change_to(&session.cwd).map_err(|e| {
             runtime::AcpError::internal(format!("failed to enter session cwd: {e}"))
         })?;
-        session
-            .runtime
-            .run_turn(prompt, prompter, Some(observer))
+        self.inner
+            .tokio_runtime
+            .block_on(session.runtime.run_turn(prompt, prompter, Some(observer)))
             .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
         let usage = UsageTracker::from_session(session.runtime.session()).cumulative_usage();
         let prompt_usage = runtime::acp_sdk_server::PromptUsage {
@@ -2187,6 +2192,7 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            tokio_runtime: tokio::runtime::Runtime::new()?,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -2342,7 +2348,11 @@ impl LiveCli {
             .set_spinner_pause(pause_flag.clone());
         runtime.tool_executor_mut().set_spinner_pause(pause_flag);
         let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
+        let result = self.tokio_runtime.block_on(runtime.run_turn(
+            input,
+            Some(&mut permission_prompter),
+            None,
+        ));
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
@@ -2393,7 +2403,11 @@ impl LiveCli {
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
+        let result = self.tokio_runtime.block_on(runtime.run_turn(
+            input,
+            Some(&mut permission_prompter),
+            None,
+        ));
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -2406,7 +2420,11 @@ impl LiveCli {
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
+        let result = self.tokio_runtime.block_on(runtime.run_turn(
+            input,
+            Some(&mut permission_prompter),
+            None,
+        ));
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -2431,7 +2449,11 @@ impl LiveCli {
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
+        let result = self.tokio_runtime.block_on(runtime.run_turn(
+            input,
+            Some(&mut permission_prompter),
+            None,
+        ));
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -3202,7 +3224,11 @@ impl LiveCli {
             },
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
-        let summary = runtime.run_turn(prompt, Some(&mut permission_prompter), None)?;
+        let summary = self.tokio_runtime.block_on(runtime.run_turn(
+            prompt,
+            Some(&mut permission_prompter),
+            None,
+        ))?;
         let text = final_assistant_text(&summary).trim().to_string();
         runtime.shutdown_plugins()?;
         Ok(text)

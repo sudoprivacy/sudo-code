@@ -22,12 +22,12 @@ use runtime::{
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
-    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
-    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session,
-    SystemPrompt, TaskPacket, ToolError, ToolExecutor,
+    write_file, ApiClient, ApiRequest, AssistantEvent, AssistantEventStream, BashCommandInput,
+    BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
+    ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
+    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
+    PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
+    Session, SystemPrompt, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -3588,8 +3588,9 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
 
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
-    let summary = runtime
-        .run_turn(job.prompt.clone(), None, None)
+    let tokio_rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let summary = tokio_rt
+        .block_on(runtime.run_turn(job.prompt.clone(), None, None))
         .map_err(|error| error.to_string())?;
     let final_text = final_assistant_text(&summary);
     persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
@@ -4508,7 +4509,6 @@ struct ProviderEntry {
 }
 
 struct ProviderRuntimeClient {
-    runtime: tokio::runtime::Runtime,
     chain: Vec<ProviderEntry>,
     allowed_tools: BTreeSet<String>,
 }
@@ -4540,7 +4540,6 @@ impl ProviderRuntimeClient {
             }
         }
         Ok(Self {
-            runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
             chain,
             allowed_tools,
         })
@@ -4580,8 +4579,9 @@ fn load_provider_fallback_config() -> ProviderFallbackConfig {
         })
 }
 
+#[async_trait::async_trait]
 impl ApiClient for ProviderRuntimeClient {
-    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+    async fn stream(&mut self, request: ApiRequest) -> Result<AssistantEventStream, RuntimeError> {
         let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
             .into_iter()
             .map(|spec| ToolDefinition {
@@ -4594,7 +4594,6 @@ impl ApiClient for ProviderRuntimeClient {
         let system = (!request.system_prompt.is_empty()).then(|| request.system_prompt.render());
         let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
 
-        let runtime = &self.runtime;
         let chain = &self.chain;
         let mut last_error: Option<ApiError> = None;
         for (index, entry) in chain.iter().enumerate() {
@@ -4609,9 +4608,11 @@ impl ApiClient for ProviderRuntimeClient {
                 ..Default::default()
             };
 
-            let attempt = runtime.block_on(stream_with_provider(&entry.client, &message_request));
+            let attempt = stream_with_provider(&entry.client, &message_request).await;
             match attempt {
-                Ok(events) => return Ok(events),
+                Ok(events) => {
+                    return Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))));
+                }
                 Err(error) if error.is_retryable() && index + 1 < chain.len() => {
                     eprintln!(
                         "provider {} failed with retryable error, falling back: {error}",
@@ -8453,13 +8454,17 @@ mod tests {
         input_path: String,
     }
 
+    #[async_trait::async_trait]
     impl runtime::ApiClient for MockSubagentApiClient {
-        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        async fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Result<runtime::AssistantEventStream, RuntimeError> {
             self.calls += 1;
-            match self.calls {
+            let events = match self.calls {
                 1 => {
                     assert_eq!(request.messages.len(), 1);
-                    Ok(vec![
+                    vec![
                         AssistantEvent::ToolUse {
                             id: "tool-1".to_string(),
                             name: "read_file".to_string(),
@@ -8467,22 +8472,24 @@ mod tests {
                             thought_signature: None,
                         },
                         AssistantEvent::MessageStop,
-                    ])
+                    ]
                 }
                 2 => {
                     assert!(request.messages.len() >= 3);
-                    Ok(vec![
+                    vec![
                         AssistantEvent::TextDelta("Scope: completed mock review".to_string()),
                         AssistantEvent::MessageStop,
-                    ])
+                    ]
                 }
                 _ => unreachable!("extra mock stream call"),
-            }
+            };
+            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
         }
     }
 
-    #[test]
-    fn subagent_runtime_executes_tool_loop_with_isolated_session() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn subagent_runtime_executes_tool_loop_with_isolated_session() {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -8502,6 +8509,7 @@ mod tests {
 
         let summary = runtime
             .run_turn("Inspect the delegated file", None, None)
+            .await
             .expect("subagent loop should succeed");
 
         assert_eq!(
