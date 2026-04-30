@@ -1734,4 +1734,56 @@ mod tests {
             crate::error::ApiError::InvalidSseFrame(_)
         ));
     }
+
+    #[test]
+    fn apply_system_cache_blocks_produces_array_with_cache_control() {
+        use crate::types::SystemCacheBlock;
+        use telemetry::AnthropicRequestProfile;
+
+        let request = MessageRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            system: Some("ignored when blocks present".to_string()),
+            stream: true,
+            system_cache_blocks: Some(vec![
+                SystemCacheBlock {
+                    text: "static core instructions".to_string(),
+                    cache_scope: Some("global".to_string()),
+                },
+                SystemCacheBlock {
+                    text: "dynamic session context".to_string(),
+                    cache_scope: None,
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let mut body = AnthropicRequestProfile::default()
+            .render_json_body(&request)
+            .expect("render body");
+        super::apply_system_cache_blocks(&mut body, &request);
+
+        let system = body.get("system").expect("system field should exist");
+        let blocks = system.as_array().expect("system should be an array");
+        assert_eq!(blocks.len(), 2);
+
+        // Static block: has cache_control with scope "global".
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "static core instructions");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[0]["cache_control"]["scope"], "global");
+
+        // Dynamic block: has cache_control without scope.
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "dynamic session context");
+        assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+        assert!(blocks[1]["cache_control"].get("scope").is_none());
+
+        // Dump for manual inspection.
+        eprintln!(
+            "=== system field JSON ===\n{}",
+            serde_json::to_string_pretty(system).unwrap()
+        );
+    }
 }
