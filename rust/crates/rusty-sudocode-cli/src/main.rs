@@ -2357,20 +2357,28 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.clear(&mut stdout)?;
-                if let Some(event) = summary.auto_compaction {
+                if summary.cancelled {
+                    spinner.fail(
+                        "⏹ Cancelled",
+                        TerminalRenderer::new().color_theme(),
+                        &mut stdout,
+                    )?;
+                } else {
+                    spinner.clear(&mut stdout)?;
+                    if let Some(event) = summary.auto_compaction {
+                        println!(
+                            "{}",
+                            format_auto_compaction_notice(event.removed_message_count)
+                        );
+                    }
+                    let elapsed = turn_start.elapsed();
+                    let usage = self.runtime.usage().current_turn_usage();
+                    let turns = self.runtime.usage().turns();
                     println!(
                         "{}",
-                        format_auto_compaction_notice(event.removed_message_count)
+                        format_turn_status_line(&self.config.model, turns, &usage, elapsed)
                     );
                 }
-                let elapsed = turn_start.elapsed();
-                let usage = self.runtime.usage().current_turn_usage();
-                let turns = self.runtime.usage().turns();
-                println!(
-                    "{}",
-                    format_turn_status_line(&self.config.model, turns, &usage, elapsed)
-                );
                 self.persist_session()?;
                 Ok(())
             }

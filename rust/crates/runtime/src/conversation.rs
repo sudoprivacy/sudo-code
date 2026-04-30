@@ -144,7 +144,8 @@ impl Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
-/// Summary of one completed runtime turn, including tool results and usage.
+/// Summary of one completed (or cancelled) runtime turn, including tool
+/// results and usage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnSummary {
     pub assistant_messages: Vec<ConversationMessage>,
@@ -153,6 +154,11 @@ pub struct TurnSummary {
     pub iterations: usize,
     pub usage: TokenUsage,
     pub auto_compaction: Option<AutoCompactionEvent>,
+    /// `true` when the turn was interrupted by the abort signal.  Partial
+    /// progress (user message, streamed assistant text, synthetic tool
+    /// results, interruption marker) has already been committed to the
+    /// session so the model has full context on the next turn.
+    pub cancelled: bool,
 }
 
 /// Details about automatic session compaction applied during a turn.
@@ -484,7 +490,15 @@ where
         loop {
             if self.hook_abort_signal.is_aborted() {
                 self.finalize_cancelled_turn(Vec::new());
-                return Err(RuntimeError::new("turn cancelled by abort signal"));
+                return Ok(TurnSummary {
+                    assistant_messages: Vec::new(),
+                    tool_results: Vec::new(),
+                    prompt_cache_events: Vec::new(),
+                    iterations,
+                    usage: self.usage_tracker.cumulative_usage(),
+                    auto_compaction: None,
+                    cancelled: true,
+                });
             }
 
             iterations += 1;
@@ -521,9 +535,15 @@ where
                             // and stop token consumption.
                             drop(stream);
                             self.finalize_cancelled_turn(collected);
-                            return Err(RuntimeError::new(
-                                "turn cancelled by abort signal",
-                            ));
+                            return Ok(TurnSummary {
+                                assistant_messages: Vec::new(),
+                                tool_results: Vec::new(),
+                                prompt_cache_events: Vec::new(),
+                                iterations,
+                                usage: self.usage_tracker.cumulative_usage(),
+                                auto_compaction: None,
+                                cancelled: true,
+                            });
                         }
                         next = stream.next() => {
                             match next {
@@ -689,6 +709,7 @@ where
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
+            cancelled: false,
         };
         self.record_turn_completed(&summary);
 
