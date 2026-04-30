@@ -363,12 +363,12 @@ pub fn clear_oauth_credentials_from_keyring() {
 }
 
 // ---------------------------------------------------------------------------
-// Import credentials from Claude Code's keychain
+// Import credentials from Sudo Code's keychain
 // ---------------------------------------------------------------------------
 
 const CC_KEYRING_SERVICE: &str = "Claude Code-credentials";
 
-/// JSON shape stored by Claude Code in macOS Keychain.
+/// JSON shape stored by Sudo Code (originally Claude Code) in macOS Keychain.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CcKeychainPayload {
@@ -388,16 +388,16 @@ struct CcOAuthEntry {
     scopes: Vec<String>,
 }
 
-/// Reads Claude Code's OAuth token from the OS keychain and copies it into
+/// Reads Sudo Code's OAuth token from the OS keychain and copies it into
 /// scode's own credential storage (keyring + file).
 ///
 /// Returns the imported token set, or a human-readable error string.
 pub fn import_claude_code_credentials() -> Result<OAuthTokenSet, String> {
     let json = read_cc_keychain_password()?;
     let payload: CcKeychainPayload = serde_json::from_str(&json)
-        .map_err(|e| format!("failed to parse Claude Code keychain data: {e}"))?;
+        .map_err(|e| format!("failed to parse Sudo Code keychain data: {e}"))?;
     let cc = payload.claude_ai_oauth.ok_or_else(|| {
-        "Claude Code keychain entry has no OAuth token. Run `claude` first to authenticate."
+        "Sudo Code keychain entry has no OAuth token. Run `claude` first to authenticate."
             .to_string()
     })?;
 
@@ -414,7 +414,7 @@ pub fn import_claude_code_credentials() -> Result<OAuthTokenSet, String> {
     Ok(token_set)
 }
 
-/// Reads the password from Claude Code's legacy keychain entry using the
+/// Reads the password from Sudo Code's legacy keychain entry using the
 /// macOS `security` CLI.  The `keyring` crate cannot access legacy keychain
 /// entries (it uses the newer Data Protection Keychain API), so we shell out.
 fn read_cc_keychain_password() -> Result<String, String> {
@@ -433,7 +433,7 @@ fn read_cc_keychain_password() -> Result<String, String> {
 
     if !output.status.success() {
         return Err(
-            "no Claude Code credentials found in keychain. Run `claude` first to authenticate."
+            "no Sudo Code credentials found in keychain. Run `claude` first to authenticate."
                 .to_string(),
         );
     }
