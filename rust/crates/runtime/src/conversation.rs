@@ -390,6 +390,7 @@ where
         }
 
         self.record_turn_started(&label);
+        let session_len_before_turn = self.session.messages.len();
         self.session
             .push_user_blocks(blocks)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -401,6 +402,9 @@ where
 
         loop {
             if self.hook_abort_signal.is_aborted() {
+                // Roll back the session to discard the cancelled turn so the
+                // next prompt does not inherit orphaned messages.
+                self.session.messages.truncate(session_len_before_turn);
                 return Err(RuntimeError::new("turn cancelled by abort signal"));
             }
 
@@ -437,6 +441,10 @@ where
                             // Drop the stream to close the HTTP connection
                             // and stop token consumption.
                             drop(stream);
+                            // Roll back the session to discard the cancelled
+                            // turn so the next prompt does not inherit
+                            // orphaned messages.
+                            self.session.messages.truncate(session_len_before_turn);
                             return Err(RuntimeError::new(
                                 "turn cancelled by abort signal",
                             ));
