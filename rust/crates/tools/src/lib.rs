@@ -69,6 +69,16 @@ fn global_worker_registry() -> &'static WorkerRegistry {
     REGISTRY.get_or_init(WorkerRegistry::new)
 }
 
+/// Global auth mode set by the CLI at startup. Subagents inherit this so they
+/// use the same credential path as the main agent.
+static GLOBAL_AUTH_MODE: std::sync::OnceLock<api::AuthMode> = std::sync::OnceLock::new();
+
+/// Called by the CLI at startup to set the auth mode for the entire process.
+/// Subagents automatically inherit this unless explicitly overridden.
+pub fn set_global_auth_mode(mode: api::AuthMode) {
+    let _ = GLOBAL_AUTH_MODE.set(mode);
+}
+
 /// In-process registry that tracks running agent threads and allows callers
 /// to block until an agent reaches a terminal state ("completed" or "failed").
 struct AgentCompletionRegistry {
@@ -3752,11 +3762,14 @@ fn prepare_agent_job(input: AgentInput) -> Result<PreparedAgent, String> {
     // parent's auth/credential settings rather than re-loading from CWD.
     let sudocode_config = load_sudocode_config();
     let fallback_config = load_provider_fallback_config();
+    // Explicit override from the Agent tool call, falling back to the
+    // process-wide auth mode set by the CLI at startup.
     let auth_mode = input
         .auth_mode
         .as_deref()
         .map(api::AuthMode::parse)
-        .transpose()?;
+        .transpose()?
+        .or_else(|| GLOBAL_AUTH_MODE.get().copied());
     let job = AgentJob {
         manifest: manifest.clone(),
         prompt: input.prompt,
