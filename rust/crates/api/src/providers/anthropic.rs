@@ -367,6 +367,7 @@ impl AnthropicClient {
             latest_usage: None,
             usage_recorded: false,
             last_prompt_cache_record: Arc::clone(&self.last_prompt_cache_record),
+            session_tracer: self.session_tracer().cloned(),
         })
     }
 
@@ -417,6 +418,7 @@ impl AnthropicClient {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let mut body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut body);
+        apply_cache_hints(&mut body, request);
         self.prepend_oauth_system_prefix(&mut body);
 
         let mut headers: Vec<(String, String)> =
@@ -447,19 +449,29 @@ impl AnthropicClient {
         let Some(obj) = body.as_object_mut() else {
             return;
         };
-        let mut blocks = vec![serde_json::json!({"type": "text", "text": prefix})];
+        let prefix_block = serde_json::json!({"type": "text", "text": prefix});
         if let Some(system_val) = obj.remove("system") {
-            if let Some(s) = system_val.as_str() {
-                if !s.is_empty() {
-                    blocks.push(serde_json::json!({"type": "text", "text": s}));
+            match system_val {
+                Value::String(s) => {
+                    let mut blocks = vec![prefix_block];
+                    if !s.is_empty() {
+                        blocks.push(serde_json::json!({"type": "text", "text": s}));
+                    }
+                    obj.insert("system".to_string(), Value::Array(blocks));
                 }
-            } else {
-                // Already an array or non-string — put it back as-is.
-                obj.insert("system".to_string(), system_val);
-                return;
+                Value::Array(mut arr) => {
+                    // Already an array (e.g. from cache blocks) — prepend the prefix.
+                    arr.insert(0, prefix_block);
+                    obj.insert("system".to_string(), Value::Array(arr));
+                }
+                other => {
+                    // Unknown format — put it back unchanged.
+                    obj.insert("system".to_string(), other);
+                }
             }
+        } else {
+            obj.insert("system".to_string(), Value::Array(vec![prefix_block]));
         }
-        obj.insert("system".to_string(), Value::Array(blocks));
     }
 
     async fn preflight_message_request(&self, request: &MessageRequest) -> Result<(), ApiError> {
@@ -507,6 +519,7 @@ impl AnthropicClient {
         );
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
+        apply_cache_hints(&mut request_body, request);
         self.prepend_oauth_system_prefix(&mut request_body);
         let mut builder = self
             .http
@@ -811,6 +824,7 @@ pub struct MessageStream {
     latest_usage: Option<Usage>,
     usage_recorded: bool,
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
+    session_tracer: Option<SessionTracer>,
 }
 
 impl MessageStream {
@@ -853,14 +867,22 @@ impl MessageStream {
             }
             StreamEvent::MessageStop(_) => {
                 if !self.usage_recorded {
-                    if let (Some(prompt_cache), Some(usage)) =
-                        (&self.prompt_cache, self.latest_usage.as_ref())
-                    {
-                        let record = prompt_cache.record_usage(&self.request, usage);
-                        *self
-                            .last_prompt_cache_record
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+                    if let Some(usage) = self.latest_usage.as_ref() {
+                        if let Some(prompt_cache) = &self.prompt_cache {
+                            let record = prompt_cache.record_usage(&self.request, usage);
+                            *self
+                                .last_prompt_cache_record
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+                        }
+                        if let Some(tracer) = &self.session_tracer {
+                            tracer.record_usage(
+                                usage.input_tokens,
+                                usage.output_tokens,
+                                usage.cache_creation_input_tokens,
+                                usage.cache_read_input_tokens,
+                            );
+                        }
                     }
                     self.usage_recorded = true;
                 }
@@ -1001,6 +1023,64 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
         // Strip thought_signature from tool_use content blocks. The API
         // rejects this field when extended thinking is not enabled.
         strip_thought_signatures(object);
+    }
+}
+
+/// Translate provider-agnostic [`CacheHints`] into Anthropic-specific
+/// `cache_control` markers on the JSON body.
+///
+/// - `system_static` → system block with `cache_control: {type: "ephemeral", scope: "global"}`
+/// - `system_dynamic` → system block with `cache_control: {type: "ephemeral"}`
+/// - `breakpoint_last_message` → `cache_control: {type: "ephemeral"}` on the last
+///   content block of the last message
+fn apply_cache_hints(body: &mut Value, request: &MessageRequest) {
+    let Some(hints) = &request.cache_hints else {
+        return;
+    };
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+
+    // --- System blocks ---
+    let mut system_blocks: Vec<Value> = Vec::new();
+    if let Some(text) = &hints.system_static {
+        if !text.is_empty() {
+            system_blocks.push(serde_json::json!({
+                "type": "text",
+                "text": text,
+                "cache_control": { "type": "ephemeral", "scope": "global" },
+            }));
+        }
+    }
+    if let Some(text) = &hints.system_dynamic {
+        if !text.is_empty() {
+            system_blocks.push(serde_json::json!({
+                "type": "text",
+                "text": text,
+                "cache_control": { "type": "ephemeral" },
+            }));
+        }
+    }
+    if !system_blocks.is_empty() {
+        obj.insert("system".to_string(), Value::Array(system_blocks));
+    }
+
+    // --- Message breakpoint ---
+    if hints.breakpoint_last_message {
+        if let Some(Value::Array(messages)) = obj.get_mut("messages") {
+            if let Some(last_msg) = messages.last_mut() {
+                if let Some(Value::Array(content)) = last_msg.get_mut("content") {
+                    if let Some(last_block) = content.last_mut() {
+                        if let Some(block_obj) = last_block.as_object_mut() {
+                            block_obj.insert(
+                                "cache_control".to_string(),
+                                serde_json::json!({ "type": "ephemeral" }),
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1685,5 +1765,55 @@ mod tests {
             enriched,
             crate::error::ApiError::InvalidSseFrame(_)
         ));
+    }
+
+    #[test]
+    fn apply_cache_hints_produces_system_blocks_and_message_breakpoint() {
+        use crate::types::{CacheHints, InputMessage};
+        use telemetry::AnthropicRequestProfile;
+
+        let request = MessageRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                InputMessage::user_text("first question"),
+                InputMessage::user_text("second question"),
+            ],
+            system: Some("flat fallback".to_string()),
+            stream: true,
+            cache_hints: Some(CacheHints {
+                system_static: Some("static core instructions".to_string()),
+                system_dynamic: Some("dynamic session context".to_string()),
+                breakpoint_last_message: true,
+            }),
+            ..Default::default()
+        };
+
+        let mut body = AnthropicRequestProfile::default()
+            .render_json_body(&request)
+            .expect("render body");
+        super::apply_cache_hints(&mut body, &request);
+
+        // --- System blocks ---
+        let system = body.get("system").expect("system field should exist");
+        let sys_blocks = system.as_array().expect("system should be an array");
+        assert_eq!(sys_blocks.len(), 2);
+
+        assert_eq!(sys_blocks[0]["text"], "static core instructions");
+        assert_eq!(sys_blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(sys_blocks[0]["cache_control"]["scope"], "global");
+
+        assert_eq!(sys_blocks[1]["text"], "dynamic session context");
+        assert_eq!(sys_blocks[1]["cache_control"]["type"], "ephemeral");
+        assert!(sys_blocks[1]["cache_control"].get("scope").is_none());
+
+        // --- Message breakpoint on last message ---
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+        // First message: no cache_control.
+        assert!(messages[0]["content"][0].get("cache_control").is_none());
+        // Last message's last content block: has cache_control.
+        let last_block = &messages[1]["content"][0];
+        assert_eq!(last_block["cache_control"]["type"], "ephemeral");
     }
 }

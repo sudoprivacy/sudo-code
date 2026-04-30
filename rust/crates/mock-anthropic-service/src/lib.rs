@@ -144,7 +144,11 @@ async fn handle_connection(
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
 ) -> io::Result<()> {
     let (method, path, headers, raw_body) = read_http_request(&mut socket).await?;
-    let request: MessageRequest = serde_json::from_str(&raw_body)
+    // Normalize the "system" field: when it arrives as an array of content
+    // blocks (from cache-control-aware clients), flatten it back into a plain
+    // string so that `MessageRequest` deserialization succeeds.
+    let normalized_body = normalize_system_field(&raw_body);
+    let request: MessageRequest = serde_json::from_str(&normalized_body)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     let scenario = detect_scenario(&request)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parity scenario"))?;
@@ -235,6 +239,26 @@ async fn read_http_request(
     let body = String::from_utf8(body)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     Ok((method, path, headers, body))
+}
+
+/// When the `system` field is an array of content blocks (e.g. cache-control
+/// structured prompts), flatten it into a single concatenated string so that
+/// `MessageRequest` deserialization (which expects `Option<String>`) succeeds.
+fn normalize_system_field(raw_body: &str) -> String {
+    let Ok(mut body) = serde_json::from_str::<Value>(raw_body) else {
+        return raw_body.to_string();
+    };
+    if let Some(Value::Array(blocks)) = body.get("system") {
+        let text = blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        body["system"] = Value::String(text);
+        serde_json::to_string(&body).unwrap_or_else(|_| raw_body.to_string())
+    } else {
+        raw_body.to_string()
+    }
 }
 
 fn find_header_end(bytes: &[u8]) -> Option<usize> {

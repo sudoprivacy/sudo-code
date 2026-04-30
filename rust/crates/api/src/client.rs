@@ -227,6 +227,7 @@ impl ProviderClient {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum MessageStream {
     Anthropic(anthropic::MessageStream),
     OpenAiCompat(openai_compat::MessageStream),

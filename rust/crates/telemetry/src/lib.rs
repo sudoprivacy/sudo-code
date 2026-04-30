@@ -213,6 +213,15 @@ pub enum TelemetryEvent {
         headers: Map<String, Value>,
         body: Value,
     },
+    /// Token usage snapshot emitted after a streaming response completes.
+    HttpResponseUsage {
+        session_id: String,
+        timestamp_ms: u64,
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_creation_input_tokens: u32,
+        cache_read_input_tokens: u32,
+    },
     Analytics(AnalyticsEvent),
     SessionTrace(SessionTraceRecord),
 }
@@ -423,6 +432,23 @@ impl SessionTracer {
             method: method.into(),
             headers,
             body,
+        });
+    }
+
+    pub fn record_usage(
+        &self,
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_creation_input_tokens: u32,
+        cache_read_input_tokens: u32,
+    ) {
+        self.sink.record(TelemetryEvent::HttpResponseUsage {
+            session_id: self.session_id.clone(),
+            timestamp_ms: current_timestamp_ms(),
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
         });
     }
 
