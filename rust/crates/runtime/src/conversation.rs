@@ -568,7 +568,7 @@ where
                 collected
             };
 
-            let (assistant_message, usage, turn_prompt_cache_events) =
+            let (mut assistant_message, usage, turn_prompt_cache_events) =
                 match build_assistant_message(events) {
                     Ok(result) => result,
                     Err(error) => {
@@ -576,6 +576,7 @@ where
                         return Err(error);
                     }
                 };
+            assistant_message.model.clone_from(&self.session.model);
             if let Some(usage) = usage {
                 self.usage_tracker.record(usage);
             }

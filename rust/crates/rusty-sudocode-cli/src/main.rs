@@ -1959,6 +1959,7 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
                     mime_type: mime_type.clone(),
                 }],
                 usage: None,
+                model: None,
             };
             session
                 .runtime
