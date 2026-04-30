@@ -937,7 +937,7 @@ mod tests {
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
     };
-    use crate::prompt::{ProjectContext, SystemPromptBuilder};
+    use crate::prompt::{ProjectContext, SystemPrompt, SystemPromptBuilder};
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
     use crate::ToolError;
@@ -1131,7 +1131,7 @@ mod tests {
             ScriptedApiClient { call_count: 0 },
             StaticToolExecutor::new().register("add", |_input| Ok("4".to_string())),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
         )
         .with_session_tracer(tracer);
 
@@ -1196,7 +1196,7 @@ mod tests {
             SingleCallApiClient,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
         );
 
         let summary = runtime
@@ -1244,7 +1244,7 @@ mod tests {
                 panic!("tool should not execute when hook denies")
             }),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
                 vec![shell_snippet("printf 'blocked by hook'; exit 2")],
                 Vec::new(),
@@ -1308,7 +1308,7 @@ mod tests {
                 panic!("tool should not execute when hook fails")
             }),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
                 vec![shell_snippet("printf 'broken hook'; exit 1")],
                 Vec::new(),
@@ -1378,7 +1378,7 @@ mod tests {
             TwoCallApiClient { calls: 0 },
             StaticToolExecutor::new().register("add", |_input| Ok("4".to_string())),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
                 vec![shell_snippet("printf 'pre hook ran'")],
                 vec![shell_snippet("printf 'post hook ran'")],
@@ -1456,7 +1456,7 @@ mod tests {
             StaticToolExecutor::new()
                 .register("fail", |_input| Err(ToolError::new("tool exploded"))),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
                 Vec::new(),
                 vec![shell_snippet("printf 'post hook should not run'")],
@@ -1502,7 +1502,7 @@ mod tests {
             ScriptedApiClient { call_count: 0 },
             StaticToolExecutor::new().register("add", |_input| Ok("4".to_string())),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
         );
         let mut observer = RecordingRuntimeObserver::default();
 
@@ -1572,7 +1572,7 @@ mod tests {
             StaticToolExecutor::new()
                 .register("blocked", |_input| panic!("denied tool should not execute")),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
         );
         let mut observer = RecordingRuntimeObserver::default();
 
@@ -1624,7 +1624,7 @@ mod tests {
             ToolUseApiClient,
             StaticToolExecutor::new().register("fail", |_input| Err(ToolError::new("boom"))),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
         );
         let mut observer = RecordingRuntimeObserver::default();
 
@@ -1675,7 +1675,7 @@ mod tests {
             SimpleApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
         );
 
         assert_eq!(runtime.usage().turns(), 1);
@@ -1702,7 +1702,7 @@ mod tests {
             SimpleApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
         );
         runtime.run_turn("a", None, None).expect("turn a");
         runtime.run_turn("b", None, None).expect("turn b");
@@ -1746,7 +1746,7 @@ mod tests {
             SimpleApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
         );
 
         runtime
@@ -1774,7 +1774,7 @@ mod tests {
             ScriptedApiClient { call_count: 0 },
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
         );
 
         let forked = runtime.fork_session(Some("alt-path".to_string()));
@@ -1847,7 +1847,7 @@ mod tests {
             SimpleApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
         )
         .with_auto_compaction_input_tokens_threshold(100_000);
 
@@ -1890,7 +1890,7 @@ mod tests {
             SimpleApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
         )
         .with_auto_compaction_input_tokens_threshold(100_000);
 
@@ -1944,7 +1944,7 @@ mod tests {
             SimpleApi,
             tool_executor,
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
         );
 
         let error = runtime
@@ -1990,7 +1990,7 @@ mod tests {
             SimpleApi,
             tool_executor,
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
         );
 
         let summary = runtime
@@ -2071,7 +2071,7 @@ mod tests {
             LoopingApi,
             StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
         )
         .with_max_iterations(1);
 
@@ -2111,7 +2111,7 @@ mod tests {
             FailingApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            vec!["system".to_string()].into(),
+            SystemPrompt::default(),
         );
 
         // when

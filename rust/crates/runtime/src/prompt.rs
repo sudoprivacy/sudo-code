@@ -80,17 +80,6 @@ impl SystemPrompt {
     }
 }
 
-/// Convenience conversion: treats all strings as static sections.
-/// Useful in tests and call sites that don't need the static/dynamic split.
-impl From<Vec<String>> for SystemPrompt {
-    fn from(sections: Vec<String>) -> Self {
-        Self {
-            static_sections: sections,
-            dynamic_sections: Vec::new(),
-        }
-    }
-}
-
 /// Contents of an instruction file included in prompt construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextFile {

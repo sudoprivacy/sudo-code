@@ -6186,7 +6186,8 @@ mod tests {
     use api::OutputContentBlock;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        PermissionMode, PermissionPolicy, RuntimeError, Session, SystemPrompt, TaskPacket,
+        ToolExecutor,
     };
     use serde_json::json;
 
@@ -8496,7 +8497,7 @@ mod tests {
             },
             SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")])),
             agent_permission_policy(),
-            vec![String::from("system prompt")].into(),
+            SystemPrompt::default(),
         );
 
         let summary = runtime
