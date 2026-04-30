@@ -767,8 +767,8 @@ pub(crate) fn format_unknown_slash_command(name: &str) -> String {
 
 fn omc_compatibility_note(name: &str) -> Option<&'static str> {
     name.starts_with("oh-my-claudecode:").then_some(
-        "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. \
-         `scode` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
+        "Compatibility note: `/oh-my-claudecode:*` is a Sudo Code/OMC plugin command. \
+         `scode` does not yet load plugin slash commands, Sudo Code statusline stdin, or OMC session hooks.",
     )
 }
 

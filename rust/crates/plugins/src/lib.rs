@@ -1622,15 +1622,15 @@ fn detect_claude_code_manifest_contract_gaps(
     for (field, detail) in [
         (
             "skills",
-            "plugin manifest field `skills` uses the Claude Code plugin contract; `scode` does not load plugin-managed skills and instead discovers skills from local roots such as `.nexus/sudocode/skills`, `.omc/skills`, `.agents/skills`, `~/.omc/skills`, and `~/.claude/skills/omc-learned`.",
+            "plugin manifest field `skills` uses the Sudo Code plugin contract; `scode` does not load plugin-managed skills and instead discovers skills from local roots such as `.nexus/sudocode/skills`, `.omc/skills`, `.agents/skills`, `~/.omc/skills`, and `~/.claude/skills/omc-learned`.",
         ),
         (
             "mcpServers",
-            "plugin manifest field `mcpServers` uses the Claude Code plugin contract; `scode` does not import MCP servers from plugin manifests.",
+            "plugin manifest field `mcpServers` uses the Sudo Code plugin contract; `scode` does not import MCP servers from plugin manifests.",
         ),
         (
             "agents",
-            "plugin manifest field `agents` uses the Claude Code plugin contract; `scode` does not load plugin-managed agent markdown catalogs from plugin manifests.",
+            "plugin manifest field `agents` uses the Sudo Code plugin contract; `scode` does not load plugin-managed agent markdown catalogs from plugin manifests.",
         ),
     ] {
         if root.contains_key(field) {
@@ -1646,7 +1646,7 @@ fn detect_claude_code_manifest_contract_gaps(
         .is_some_and(|commands| commands.iter().any(Value::is_string))
     {
         errors.push(PluginManifestValidationError::UnsupportedManifestContract {
-            detail: "plugin manifest field `commands` uses Claude Code-style directory globs; `scode` slash dispatch is still built-in and does not load plugin slash command markdown files.".to_string(),
+            detail: "plugin manifest field `commands` uses Sudo Code-style directory globs; `scode` slash dispatch is still built-in and does not load plugin slash command markdown files.".to_string(),
         });
     }
 
@@ -1658,7 +1658,7 @@ fn detect_claude_code_manifest_contract_gaps(
             ) {
                 errors.push(PluginManifestValidationError::UnsupportedManifestContract {
                     detail: format!(
-                        "plugin hook `{hook_name}` uses the Claude Code lifecycle contract; `scode` plugins currently support only PreToolUse, PostToolUse, and PostToolUseFailure."
+                        "plugin hook `{hook_name}` uses the Sudo Code lifecycle contract; `scode` plugins currently support only PreToolUse, PostToolUse, and PostToolUseFailure."
                     ),
                 });
             }
@@ -2632,7 +2632,7 @@ mod tests {
             r#"{
   "name": "oh-my-claudecode",
   "version": "4.10.2",
-  "description": "Claude Code plugin manifest",
+  "description": "Sudo Code plugin manifest",
   "hooks": {
     "SessionStart": ["scripts/session-start.mjs"]
   },
@@ -2644,13 +2644,13 @@ mod tests {
         );
 
         let error = load_plugin_from_directory(&root)
-            .expect_err("Claude Code plugin manifest should fail with guidance");
+            .expect_err("Sudo Code plugin manifest should fail with guidance");
         let rendered = error.to_string();
-        assert!(rendered.contains("field `skills` uses the Claude Code plugin contract"));
-        assert!(rendered.contains("field `mcpServers` uses the Claude Code plugin contract"));
-        assert!(rendered.contains("field `agents` uses the Claude Code plugin contract"));
-        assert!(rendered.contains("field `commands` uses Claude Code-style directory globs"));
-        assert!(rendered.contains("hook `SessionStart` uses the Claude Code lifecycle contract"));
+        assert!(rendered.contains("field `skills` uses the Sudo Code plugin contract"));
+        assert!(rendered.contains("field `mcpServers` uses the Sudo Code plugin contract"));
+        assert!(rendered.contains("field `agents` uses the Sudo Code plugin contract"));
+        assert!(rendered.contains("field `commands` uses Sudo Code-style directory globs"));
+        assert!(rendered.contains("hook `SessionStart` uses the Sudo Code lifecycle contract"));
 
         let _ = fs::remove_dir_all(root);
     }
