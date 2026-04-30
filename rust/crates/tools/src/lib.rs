@@ -32,13 +32,31 @@ use runtime::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-/// Global abort flag for agent polling loops. Callers (e.g. Ctrl-C handlers) set this to true
-/// to unblock any in-progress `await_agent_output` poll.
-static AGENT_POLL_ABORT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// Registry of per-call abort tokens for agent polling loops. Each `await_agent_output`
+/// call registers its own token; callers (e.g. Ctrl-C handlers) invoke
+/// `set_agent_poll_abort(true)` to cancel all currently-active polls without cross-talk
+/// between concurrent calls or stale state carrying over to subsequent calls.
+fn active_poll_abort_tokens(
+) -> &'static std::sync::Mutex<Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>> {
+    use std::sync::OnceLock;
+    static TOKENS: OnceLock<
+        std::sync::Mutex<Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>>,
+    > = OnceLock::new();
+    TOKENS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
 
 pub fn set_agent_poll_abort(aborted: bool) {
-    AGENT_POLL_ABORT.store(aborted, std::sync::atomic::Ordering::Relaxed);
+    if !aborted {
+        return;
+    }
+    let mut tokens = active_poll_abort_tokens()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for token in tokens.drain(..) {
+        if let Some(arc) = token.upgrade() {
+            arc.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 /// Global task registry shared across tool invocations within a session.
@@ -1512,11 +1530,21 @@ fn run_task_output(input: TaskOutputInput) -> Result<String, String> {
 fn await_agent_output(agent_id: &str, block: bool, timeout_ms: u64) -> Result<Value, String> {
     let output_dir = agent_store_dir()?;
     let manifest_path = output_dir.join(format!("{agent_id}.json"));
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+    // Per-call abort token. Registered in the global registry so set_agent_poll_abort
+    // can cancel it; auto-resets because each call creates a fresh Arc starting false.
+    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut tokens = active_poll_abort_tokens()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokens.retain(|w| w.strong_count() > 0);
+        tokens.push(std::sync::Arc::downgrade(&abort));
+    }
 
     loop {
-        if AGENT_POLL_ABORT.load(std::sync::atomic::Ordering::Relaxed) {
+        if abort.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(String::from("agent polling aborted by shutdown signal"));
         }
 
@@ -3586,6 +3614,7 @@ fn prepare_agent_job(input: AgentInput) -> Result<PreparedAgent, String> {
     let agent_id = make_agent_id();
     let output_dir = agent_store_dir()?;
     std::fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
+    sweep_orphaned_tmp_files(&output_dir);
     let output_file = output_dir.join(format!("{agent_id}.md"));
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
@@ -3726,21 +3755,27 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
 }
 
 fn run_agent_job_returning_text(job: &AgentJob) -> Result<String, String> {
-    let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
-    // When called from within a tokio context (inline agent), use block_in_place to avoid
-    // "Cannot start a runtime from within a runtime". When called from a plain std thread
-    // (background agent via spawn_agent_job), fall back to a fresh runtime.
-    let summary = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            handle
-                .block_on(runtime.run_turn(job.prompt.clone(), None, None))
-                .map_err(|e| e.to_string())
-        })?,
-        Err(_) => {
-            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-            rt.block_on(runtime.run_turn(job.prompt.clone(), None, None))
-                .map_err(|e| e.to_string())?
-        }
+    let mut conv_runtime =
+        build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+    let prompt = job.prompt.clone();
+
+    // When inside a tokio context, spawn a fresh OS thread so we can create a new
+    // tokio Runtime without nesting. block_in_place is not used here because it
+    // panics on current_thread runtimes (the MCP server entry path uses one).
+    let summary = if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+                rt.block_on(conv_runtime.run_turn(prompt, None, None))
+                    .map_err(|e| e.to_string())
+            })
+            .join()
+            .map_err(|_| String::from("sub-agent thread panicked"))?
+        })?
+    } else {
+        let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+        rt.block_on(conv_runtime.run_turn(prompt, None, None))
+            .map_err(|e| e.to_string())?
     };
     Ok(final_assistant_text(&summary))
 }
@@ -3876,6 +3911,20 @@ fn agent_permission_policy() -> PermissionPolicy {
         PermissionPolicy::new(PermissionMode::DangerFullAccess),
         |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
     )
+}
+
+/// Best-effort removal of `*.tmp` files left behind by a previous crash between
+/// `fs::write` and `fs::rename` in `write_agent_manifest`. Called once per agent
+/// launch so the directory stays clean without a separate startup sweep.
+fn sweep_orphaned_tmp_files(dir: &std::path::Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
 }
 
 fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
@@ -6331,12 +6380,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        derive_agent_state, execute_agent_with_spawn, execute_tool, extract_recovery_outcome,
-        final_assistant_text, global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        SubagentToolExecutor,
+        agent_permission_policy, agent_store_dir, allowed_tools_for_subagent,
+        await_agent_output, classify_lane_failure, derive_agent_state, execute_agent_with_spawn,
+        execute_tool, extract_recovery_outcome, final_assistant_text, global_cron_registry,
+        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        persist_agent_terminal_state, push_output_block, run_task_packet, set_agent_poll_abort,
+        sweep_orphaned_tmp_files, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName,
+        LaneFailureClass, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::{
@@ -8717,6 +8767,204 @@ mod tests {
         )
         .expect_err("blank prompt should fail");
         assert!(missing_prompt.contains("prompt must not be empty"));
+    }
+
+    #[test]
+    fn await_agent_output_returns_not_ready_for_running_non_blocking() {
+        let _guard = env_guard();
+        let dir = temp_path("agent-poll-nonblocking");
+        std::env::set_var("SUDOCODE_AGENT_STORE", &dir);
+
+        let manifest = execute_agent_with_spawn(
+            AgentInput {
+                description: "Slow task".to_string(),
+                prompt: "Run slowly".to_string(),
+                subagent_type: None,
+                name: None,
+                model: None,
+                run_in_background: None,
+            },
+            |_job| Ok(()), // spawn but don't complete — manifest stays "running"
+        )
+        .expect("spawn should succeed");
+
+        // block=false should return immediately with not_ready.
+        let value = await_agent_output(&manifest.agent_id, false, 5_000)
+            .expect("non-blocking poll should not error");
+        assert_eq!(value["retrieval_status"], "not_ready");
+        assert_eq!(value["status"], "running");
+
+        std::env::remove_var("SUDOCODE_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn await_agent_output_returns_timeout_when_deadline_exceeded() {
+        let _guard = env_guard();
+        let dir = temp_path("agent-poll-timeout");
+        std::env::set_var("SUDOCODE_AGENT_STORE", &dir);
+
+        let manifest = execute_agent_with_spawn(
+            AgentInput {
+                description: "Never completes".to_string(),
+                prompt: "Spin forever".to_string(),
+                subagent_type: None,
+                name: None,
+                model: None,
+                run_in_background: None,
+            },
+            |_job| Ok(()),
+        )
+        .expect("spawn should succeed");
+
+        // timeout_ms=1 should expire almost immediately for a still-running agent.
+        let value = await_agent_output(&manifest.agent_id, true, 1)
+            .expect("timeout path should return Ok");
+        assert_eq!(value["retrieval_status"], "timeout");
+        assert_eq!(value["status"], "running");
+
+        std::env::remove_var("SUDOCODE_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn await_agent_output_returns_success_after_completion() {
+        let _guard = env_guard();
+        let dir = temp_path("agent-poll-completed");
+        std::env::set_var("SUDOCODE_AGENT_STORE", &dir);
+
+        let manifest = execute_agent_with_spawn(
+            AgentInput {
+                description: "Quick task".to_string(),
+                prompt: "Finish fast".to_string(),
+                subagent_type: None,
+                name: None,
+                model: None,
+                run_in_background: None,
+            },
+            |job| persist_agent_terminal_state(&job.manifest, "completed", Some("done"), None),
+        )
+        .expect("spawn should succeed");
+
+        // Agent is already completed — blocking poll should return success immediately.
+        let value = await_agent_output(&manifest.agent_id, true, 5_000)
+            .expect("completed agent poll should succeed");
+        assert_eq!(value["retrieval_status"], "success");
+        assert_eq!(value["status"], "completed");
+
+        std::env::remove_var("SUDOCODE_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn await_agent_output_returns_error_for_missing_agent() {
+        let _guard = env_guard();
+        let dir = temp_path("agent-poll-missing");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::env::set_var("SUDOCODE_AGENT_STORE", &dir);
+
+        let err = await_agent_output("agent-nonexistent", false, 5_000)
+            .expect_err("missing agent should error");
+        assert!(err.contains("agent not found"), "got: {err}");
+
+        std::env::remove_var("SUDOCODE_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn await_agent_output_handles_truncated_manifest_gracefully() {
+        let _guard = env_guard();
+        let dir = temp_path("agent-poll-truncated");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::env::set_var("SUDOCODE_AGENT_STORE", &dir);
+
+        // Write a truncated (invalid) JSON file where the manifest would be.
+        let agent_id = "agent-malformed-12345";
+        std::fs::write(dir.join(format!("{agent_id}.json")), b"{ \"status\": \"runn")
+            .expect("write truncated manifest");
+
+        let err = await_agent_output(agent_id, false, 5_000)
+            .expect_err("truncated manifest should return Err, not panic");
+        assert!(!err.is_empty(), "error message should be non-empty");
+
+        std::env::remove_var("SUDOCODE_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn set_agent_poll_abort_cancels_active_poll_without_affecting_new_ones() {
+        let _guard = env_guard();
+        let dir = temp_path("agent-poll-abort");
+        std::env::set_var("SUDOCODE_AGENT_STORE", &dir);
+
+        let manifest = execute_agent_with_spawn(
+            AgentInput {
+                description: "Abortable task".to_string(),
+                prompt: "Stay running".to_string(),
+                subagent_type: None,
+                name: None,
+                model: None,
+                run_in_background: None,
+            },
+            |_job| Ok(()),
+        )
+        .expect("spawn should succeed");
+        let agent_id = manifest.agent_id.clone();
+
+        // Spawn a thread to poll, then abort it from the main thread.
+        let poll_handle = std::thread::spawn(move || {
+            await_agent_output(&agent_id, true, 60_000)
+        });
+
+        // Give the poll thread a moment to register its abort token.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        set_agent_poll_abort(true);
+
+        let result = poll_handle.join().expect("poll thread should not panic");
+        assert!(result.is_err(), "aborted poll should return Err");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("aborted"), "got: {msg}");
+
+        // After the abort, a brand-new poll should NOT be immediately aborted
+        // (auto-reset: each call creates a fresh token starting false).
+        let manifest2 = execute_agent_with_spawn(
+            AgentInput {
+                description: "Second task".to_string(),
+                prompt: "Also running".to_string(),
+                subagent_type: None,
+                name: None,
+                model: None,
+                run_in_background: None,
+            },
+            |_job| Ok(()),
+        )
+        .expect("second spawn should succeed");
+
+        // block=false so it returns immediately — key check: not erroring with "aborted".
+        let value = await_agent_output(&manifest2.agent_id, false, 5_000)
+            .expect("fresh poll after abort should not be pre-aborted");
+        assert_eq!(value["retrieval_status"], "not_ready");
+
+        std::env::remove_var("SUDOCODE_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sweep_orphaned_tmp_files_removes_tmp_and_leaves_json() {
+        let dir = temp_path("agent-sweep-tmp");
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let tmp_path = dir.join("agent-123.json.tmp");
+        let json_path = dir.join("agent-123.json");
+        std::fs::write(&tmp_path, b"partial").expect("write tmp");
+        std::fs::write(&json_path, b"{}").expect("write json");
+
+        sweep_orphaned_tmp_files(&dir);
+
+        assert!(!tmp_path.exists(), ".tmp file should be removed");
+        assert!(json_path.exists(), ".json file should be kept");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
