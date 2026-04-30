@@ -23,10 +23,8 @@ use crate::usage::{TokenUsage, UsageTracker};
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 
-/// Message appended to the conversation when a turn is interrupted by the
-/// user.  This tells the model that the previous response was cut short.
-const INTERRUPT_MESSAGE: &str = "User interrupted the response. \
-    You may continue where you left off or start a new approach.";
+/// Message used in synthetic tool results when a turn is interrupted.
+const INTERRUPT_MESSAGE: &str = "Interrupted · What should Sudo Code do instead?";
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,17 +356,12 @@ where
     /// Preserve partial progress when a turn is cancelled.
     ///
     /// 1. Build an assistant message from whatever events were collected
-    ///    before the abort signal fired and push it to the session.
-    /// 2. For every `tool_use` block in that partial message, generate a
+    ///    before the abort signal fired.  An `[interrupted]` text block is
+    ///    appended so the model can see which turn was cancelled.
+    /// 2. Push the partial assistant message to the session.
+    /// 3. For every `tool_use` block in that partial message, generate a
     ///    synthetic `tool_result` with `is_error: true` so the API contract
     ///    (every `tool_use` must have a matching `tool_result`) is maintained.
-    ///    The error message includes a continuation hint so the model knows
-    ///    the response was cut short.
-    ///
-    /// No separate user interruption message is added — the synthetic tool
-    /// results already convey the cancellation.  Adding an extra user
-    /// message would confuse the model into attributing the interruption to
-    /// the *next* user turn instead of the cancelled one.
     fn finalize_cancelled_turn(&mut self, events: Vec<AssistantEvent>) {
         // Build partial assistant message from whatever events arrived.
         let mut text = String::new();
@@ -397,10 +390,13 @@ where
         }
         flush_text_block(&mut text, &mut blocks);
 
-        if blocks.is_empty() {
-            // No content was streamed — nothing to preserve.
-            return;
-        }
+        // Append an [interrupted] marker to the assistant message so the
+        // model knows this turn was cancelled.  This stays attached to the
+        // assistant turn (not a separate user message) so attribution is
+        // correct.
+        blocks.push(ContentBlock::Text {
+            text: "\n\n[Interrupted · What should Sudo Code do instead?]".to_string(),
+        });
 
         // Extract tool_use ids before pushing the assistant message.
         let pending_tool_ids: Vec<(String, String)> = blocks
