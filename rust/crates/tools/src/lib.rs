@@ -571,7 +571,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Agent",
-            description: "Launch a specialized agent task and persist its handoff metadata.",
+            description: "Launch a specialized agent task. By default runs synchronously and returns the result. Set run_in_background=true to launch asynchronously and retrieve results later with TaskOutput(agent_id, block=true).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -579,7 +579,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "prompt": { "type": "string" },
                     "subagent_type": { "type": "string" },
                     "name": { "type": "string" },
-                    "model": { "type": "string" }
+                    "model": { "type": "string" },
+                    "run_in_background": { "type": "boolean" }
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": false
@@ -842,13 +843,15 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskOutput",
-            description: "Retrieve the output produced by a background task.",
+            description: "Retrieve output from a background task or agent. Use task_id for TaskRegistry tasks. Use agent_id to retrieve (and optionally await) a background agent launched with Agent(run_in_background=true). Set block=true to wait until the agent finishes.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "task_id": { "type": "string" }
+                    "task_id": { "type": "string" },
+                    "agent_id": { "type": "string" },
+                    "block": { "type": "boolean" },
+                    "timeout_ms": { "type": "integer", "minimum": 0 }
                 },
-                "required": ["task_id"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -1256,7 +1259,7 @@ fn execute_tool_with_enforcer(
         "TaskList" => run_task_list(input.clone()),
         "TaskStop" => from_value::<TaskIdInput>(input).and_then(run_task_stop),
         "TaskUpdate" => from_value::<TaskUpdateInput>(input).and_then(run_task_update),
-        "TaskOutput" => from_value::<TaskIdInput>(input).and_then(run_task_output),
+        "TaskOutput" => from_value::<TaskOutputInput>(input).and_then(run_task_output),
         "WorkerCreate" => from_value::<WorkerCreateInput>(input).and_then(run_worker_create),
         "WorkerGet" => from_value::<WorkerIdInput>(input).and_then(run_worker_get),
         "WorkerObserve" => from_value::<WorkerObserveInput>(input).and_then(run_worker_observe),
@@ -1477,15 +1480,62 @@ fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_task_output(input: TaskIdInput) -> Result<String, String> {
+fn run_task_output(input: TaskOutputInput) -> Result<String, String> {
+    if let Some(agent_id) = &input.agent_id {
+        let value = await_agent_output(agent_id, input.block, input.timeout_ms)?;
+        return to_pretty_json(value);
+    }
+    let task_id = input
+        .task_id
+        .as_deref()
+        .ok_or_else(|| String::from("either task_id or agent_id is required"))?;
     let registry = global_task_registry();
-    match registry.output(&input.task_id) {
+    match registry.output(task_id) {
         Ok(output) => to_pretty_json(json!({
-            "task_id": input.task_id,
+            "task_id": task_id,
             "output": output,
             "has_output": !output.is_empty()
         })),
         Err(e) => Err(e),
+    }
+}
+
+fn await_agent_output(agent_id: &str, block: bool, timeout_ms: u64) -> Result<Value, String> {
+    let output_dir = agent_store_dir()?;
+    let manifest_path = output_dir.join(format!("{agent_id}.json"));
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+    loop {
+        if !manifest_path.exists() {
+            return Err(format!("agent not found: {agent_id}"));
+        }
+        let contents =
+            std::fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
+        let manifest: AgentOutput =
+            serde_json::from_str(&contents).map_err(|e| e.to_string())?;
+
+        if manifest.status != "running" || !block {
+            return Ok(json!({
+                "agent_id": manifest.agent_id,
+                "status": manifest.status,
+                "retrieval_status": if manifest.status == "running" { "not_ready" } else { "success" },
+                "result": manifest.result,
+                "error": manifest.error,
+                "output_file": manifest.output_file,
+                "manifest_file": manifest.manifest_file,
+            }));
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Ok(json!({
+                "agent_id": agent_id,
+                "status": "running",
+                "retrieval_status": "timeout",
+            }));
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
 
@@ -2310,6 +2360,8 @@ struct AgentInput {
     subagent_type: Option<String>,
     name: Option<String>,
     model: Option<String>,
+    #[serde(default)]
+    run_in_background: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2425,6 +2477,20 @@ struct TaskIdInput {
 struct TaskUpdateInput {
     task_id: String,
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskOutputInput {
+    task_id: Option<String>,
+    agent_id: Option<String>,
+    #[serde(default)]
+    block: bool,
+    #[serde(default = "default_task_output_timeout_ms")]
+    timeout_ms: u64,
+}
+
+const fn default_task_output_timeout_ms() -> u64 {
+    30_000
 }
 
 #[derive(Debug, Deserialize)]
@@ -2608,6 +2674,8 @@ struct AgentOutput {
     derived_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3476,13 +3544,19 @@ const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
-    execute_agent_with_spawn(input, spawn_agent_job)
+    if input.run_in_background.unwrap_or(false) {
+        execute_agent_with_spawn(input, spawn_agent_job)
+    } else {
+        execute_agent_inline(input)
+    }
 }
 
-fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
-where
-    F: FnOnce(AgentJob) -> Result<(), String>,
-{
+struct PreparedAgent {
+    manifest: AgentOutput,
+    job: AgentJob,
+}
+
+fn prepare_agent_job(input: AgentInput) -> Result<PreparedAgent, String> {
     if input.description.trim().is_empty() {
         return Err(String::from("description must not be empty"));
     }
@@ -3540,23 +3614,61 @@ where
         current_blocker: None,
         derived_state: String::from("working"),
         error: None,
+        result: None,
     };
     write_agent_manifest(&manifest)?;
 
-    let manifest_for_spawn = manifest.clone();
     let job = AgentJob {
-        manifest: manifest_for_spawn,
+        manifest: manifest.clone(),
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
     };
+    Ok(PreparedAgent { manifest, job })
+}
+
+fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
+where
+    F: FnOnce(AgentJob) -> Result<(), String>,
+{
+    let PreparedAgent { manifest, job } = prepare_agent_job(input)?;
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
         persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
         return Err(error);
     }
-
     Ok(manifest)
+}
+
+fn execute_agent_inline(input: AgentInput) -> Result<AgentOutput, String> {
+    let PreparedAgent { manifest, job } = prepare_agent_job(input)?;
+    match run_agent_job_returning_text(&job) {
+        Ok(final_text) => {
+            persist_agent_terminal_state(
+                &manifest,
+                "completed",
+                Some(final_text.as_str()),
+                None,
+            )?;
+            // Re-read manifest so lane events and result written by persist are present.
+            let output = std::fs::read_to_string(&manifest.manifest_file)
+                .map_err(|e| e.to_string())
+                .and_then(|s| {
+                    serde_json::from_str::<AgentOutput>(&s).map_err(|e| e.to_string())
+                })
+                .unwrap_or(manifest);
+            Ok(output)
+        }
+        Err(error) => {
+            let _ = persist_agent_terminal_state(
+                &manifest,
+                "failed",
+                None,
+                Some(error.clone()),
+            );
+            Err(format!("sub-agent failed: {error}"))
+        }
+    }
 }
 
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
@@ -3564,8 +3676,16 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_agent_job_returning_text(&job).and_then(|text| {
+                    persist_agent_terminal_state(
+                        &job.manifest,
+                        "completed",
+                        Some(text.as_str()),
+                        None,
+                    )
+                })
+            }));
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -3586,14 +3706,13 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn run_agent_job(job: &AgentJob) -> Result<(), String> {
+fn run_agent_job_returning_text(job: &AgentJob) -> Result<String, String> {
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
     let tokio_rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let summary = tokio_rt
         .block_on(runtime.run_turn(job.prompt.clone(), None, None))
         .map_err(|error| error.to_string())?;
-    let final_text = final_assistant_text(&summary);
-    persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
+    Ok(final_assistant_text(&summary))
 }
 
 fn build_agent_runtime(
@@ -3756,6 +3875,10 @@ fn persist_agent_terminal_state(
     next_manifest.current_blocker.clone_from(&blocker);
     next_manifest.derived_state =
         derive_agent_state(status, result, error.as_deref(), blocker.as_ref()).to_string();
+    next_manifest.result = result
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     next_manifest.error = error;
     if let Some(blocker) = blocker {
         next_manifest
@@ -7794,6 +7917,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
+                run_in_background: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -7837,7 +7961,8 @@ mod tests {
             &json!({
                 "description": "Verify the branch",
                 "prompt": "Check tests.",
-                "subagent_type": "explorer"
+                "subagent_type": "explorer",
+                "run_in_background": true
             }),
         )
         .expect("Agent should normalize built-in aliases");
@@ -7850,7 +7975,8 @@ mod tests {
             &json!({
                 "description": "Review the branch",
                 "prompt": "Inspect diff.",
-                "name": "Ship Audit!!!"
+                "name": "Ship Audit!!!",
+                "run_in_background": true
             }),
         )
         .expect("Agent should normalize explicit names");
@@ -7875,6 +8001,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
+                run_in_background: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -7932,6 +8059,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
+                run_in_background: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -7979,6 +8107,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("summary-floor".to_string()),
                 model: None,
+                run_in_background: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8024,6 +8153,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("recovery-lane".to_string()),
                 model: None,
+                run_in_background: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8072,6 +8202,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("review-lane".to_string()),
                 model: None,
+                run_in_background: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8112,6 +8243,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("backlog-scan".to_string()),
                 model: None,
+                run_in_background: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8158,6 +8290,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("artifact-lane".to_string()),
                 model: None,
+                run_in_background: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8228,6 +8361,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("cron-closeout".to_string()),
                 model: None,
+                run_in_background: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8269,6 +8403,7 @@ mod tests {
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
+                run_in_background: None,
             },
             |_| Err(String::from("thread creation failed")),
         )
