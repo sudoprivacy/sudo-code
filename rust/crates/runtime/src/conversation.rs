@@ -362,8 +362,13 @@ where
     /// 2. For every `tool_use` block in that partial message, generate a
     ///    synthetic `tool_result` with `is_error: true` so the API contract
     ///    (every `tool_use` must have a matching `tool_result`) is maintained.
-    /// 3. Append a user interruption message so the model knows the previous
-    ///    response was cut short.
+    ///    The error message includes a continuation hint so the model knows
+    ///    the response was cut short.
+    ///
+    /// No separate user interruption message is added — the synthetic tool
+    /// results already convey the cancellation.  Adding an extra user
+    /// message would confuse the model into attributing the interruption to
+    /// the *next* user turn instead of the cancelled one.
     fn finalize_cancelled_turn(&mut self, events: Vec<AssistantEvent>) {
         // Build partial assistant message from whatever events arrived.
         let mut text = String::new();
@@ -393,11 +398,7 @@ where
         flush_text_block(&mut text, &mut blocks);
 
         if blocks.is_empty() {
-            // No content was streamed — nothing to preserve except the
-            // interruption marker.
-            let _ = self
-                .session
-                .push_message(ConversationMessage::user_text(INTERRUPT_MESSAGE));
+            // No content was streamed — nothing to preserve.
             return;
         }
 
@@ -421,15 +422,10 @@ where
             let _ = self.session.push_message(ConversationMessage::tool_result(
                 tool_use_id,
                 tool_name,
-                "Interrupted by user",
+                INTERRUPT_MESSAGE,
                 true,
             ));
         }
-
-        // Tell the model the response was interrupted.
-        let _ = self
-            .session
-            .push_message(ConversationMessage::user_text(INTERRUPT_MESSAGE));
     }
 
     #[allow(clippy::too_many_lines)]
