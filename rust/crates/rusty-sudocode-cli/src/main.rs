@@ -2167,6 +2167,7 @@ impl LiveCli {
         let sudocode_config = require_sudocode_config_for_cwd(&cwd)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         let auth_mode = resolve_auth_mode(&model, auth_mode, &sudocode_config)?;
+        tools::set_global_auth_mode(auth_mode);
         let config = RuntimeConfig {
             model,
             system_prompt,
