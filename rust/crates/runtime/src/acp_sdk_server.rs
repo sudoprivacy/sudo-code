@@ -160,32 +160,31 @@ pub trait SdkAcpDelegate: Send + 'static {
     ) -> Result<(String, PathBuf), AcpError>;
 }
 
-/// Observer that collects session update notifications to be forwarded to
-/// the ACP client. Implements [`RuntimeObserver`] so existing `run_turn()`
-/// machinery can drive it.
+/// Observer that streams session update notifications to the ACP client in
+/// real time via a channel. Implements [`RuntimeObserver`] so existing
+/// `run_turn()` machinery can drive it.
 pub struct SdkSessionObserver {
     session_id: String,
-    updates: Vec<SessionNotification>,
+    tx: tokio::sync::mpsc::UnboundedSender<SessionNotification>,
 }
 
 impl SdkSessionObserver {
-    /// Create a new observer for the given session.
+    /// Create a new observer that sends notifications through `tx`.
     #[must_use]
-    pub fn new(session_id: impl Into<String>) -> Self {
+    pub fn new(
+        session_id: impl Into<String>,
+        tx: tokio::sync::mpsc::UnboundedSender<SessionNotification>,
+    ) -> Self {
         Self {
             session_id: session_id.into(),
-            updates: Vec::new(),
+            tx,
         }
     }
 
-    /// Drain all buffered notifications.
-    pub fn drain(&mut self) -> Vec<SessionNotification> {
-        std::mem::take(&mut self.updates)
-    }
-
     fn push(&mut self, update: SessionUpdate) {
-        self.updates
-            .push(SessionNotification::new(self.session_id.clone(), update));
+        let _ = self
+            .tx
+            .send(SessionNotification::new(self.session_id.clone(), update));
     }
 }
 
@@ -507,10 +506,14 @@ pub(crate) async fn run_acp_on_transport(
                             tokio::sync::oneshot::Sender<PermissionPromptDecision>,
                         )>();
 
+                        // Set up notification streaming channel.
+                        let (notif_tx, mut notif_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<SessionNotification>();
+
                         let sid_for_blocking = sid.clone();
                         let sid_for_perm = sid.clone();
                         let blocking_handle = tokio::task::spawn_blocking(move || {
-                            let mut observer = SdkSessionObserver::new(&sid_for_blocking);
+                            let mut observer = SdkSessionObserver::new(&sid_for_blocking, notif_tx);
                             let mut bridge = AcpPermissionBridge { tx: bridge_tx };
                             let mut delegate =
                                 d.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -537,18 +540,25 @@ pub(crate) async fn run_acp_on_transport(
                                     &mut bridge,
                                 )
                             };
-                            let notifications = observer.drain();
-                            let (reason, usage) = stop.unwrap_or((StopReason::EndTurn, None));
-                            (reason, usage, notifications)
+                            stop.unwrap_or((StopReason::EndTurn, None))
                         });
 
-                        // Concurrently serve permission requests from the
-                        // blocking thread and wait for the blocking task to
-                        // finish.
+                        // Concurrently serve permission requests and stream
+                        // notifications from the blocking thread while waiting
+                        // for it to finish.
                         let mut blocking_handle = blocking_handle;
+                        let mut notif_rx_open = true;
                         let result = loop {
                             tokio::select! {
                                 biased;
+                                notif = notif_rx.recv(), if notif_rx_open => {
+                                    if let Some(n) = notif {
+                                        let _ = cx_inner.send_notification(n);
+                                    } else {
+                                        // Sender dropped — stop polling this channel.
+                                        notif_rx_open = false;
+                                    }
+                                }
                                 perm = bridge_rx.recv() => {
                                     if let Some((perm_req, response_tx)) = perm {
                                         let acp_req = build_acp_permission_request(
@@ -572,19 +582,22 @@ pub(crate) async fn run_acp_on_transport(
                                         // Await the result directly to avoid a busy loop
                                         // (biased select would keep picking this branch).
                                         break blocking_handle.await
-                                            .unwrap_or((StopReason::EndTurn, None, Vec::new()));
+                                            .unwrap_or((StopReason::EndTurn, None));
                                     }
                                 }
                                 done = &mut blocking_handle => {
-                                    break done.unwrap_or((StopReason::EndTurn, None, Vec::new()));
+                                    break done.unwrap_or((StopReason::EndTurn, None));
                                 }
                             }
                         };
 
-                        let (stop_reason, prompt_usage, notifications) = result;
-                        for notif in notifications {
-                            cx_inner.send_notification(notif)?;
+                        // Drain any residual notifications that were buffered
+                        // before the blocking task returned.
+                        while let Ok(n) = notif_rx.try_recv() {
+                            let _ = cx_inner.send_notification(n);
                         }
+
+                        let (stop_reason, prompt_usage) = result;
 
                         let mut response = PromptResponse::new(stop_reason);
                         if let Some(u) = prompt_usage {
