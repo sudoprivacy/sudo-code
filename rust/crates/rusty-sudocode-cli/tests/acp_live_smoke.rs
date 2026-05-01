@@ -19,7 +19,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-const RECV_TIMEOUT: Duration = Duration::from_secs(60);
+const RECV_TIMEOUT: Duration = Duration::from_secs(120);
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
@@ -152,7 +152,7 @@ impl AcpTestClient {
     async fn recv(&mut self) -> Value {
         timeout(RECV_TIMEOUT, self.recv_inner())
             .await
-            .expect("recv timed out after 60s")
+            .expect("recv timed out after 120s")
     }
 
     async fn recv_inner(&mut self) -> Value {
@@ -211,6 +211,14 @@ impl AcpTestClient {
 // ---------------------------------------------------------------------------
 
 fn base_command(workspace: &TestWorkspace, token: &str) -> Command {
+    base_command_with_mode(workspace, token, "read-only")
+}
+
+fn base_command_with_mode(
+    workspace: &TestWorkspace,
+    token: &str,
+    permission_mode: &str,
+) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_scode"));
     cmd.current_dir(&workspace.root)
         .env_clear()
@@ -223,15 +231,23 @@ fn base_command(workspace: &TestWorkspace, token: &str) -> Command {
             "--auth",
             "subscription",
             "--model",
-            "claude-haiku",
+            "claude-sonnet",
             "--permission-mode",
-            "read-only",
+            permission_mode,
         ]);
     cmd
 }
 
 fn spawn_stdio_client(workspace: &TestWorkspace, token: &str) -> AcpTestClient {
-    let mut cmd = base_command(workspace, token);
+    spawn_stdio_client_with_mode(workspace, token, "read-only")
+}
+
+fn spawn_stdio_client_with_mode(
+    workspace: &TestWorkspace,
+    token: &str,
+    permission_mode: &str,
+) -> AcpTestClient {
+    let mut cmd = base_command_with_mode(workspace, token, permission_mode);
     cmd.arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -364,25 +380,142 @@ async fn scenario_session_prompt(client: &mut AcpTestClient, session_id: &str) {
         )
         .await;
 
+    // When the API token is invalid or expired the prompt completes
+    // instantly with zero notifications — fail loudly so we notice.
     assert!(
         !notifs.is_empty(),
-        "prompt should produce at least one notification"
+        "prompt produced no notifications — auth/API failure. \
+         Check CLAUDE_CODE_OAUTH_TOKEN is valid."
     );
 
-    let has_session_updates = notifs.iter().any(|n| {
-        n.get("method")
-            .and_then(Value::as_str)
-            .is_some_and(|m| m.contains("session"))
-    });
+    // Every notification should be a session/update.
+    for n in &notifs {
+        assert_eq!(
+            n["method"], "session/update",
+            "unexpected notification method: {}",
+            n["method"]
+        );
+    }
+
+    // Collect text deltas from agent_message_chunk notifications.
+    let response_text: String = notifs
+        .iter()
+        .filter_map(|n| {
+            let update = &n["params"]["update"];
+            if update["sessionUpdate"] == "agent_message_chunk" {
+                update["content"]["text"].as_str().map(String::from)
+            } else {
+                None
+            }
+        })
+        .collect();
     assert!(
-        has_session_updates,
-        "should have session update notifications"
+        response_text.to_lowercase().contains("pong"),
+        "expected 'pong' in model response but got: {response_text:?}"
     );
 
     let result = &resp["result"];
+    assert_eq!(
+        result["stopReason"], "end_turn",
+        "prompt response stopReason should be end_turn"
+    );
     assert!(
-        result.get("stopReason").is_some(),
-        "prompt response should include stopReason"
+        result.get("usage").is_some(),
+        "prompt response should include usage"
+    );
+}
+
+async fn scenario_subagent_calculations(client: &mut AcpTestClient, session_id: &str) {
+    let (notifs, resp) = client
+        .send_request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": concat!(
+                    "You MUST use the Agent tool to create exactly 3 separate agents, ",
+                    "one for each calculation below. Do NOT compute them yourself. ",
+                    "Each agent prompt should be: \"What is <expr>? Reply with ONLY the number.\"\n\n",
+                    "Calculations:\n",
+                    "1. 101 + 102\n",
+                    "2. 201 + 202\n",
+                    "3. 301 + 302\n\n",
+                    "After all 3 agents return, output exactly this JSON and nothing else:\n",
+                    "{\"results\": [<agent1_answer>, <agent2_answer>, <agent3_answer>]}"
+                )}]
+            }),
+        )
+        .await;
+
+    assert!(
+        !notifs.is_empty(),
+        "subagent prompt produced no notifications — auth/API failure. \
+         Check CLAUDE_CODE_OAUTH_TOKEN is valid."
+    );
+
+    // Count Agent tool_call starts (title == "Agent", status == "in_progress").
+    let agent_starts: Vec<_> = notifs
+        .iter()
+        .filter(|n| {
+            let update = &n["params"]["update"];
+            update["sessionUpdate"] == "tool_call"
+                && update["title"] == "Agent"
+                && update["status"] == "in_progress"
+        })
+        .collect();
+    assert_eq!(
+        agent_starts.len(),
+        3,
+        "expected exactly 3 Agent tool_call starts, got {}",
+        agent_starts.len()
+    );
+
+    // Extract completed tool_call_update notifications.
+    let completed_updates: Vec<_> = notifs
+        .iter()
+        .filter(|n| {
+            let update = &n["params"]["update"];
+            update["sessionUpdate"] == "tool_call_update" && update["status"] == "completed"
+        })
+        .collect();
+
+    // Extract subagent results from rawOutput.result (TaskOutput results).
+    let mut agent_results: Vec<String> = completed_updates
+        .iter()
+        .filter_map(|n| {
+            n["params"]["update"]["rawOutput"]["result"]
+                .as_str()
+                .map(String::from)
+        })
+        .collect();
+    agent_results.sort();
+
+    // Log all completed updates for diagnostics on CI failures.
+    eprintln!(
+        "subagent test: {} notifications, {} Agent starts, {} completed updates, results: {:?}",
+        notifs.len(),
+        agent_starts.len(),
+        completed_updates.len(),
+        agent_results,
+    );
+    for (i, u) in completed_updates.iter().enumerate() {
+        eprintln!("  completed[{i}]: {}", serde_json::to_string(u).unwrap());
+    }
+
+    assert!(
+        agent_results.contains(&"203".to_string())
+            && agent_results.contains(&"403".to_string())
+            && agent_results.contains(&"603".to_string()),
+        "expected agent results to contain 203, 403, 603 but got: {agent_results:?}"
+    );
+
+    let result = &resp["result"];
+    assert_eq!(
+        result["stopReason"], "end_turn",
+        "subagent prompt stopReason should be end_turn"
+    );
+    assert!(
+        result.get("usage").is_some(),
+        "subagent prompt response should include usage"
     );
 }
 
@@ -394,6 +527,60 @@ async fn run_live_scenarios(client: &mut AcpTestClient, workspace: &TestWorkspac
     scenario_initialize(client).await;
     let session_id = scenario_session_new(client, &workspace.root).await;
     scenario_session_prompt(client, &session_id).await;
+    verify_session_model_in_jsonl(workspace);
+}
+
+/// After a prompt completes, find the persisted session JSONL and verify
+/// that assistant messages carry a `model` field.
+fn verify_session_model_in_jsonl(workspace: &TestWorkspace) {
+    let sessions_dir = workspace.root.join(".scode").join("sessions");
+    if !sessions_dir.exists() {
+        eprintln!("WARN: session directory does not exist, skipping JSONL model check");
+        return;
+    }
+
+    let Some(jsonl_path) = find_jsonl_file(&sessions_dir) else {
+        eprintln!("WARN: no session .jsonl file found, skipping model check");
+        return;
+    };
+
+    let contents = fs::read_to_string(&jsonl_path).expect("should read session jsonl");
+
+    let mut found_assistant = false;
+    for line in contents.lines() {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record["type"] != "message" {
+            continue;
+        }
+        let msg = &record["message"];
+        if msg["role"] != "assistant" {
+            continue;
+        }
+        found_assistant = true;
+        let model = msg.get("model").and_then(Value::as_str);
+        assert!(
+            model.is_some_and(|m| !m.is_empty()),
+            "assistant message in session JSONL should have a non-empty model field, \
+             but got: {:?}",
+            model
+        );
+        eprintln!(
+            "session JSONL: assistant message model = {:?}",
+            model.unwrap()
+        );
+    }
+    assert!(
+        found_assistant,
+        "session JSONL should contain at least one assistant message"
+    );
+}
+
+async fn run_subagent_scenarios(client: &mut AcpTestClient, workspace: &TestWorkspace) {
+    scenario_initialize(client).await;
+    let session_id = scenario_session_new(client, &workspace.root).await;
+    scenario_subagent_calculations(client, &session_id).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +604,22 @@ async fn live_anthropic_smoke_stdio() {
 }
 
 #[tokio::test]
+async fn live_subagent_smoke_stdio() {
+    let Some(token) = oauth_token() else {
+        return;
+    };
+
+    let workspace = TestWorkspace::new("live-subagent-stdio");
+    workspace.create();
+    workspace.write_sudocode_json();
+
+    let mut client = spawn_stdio_client_with_mode(&workspace, &token, "danger-full-access");
+    run_subagent_scenarios(&mut client, &workspace).await;
+    client.shutdown().await;
+    workspace.cleanup();
+}
+
+#[tokio::test]
 async fn live_anthropic_smoke_ws() {
     let Some(token) = oauth_token() else {
         return;
@@ -430,4 +633,23 @@ async fn live_anthropic_smoke_ws() {
     run_live_scenarios(&mut client, &workspace).await;
     client.shutdown().await;
     workspace.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Recursively find the first `.jsonl` file under `dir`.
+fn find_jsonl_file(dir: &std::path::Path) -> Option<PathBuf> {
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_jsonl_file(&path) {
+                return Some(found);
+            }
+        } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+            return Some(path);
+        }
+    }
+    None
 }

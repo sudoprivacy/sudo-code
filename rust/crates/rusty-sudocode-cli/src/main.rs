@@ -237,9 +237,11 @@ fn main() {
         if json_output {
             // #77: classify error by prefix so downstream consumers can route without
             // regex-scraping the prose. Split short-reason from hint-runbook.
+            // #64: emit to stdout (not stderr) so JSON-mode consumers capturing only
+            // stdout receive errors with the same envelope as success responses.
             let kind = classify_error_kind(&message);
             let (short_reason, hint) = split_error_hint(&message);
-            eprintln!(
+            println!(
                 "{}",
                 serde_json::json!({
                     "type": "error",
@@ -362,7 +364,12 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    match parse_args(&args)? {
+    let action = parse_args(&args)?;
+    // Informational commands (help, version, config, login, logout) are
+    // dispatched immediately and must never block on a credential check.
+    // If an ensure_authenticated() call is ever added below this point it
+    // MUST be guarded by `if !action.is_informational()`.
+    match action {
         CliAction::DumpManifests {
             output_format,
             manifests_dir,
@@ -1756,12 +1763,16 @@ impl AcpSdkDelegate {
 }
 
 impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
-    fn new_session(&mut self, cwd: PathBuf) -> Result<(String, PathBuf), runtime::AcpError> {
+    fn new_session(
+        &mut self,
+        cwd: PathBuf,
+    ) -> Result<(String, PathBuf, runtime::HookAbortSignal), runtime::AcpError> {
         let session = self.inner.build_session(&cwd)?;
         let session_id = session.handle.id.clone();
         let session_cwd = session.cwd.clone();
+        let abort_signal = session.abort_signal.clone();
         self.inner.sessions.insert(session_id.clone(), session);
-        Ok((session_id, session_cwd))
+        Ok((session_id, session_cwd, abort_signal))
     }
 
     fn run_prompt(
@@ -1910,15 +1921,6 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
         self.inner.sessions.remove(session_id).is_some()
     }
 
-    fn cancel_session(&mut self, session_id: &str) -> bool {
-        if let Some(session) = self.inner.sessions.get(session_id) {
-            session.abort_signal.abort();
-            true
-        } else {
-            false
-        }
-    }
-
     fn set_model(&mut self, session_id: &str, model_id: &str) -> Result<String, runtime::AcpError> {
         self.inner
             .handle_acp_model_switch(session_id, Some(model_id.to_string()))
@@ -1964,6 +1966,7 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
                     mime_type: mime_type.clone(),
                 }],
                 usage: None,
+                model: None,
             };
             session
                 .runtime
@@ -1978,7 +1981,7 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
         &mut self,
         session_id: &str,
         cwd: PathBuf,
-    ) -> Result<(String, PathBuf), runtime::AcpError> {
+    ) -> Result<(String, PathBuf, runtime::HookAbortSignal), runtime::AcpError> {
         let cwd = canonical_session_cwd(&cwd)?;
         let _guard = ScopedCurrentDir::change_to(&cwd)
             .map_err(|e| runtime::AcpError::internal(format!("failed to enter cwd: {e}")))?;
@@ -2024,6 +2027,7 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
         }
 
         let loaded_session_id = handle.id.clone();
+        let signal = abort_signal.clone();
         self.inner.sessions.insert(
             loaded_session_id.clone(),
             AcpCliSession {
@@ -2033,7 +2037,7 @@ impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
                 abort_signal,
             },
         );
-        Ok((loaded_session_id, cwd))
+        Ok((loaded_session_id, cwd, signal))
     }
 }
 
@@ -2171,6 +2175,7 @@ impl LiveCli {
         let sudocode_config = require_sudocode_config_for_cwd(&cwd)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         let auth_mode = resolve_auth_mode(&model, auth_mode, &sudocode_config)?;
+        tools::set_global_auth_mode(auth_mode);
         let config = RuntimeConfig {
             model,
             system_prompt,
