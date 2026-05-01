@@ -56,6 +56,8 @@ pub struct ConversationMessage {
     pub role: MessageRole,
     pub blocks: Vec<ContentBlock>,
     pub usage: Option<TokenUsage>,
+    /// The model that generated this message (set only for assistant messages).
+    pub model: Option<String>,
 }
 
 /// Metadata describing the latest compaction that summarized a session.
@@ -259,6 +261,7 @@ impl Session {
             role: MessageRole::User,
             blocks,
             usage: None,
+            model: None,
         })
     }
 
@@ -644,6 +647,7 @@ impl ConversationMessage {
             role: MessageRole::User,
             blocks: vec![ContentBlock::Text { text: text.into() }],
             usage: None,
+            model: None,
         }
     }
 
@@ -653,6 +657,7 @@ impl ConversationMessage {
             role: MessageRole::Assistant,
             blocks,
             usage: None,
+            model: None,
         }
     }
 
@@ -662,6 +667,7 @@ impl ConversationMessage {
             role: MessageRole::Assistant,
             blocks,
             usage,
+            model: None,
         }
     }
 
@@ -681,6 +687,7 @@ impl ConversationMessage {
                 is_error,
             }],
             usage: None,
+            model: None,
         }
     }
 
@@ -705,6 +712,9 @@ impl ConversationMessage {
         );
         if let Some(usage) = self.usage {
             object.insert("usage".to_string(), usage_to_json(usage));
+        }
+        if let Some(model) = &self.model {
+            object.insert("model".to_string(), JsonValue::String(model.clone()));
         }
         JsonValue::Object(object)
     }
@@ -736,10 +746,15 @@ impl ConversationMessage {
             .map(ContentBlock::from_json)
             .collect::<Result<Vec<_>, _>>()?;
         let usage = object.get("usage").map(usage_from_json).transpose()?;
+        let model = object
+            .get("model")
+            .and_then(JsonValue::as_str)
+            .map(String::from);
         Ok(Self {
             role,
             blocks,
             usage,
+            model,
         })
     }
 }
@@ -1492,6 +1507,39 @@ mod tests {
         // then
         assert_eq!(restored.workspace_root(), Some(workspace_root.as_path()));
         assert_eq!(forked.workspace_root(), Some(workspace_root.as_path()));
+    }
+
+    #[test]
+    fn per_message_model_round_trips_through_jsonl() {
+        // given
+        let path = temp_session_path("per-message-model");
+        let mut session = Session::new();
+        let mut assistant_msg = ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: "response".to_string(),
+        }]);
+        assistant_msg.model = Some("claude-sonnet-4-6".to_string());
+        session
+            .push_user_text("hello")
+            .expect("user message should append");
+        session
+            .push_message(assistant_msg)
+            .expect("assistant message should append");
+
+        // when
+        session.save_to_path(&path).expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        // then
+        assert_eq!(
+            restored.messages[1].model.as_deref(),
+            Some("claude-sonnet-4-6"),
+            "assistant message model should survive JSONL round-trip"
+        );
+        assert_eq!(
+            restored.messages[0].model, None,
+            "user message model should be None"
+        );
     }
 
     fn temp_session_path(label: &str) -> PathBuf {

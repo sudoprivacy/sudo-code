@@ -304,6 +304,7 @@ mod tests {
                 cache_creation_input_tokens: 1,
                 cache_read_input_tokens: 0,
             }),
+            model: None,
         }];
 
         let tracker = UsageTracker::from_session(&session);
