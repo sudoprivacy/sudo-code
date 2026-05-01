@@ -14,7 +14,10 @@ use axum::Router;
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 
-use crate::acp_sdk_server::{run_acp_on_transport, SdkAcpConfig, SdkAcpDelegate, SharedDelegate};
+use crate::acp_sdk_server::{
+    new_abort_registry, run_acp_on_transport, AbortRegistry, SdkAcpConfig, SdkAcpDelegate,
+    SharedDelegate,
+};
 
 static WEB_UI_HTML: &str = include_str!("acp_web_ui.html");
 
@@ -22,6 +25,7 @@ static WEB_UI_HTML: &str = include_str!("acp_web_ui.html");
 struct AppState {
     config: SdkAcpConfig,
     delegate: SharedDelegate,
+    abort_registry: AbortRegistry,
 }
 
 /// Run an ACP server over WebSocket + serve the embedded web UI.
@@ -37,6 +41,7 @@ pub async fn run_acp_ws_server(
     let state = AppState {
         config,
         delegate: Arc::new(Mutex::new(delegate)),
+        abort_registry: new_abort_registry(),
     };
     let app = Router::new()
         .route("/", get(serve_html))
@@ -83,8 +88,13 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
 
     let transport = agent_client_protocol::Lines::new(outgoing, incoming);
 
-    if let Err(e) =
-        run_acp_on_transport(&state.config, Arc::clone(&state.delegate), transport).await
+    if let Err(e) = run_acp_on_transport(
+        &state.config,
+        Arc::clone(&state.delegate),
+        Arc::clone(&state.abort_registry),
+        transport,
+    )
+    .await
     {
         eprintln!("[acp-ws] transport error: {e}");
     }

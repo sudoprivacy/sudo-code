@@ -4,6 +4,7 @@
 //! including capabilities declaration, session cancel, permission-mode switching,
 //! model switching, image input, and permission-prompt bridging (elicitation).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -12,6 +13,7 @@ use agent_client_protocol::role::acp::{Agent, Client};
 //   - `ConnectTo<R>`:    trait for wiring up a transport (Stdio, Lines, etc.)
 //   - `ConnectionTo<R>`: runtime handle passed to handlers for sending messages
 use crate::conversation::RuntimeObserver;
+use crate::hooks::HookAbortSignal;
 use crate::permissions::{
     PermissionMode, PermissionPromptDecision, PermissionPrompter, PermissionRequest,
 };
@@ -92,8 +94,9 @@ pub(crate) struct SetPermissionModeResponse {}
 /// this crate.
 pub trait SdkAcpDelegate: Send + 'static {
     /// Create a new session for the given working directory, returning
-    /// `(session_id, cwd)` on success.
-    fn new_session(&mut self, cwd: PathBuf) -> Result<(String, PathBuf), AcpError>;
+    /// `(session_id, cwd, abort_signal)` on success.
+    fn new_session(&mut self, cwd: PathBuf)
+        -> Result<(String, PathBuf, HookAbortSignal), AcpError>;
 
     /// Run a prompt turn. The implementation should call observer methods
     /// to stream session updates.
@@ -127,10 +130,6 @@ pub trait SdkAcpDelegate: Send + 'static {
     /// Close (drop) a session by ID. Returns true if it existed.
     fn close_session(&mut self, session_id: &str) -> bool;
 
-    /// Cancel a running prompt for the given session by setting its abort
-    /// signal. Returns true if the session exists.
-    fn cancel_session(&mut self, session_id: &str) -> bool;
-
     /// Switch the model for a session. Returns a human-readable report.
     fn set_model(&mut self, session_id: &str, model_id: &str) -> Result<String, AcpError>;
 
@@ -152,40 +151,39 @@ pub trait SdkAcpDelegate: Send + 'static {
     ) -> Result<(), AcpError>;
 
     /// Load an existing persisted session by its ID and working directory,
-    /// returning `(session_id, cwd)` on success.
+    /// returning `(session_id, cwd, abort_signal)` on success.
     fn load_session(
         &mut self,
         session_id: &str,
         cwd: PathBuf,
-    ) -> Result<(String, PathBuf), AcpError>;
+    ) -> Result<(String, PathBuf, HookAbortSignal), AcpError>;
 }
 
-/// Observer that collects session update notifications to be forwarded to
-/// the ACP client. Implements [`RuntimeObserver`] so existing `run_turn()`
-/// machinery can drive it.
+/// Observer that streams session update notifications to the ACP client in
+/// real time via a channel. Implements [`RuntimeObserver`] so existing
+/// `run_turn()` machinery can drive it.
 pub struct SdkSessionObserver {
     session_id: String,
-    updates: Vec<SessionNotification>,
+    tx: tokio::sync::mpsc::UnboundedSender<SessionNotification>,
 }
 
 impl SdkSessionObserver {
-    /// Create a new observer for the given session.
+    /// Create a new observer that sends notifications through `tx`.
     #[must_use]
-    pub fn new(session_id: impl Into<String>) -> Self {
+    pub fn new(
+        session_id: impl Into<String>,
+        tx: tokio::sync::mpsc::UnboundedSender<SessionNotification>,
+    ) -> Self {
         Self {
             session_id: session_id.into(),
-            updates: Vec::new(),
+            tx,
         }
     }
 
-    /// Drain all buffered notifications.
-    pub fn drain(&mut self) -> Vec<SessionNotification> {
-        std::mem::take(&mut self.updates)
-    }
-
     fn push(&mut self, update: SessionUpdate) {
-        self.updates
-            .push(SessionNotification::new(self.session_id.clone(), update));
+        let _ = self
+            .tx
+            .send(SessionNotification::new(self.session_id.clone(), update));
     }
 }
 
@@ -302,6 +300,18 @@ pub struct PromptUsage {
 /// Thread-safe handle to a delegate, shared across async handlers.
 pub type SharedDelegate = Arc<Mutex<Box<dyn SdkAcpDelegate>>>;
 
+/// Separate registry of abort signals so that `session/cancel` can fire
+/// without contending on the main delegate mutex.
+pub type AbortRegistry = Arc<Mutex<HashMap<String, HookAbortSignal>>>;
+
+/// Create a new empty abort registry. Share this across connections so that
+/// cancel notifications on a reconnected transport can still reach sessions
+/// created on a previous connection.
+#[must_use]
+pub fn new_abort_registry() -> AbortRegistry {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
 /// A permission prompter that bridges to the ACP client over channels.
 ///
 /// From inside the blocking `spawn_blocking` context, `decide()` sends
@@ -410,6 +420,7 @@ fn uuid_v4() -> String {
 pub(crate) async fn run_acp_on_transport(
     config: &SdkAcpConfig,
     delegate: SharedDelegate,
+    abort_registry: AbortRegistry,
     transport: impl ConnectTo<Agent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let agent_version = config.agent_version.clone();
@@ -444,10 +455,12 @@ pub(crate) async fn run_acp_on_transport(
         .on_receive_request(
             {
                 let delegate = Arc::clone(&delegate);
+                let abort_registry = Arc::clone(&abort_registry);
                 async move |req: NewSessionRequest,
                             responder: Responder<NewSessionResponse>,
                             cx: ConnectionTo<Client>| {
                     let d = Arc::clone(&delegate);
+                    let registry = Arc::clone(&abort_registry);
                     cx.spawn(async move {
                         let result = tokio::task::spawn_blocking(move || {
                             d.lock()
@@ -458,7 +471,11 @@ pub(crate) async fn run_acp_on_transport(
                         .unwrap_or_else(|e| Err(AcpError::internal(e.to_string())));
 
                         match result {
-                            Ok((session_id, _cwd)) => {
+                            Ok((session_id, _cwd, signal)) => {
+                                registry
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .insert(session_id.clone(), signal);
                                 responder.respond(NewSessionResponse::new(session_id))?;
                             }
                             Err(e) => {
@@ -507,10 +524,14 @@ pub(crate) async fn run_acp_on_transport(
                             tokio::sync::oneshot::Sender<PermissionPromptDecision>,
                         )>();
 
+                        // Set up notification streaming channel.
+                        let (notif_tx, mut notif_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<SessionNotification>();
+
                         let sid_for_blocking = sid.clone();
                         let sid_for_perm = sid.clone();
                         let blocking_handle = tokio::task::spawn_blocking(move || {
-                            let mut observer = SdkSessionObserver::new(&sid_for_blocking);
+                            let mut observer = SdkSessionObserver::new(&sid_for_blocking, notif_tx);
                             let mut bridge = AcpPermissionBridge { tx: bridge_tx };
                             let mut delegate =
                                 d.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -537,18 +558,25 @@ pub(crate) async fn run_acp_on_transport(
                                     &mut bridge,
                                 )
                             };
-                            let notifications = observer.drain();
-                            let (reason, usage) = stop.unwrap_or((StopReason::EndTurn, None));
-                            (reason, usage, notifications)
+                            stop.unwrap_or((StopReason::EndTurn, None))
                         });
 
-                        // Concurrently serve permission requests from the
-                        // blocking thread and wait for the blocking task to
-                        // finish.
+                        // Concurrently serve permission requests and stream
+                        // notifications from the blocking thread while waiting
+                        // for it to finish.
                         let mut blocking_handle = blocking_handle;
+                        let mut notif_rx_open = true;
                         let result = loop {
                             tokio::select! {
                                 biased;
+                                notif = notif_rx.recv(), if notif_rx_open => {
+                                    if let Some(n) = notif {
+                                        let _ = cx_inner.send_notification(n);
+                                    } else {
+                                        // Sender dropped — stop polling this channel.
+                                        notif_rx_open = false;
+                                    }
+                                }
                                 perm = bridge_rx.recv() => {
                                     if let Some((perm_req, response_tx)) = perm {
                                         let acp_req = build_acp_permission_request(
@@ -572,19 +600,22 @@ pub(crate) async fn run_acp_on_transport(
                                         // Await the result directly to avoid a busy loop
                                         // (biased select would keep picking this branch).
                                         break blocking_handle.await
-                                            .unwrap_or((StopReason::EndTurn, None, Vec::new()));
+                                            .unwrap_or((StopReason::EndTurn, None));
                                     }
                                 }
                                 done = &mut blocking_handle => {
-                                    break done.unwrap_or((StopReason::EndTurn, None, Vec::new()));
+                                    break done.unwrap_or((StopReason::EndTurn, None));
                                 }
                             }
                         };
 
-                        let (stop_reason, prompt_usage, notifications) = result;
-                        for notif in notifications {
-                            cx_inner.send_notification(notif)?;
+                        // Drain any residual notifications that were buffered
+                        // before the blocking task returned.
+                        while let Ok(n) = notif_rx.try_recv() {
+                            let _ = cx_inner.send_notification(n);
                         }
+
+                        let (stop_reason, prompt_usage) = result;
 
                         let mut response = PromptResponse::new(stop_reason);
                         if let Some(u) = prompt_usage {
@@ -605,15 +636,17 @@ pub(crate) async fn run_acp_on_transport(
         // --- session/cancel (notification) ---
         .on_receive_notification(
             {
-                let delegate = Arc::clone(&delegate);
+                let abort_registry = Arc::clone(&abort_registry);
                 async move |notif: CancelNotification, _cx: ConnectionTo<Client>| {
-                    let d = Arc::clone(&delegate);
                     let sid = notif.session_id.to_string();
-                    tokio::task::spawn_blocking(move || {
-                        d.lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .cancel_session(&sid);
-                    });
+                    let signal = abort_registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&sid)
+                        .cloned();
+                    if let Some(signal) = signal {
+                        signal.abort();
+                    }
                     Ok(())
                 }
             },
@@ -623,19 +656,26 @@ pub(crate) async fn run_acp_on_transport(
         .on_receive_request(
             {
                 let delegate = Arc::clone(&delegate);
+                let abort_registry = Arc::clone(&abort_registry);
                 async move |req: CloseSessionRequest,
                             responder: Responder<CloseSessionResponse>,
                             cx: ConnectionTo<Client>| {
                     let d = Arc::clone(&delegate);
+                    let registry = Arc::clone(&abort_registry);
                     let sid = req.session_id.to_string();
                     cx.spawn(async move {
+                        let sid_clone = sid.clone();
                         tokio::task::spawn_blocking(move || {
                             d.lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .close_session(&sid);
+                                .close_session(&sid_clone);
                         })
                         .await
                         .ok();
+                        registry
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&sid);
                         responder.respond(CloseSessionResponse::new())?;
                         Ok(())
                     })?;
@@ -710,10 +750,12 @@ pub(crate) async fn run_acp_on_transport(
         .on_receive_request(
             {
                 let delegate = Arc::clone(&delegate);
+                let abort_registry = Arc::clone(&abort_registry);
                 async move |req: LoadSessionRequest,
                             responder: Responder<LoadSessionResponse>,
                             cx: ConnectionTo<Client>| {
                     let d = Arc::clone(&delegate);
+                    let registry = Arc::clone(&abort_registry);
                     let sid = req.session_id.to_string();
                     let cwd = req.cwd;
                     cx.spawn(async move {
@@ -726,7 +768,11 @@ pub(crate) async fn run_acp_on_transport(
                         .unwrap_or_else(|e| Err(AcpError::internal(e.to_string())));
 
                         match result {
-                            Ok((_session_id, _cwd)) => {
+                            Ok((session_id, _cwd, signal)) => {
+                                registry
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .insert(session_id, signal);
                                 responder.respond(LoadSessionResponse::new())?;
                             }
                             Err(e) => {
