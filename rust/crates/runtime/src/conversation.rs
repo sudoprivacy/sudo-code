@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::pin::Pin;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::Stream;
@@ -165,6 +166,18 @@ pub struct AutoCompactionEvent {
     pub removed_message_count: usize,
 }
 
+/// RAII guard that aborts a turn timer task when dropped.
+///
+/// Prevents a timer from firing the abort signal after a turn already
+/// completed normally — which would poison the signal for the next turn.
+struct TurnTimerGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for TurnTimerGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Coordinates the model loop, tool execution, hooks, and session updates.
 pub struct ConversationRuntime<C, T> {
     session: Session,
@@ -179,6 +192,10 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter + Send>>,
     session_tracer: Option<SessionTracer>,
+    /// Wall-clock deadline for an entire turn. Fires the abort signal when elapsed.
+    turn_timeout: Option<Duration>,
+    /// Maximum idle time between consecutive SSE events. Fires the abort signal when elapsed.
+    stream_stall_timeout: Option<Duration>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -228,6 +245,8 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            turn_timeout: None,
+            stream_stall_timeout: None,
         }
     }
 
@@ -261,6 +280,23 @@ where
     #[must_use]
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
         self.session_tracer = Some(session_tracer);
+        self
+    }
+
+    /// Set a wall-clock deadline for each turn. When elapsed the abort signal
+    /// fires and the turn returns with `cancelled: true`.
+    #[must_use]
+    pub fn with_turn_timeout(mut self, timeout: Duration) -> Self {
+        self.turn_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the maximum idle time allowed between consecutive SSE events. When
+    /// no event arrives within this window the abort signal fires and the turn
+    /// returns with `cancelled: true`.
+    #[must_use]
+    pub fn with_stream_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_stall_timeout = Some(timeout);
         self
     }
 
@@ -479,6 +515,19 @@ where
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
 
+        // Spawn a timer task that fires the abort signal after `turn_timeout`.
+        // The guard aborts the task when the turn exits (normally or via error),
+        // preventing a stale timer from poisoning the next turn.
+        let _turn_timer = self.turn_timeout.map(|dur| {
+            let signal = self.hook_abort_signal.clone();
+            TurnTimerGuard(tokio::spawn(async move {
+                tokio::time::sleep(dur).await;
+                signal.abort();
+            }))
+        });
+
+        let stall_timeout = self.stream_stall_timeout;
+
         loop {
             if self.hook_abort_signal.is_aborted() {
                 self.finalize_cancelled_turn(Vec::new());
@@ -516,6 +565,8 @@ where
 
             // Consume the stream event-by-event, racing against the abort
             // signal so cancellation drops the HTTP connection immediately.
+            // A stall arm fires the abort signal when no SSE event arrives
+            // within `stream_stall_timeout`, catching hung-but-alive connections.
             let events = {
                 let abort = &self.hook_abort_signal;
                 let mut collected = Vec::new();
@@ -562,6 +613,25 @@ where
                                 }
                                 None => break,
                             }
+                        }
+                        () = async {
+                            match stall_timeout {
+                                Some(dur) => tokio::time::sleep(dur).await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            // No SSE event within the stall window — treat as a hang.
+                            drop(stream);
+                            self.finalize_cancelled_turn(collected);
+                            return Ok(TurnSummary {
+                                assistant_messages: Vec::new(),
+                                tool_results: Vec::new(),
+                                prompt_cache_events: Vec::new(),
+                                iterations,
+                                usage: self.usage_tracker.cumulative_usage(),
+                                auto_compaction: None,
+                                cancelled: true,
+                            });
                         }
                     }
                 }
@@ -2346,5 +2416,117 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+    }
+
+    #[tokio::test]
+    async fn turn_timeout_cancels_turn_via_abort_signal() {
+        // A stream that never finishes (hangs indefinitely).
+        struct HangingApi;
+
+        #[async_trait]
+        impl ApiClient for HangingApi {
+            async fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<AssistantEventStream, RuntimeError> {
+                Ok(Box::pin(
+                    futures::stream::pending::<Result<AssistantEvent, RuntimeError>>(),
+                ))
+            }
+        }
+
+        // given: a very short turn timeout
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            HangingApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            SystemPrompt::default(),
+        )
+        .with_turn_timeout(Duration::from_millis(50));
+
+        // when
+        let summary = runtime
+            .run_turn("hello", None, None)
+            .await
+            .expect("turn timeout should return cancelled summary, not an error");
+
+        // then
+        assert!(summary.cancelled, "turn should be marked cancelled");
+    }
+
+    #[tokio::test]
+    async fn stream_stall_timeout_cancels_turn_on_idle_stream() {
+        // A stream that emits one event then stalls (TCP alive, no more data).
+        struct StallAfterFirstEventApi;
+
+        #[async_trait]
+        impl ApiClient for StallAfterFirstEventApi {
+            async fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<AssistantEventStream, RuntimeError> {
+                // Yield one event then stall forever.
+                let stream = futures::stream::unfold(false, |sent| async move {
+                    if sent {
+                        std::future::pending::<Option<_>>().await
+                    } else {
+                        Some((
+                            Ok(AssistantEvent::TextDelta("hello".to_string())),
+                            true,
+                        ))
+                    }
+                });
+                Ok(Box::pin(stream))
+            }
+        }
+
+        // given: a short stall timeout
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            StallAfterFirstEventApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            SystemPrompt::default(),
+        )
+        .with_stream_stall_timeout(Duration::from_millis(50));
+
+        // when
+        let summary = runtime
+            .run_turn("hello", None, None)
+            .await
+            .expect("stall timeout should return cancelled summary, not an error");
+
+        // then
+        assert!(summary.cancelled, "turn should be marked cancelled on stream stall");
+    }
+
+    #[tokio::test]
+    async fn turn_timeout_does_not_affect_fast_turns() {
+        // given: a generous timeout that won't fire during a normal turn
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ScriptedApiClient { call_count: 0 },
+            StaticToolExecutor::new().register("add", |input| {
+                let total = input
+                    .split(',')
+                    .map(|p| p.parse::<i32>().unwrap_or(0))
+                    .sum::<i32>();
+                Ok(total.to_string())
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            SystemPrompt::default(),
+        )
+        .with_turn_timeout(Duration::from_secs(30));
+
+        // when — DangerFullAccess auto-approves all tools; no prompter needed
+        let summary = runtime
+            .run_turn("what is 2 + 2?", None, None)
+            .await
+            .expect("fast turn should complete normally");
+
+        // then
+        assert!(!summary.cancelled, "fast turn should not be cancelled");
+        assert_eq!(summary.iterations, 2);
     }
 }
