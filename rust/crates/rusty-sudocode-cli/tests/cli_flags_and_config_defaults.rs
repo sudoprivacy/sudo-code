@@ -300,8 +300,8 @@ fn informational_commands_bypass_credential_check() {
     let help_json = no_creds(&["help", "--output-format", "json"]);
     assert_success(&help_json);
     let help_stdout = String::from_utf8(help_json.stdout).expect("utf8");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&help_stdout).expect("help --output-format json should emit valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(&help_stdout)
+        .expect("help --output-format json should emit valid JSON");
     assert_eq!(parsed["kind"], "help");
 
     // scode version --output-format json
