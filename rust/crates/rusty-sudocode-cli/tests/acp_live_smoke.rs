@@ -517,6 +517,55 @@ async fn run_live_scenarios(client: &mut AcpTestClient, workspace: &TestWorkspac
     scenario_initialize(client).await;
     let session_id = scenario_session_new(client, &workspace.root).await;
     scenario_session_prompt(client, &session_id).await;
+    verify_session_model_in_jsonl(workspace);
+}
+
+/// After a prompt completes, find the persisted session JSONL and verify
+/// that assistant messages carry a `model` field.
+fn verify_session_model_in_jsonl(workspace: &TestWorkspace) {
+    // Session files live under <workspace.root>/.scode/sessions/<fingerprint>/*.jsonl
+    let sessions_dir = workspace.root.join(".scode").join("sessions");
+    assert!(
+        sessions_dir.exists(),
+        "session directory should exist at {}",
+        sessions_dir.display()
+    );
+
+    // Find any .jsonl file (simple recursive search).
+    let jsonl_path = find_jsonl_file(&sessions_dir).expect("should find a session .jsonl file");
+
+    let contents = fs::read_to_string(&jsonl_path).expect("should read session jsonl");
+
+    // Parse each line; find message records with role=assistant.
+    let mut found_assistant = false;
+    for line in contents.lines() {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record["type"] != "message" {
+            continue;
+        }
+        let msg = &record["message"];
+        if msg["role"] != "assistant" {
+            continue;
+        }
+        found_assistant = true;
+        let model = msg.get("model").and_then(Value::as_str);
+        assert!(
+            model.is_some_and(|m| !m.is_empty()),
+            "assistant message in session JSONL should have a non-empty model field, \
+             but got: {:?}",
+            model
+        );
+        eprintln!(
+            "session JSONL: assistant message model = {:?}",
+            model.unwrap()
+        );
+    }
+    assert!(
+        found_assistant,
+        "session JSONL should contain at least one assistant message"
+    );
 }
 
 async fn run_subagent_scenarios(client: &mut AcpTestClient, workspace: &TestWorkspace) {
@@ -575,4 +624,23 @@ async fn live_anthropic_smoke_ws() {
     run_live_scenarios(&mut client, &workspace).await;
     client.shutdown().await;
     workspace.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Recursively find the first `.jsonl` file under `dir`.
+fn find_jsonl_file(dir: &std::path::Path) -> Option<PathBuf> {
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_jsonl_file(&path) {
+                return Some(found);
+            }
+        } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+            return Some(path);
+        }
+    }
+    None
 }
