@@ -225,6 +225,10 @@ fn base_command_with_mode(
         .env("SUDO_CODE_CONFIG_HOME", &workspace.config_home)
         .env("HOME", &workspace.home)
         .env("CLAUDE_CODE_OAUTH_TOKEN", token)
+        .env(
+            "SUDOCODE_AGENT_STORE",
+            workspace.root.join(".sudocode-agents"),
+        )
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
         .args([
@@ -503,10 +507,17 @@ async fn scenario_subagent_calculations(client: &mut AcpTestClient, session_id: 
         let status = update["status"].as_str().unwrap_or("none");
         let title = update["title"].as_str().unwrap_or("");
         let tool_call_id = update["toolCallId"].as_str().unwrap_or("");
-        let raw_output_preview = update.get("rawOutput").map(|v| {
-            let s = serde_json::to_string(v).unwrap_or_default();
-            if s.len() > 200 { format!("{}...", &s[..200]) } else { s }
-        }).unwrap_or_default();
+        let raw_output_preview = update
+            .get("rawOutput")
+            .map(|v| {
+                let s = serde_json::to_string(v).unwrap_or_default();
+                if s.len() > 200 {
+                    format!("{}...", &s[..200])
+                } else {
+                    s
+                }
+            })
+            .unwrap_or_default();
         eprintln!(
             "  notif[{i}]: kind={kind} status={status} title={title} toolCallId={tool_call_id} rawOutput={raw_output_preview}"
         );
