@@ -489,7 +489,7 @@ async fn scenario_subagent_calculations(client: &mut AcpTestClient, session_id: 
         .collect();
     agent_results.sort();
 
-    // Log all completed updates for diagnostics on CI failures.
+    // Log all notifications for diagnostics on CI failures.
     eprintln!(
         "subagent test: {} notifications, {} Agent starts, {} completed updates, results: {:?}",
         notifs.len(),
@@ -497,8 +497,19 @@ async fn scenario_subagent_calculations(client: &mut AcpTestClient, session_id: 
         completed_updates.len(),
         agent_results,
     );
-    for (i, u) in completed_updates.iter().enumerate() {
-        eprintln!("  completed[{i}]: {}", serde_json::to_string(u).unwrap());
+    for (i, n) in notifs.iter().enumerate() {
+        let update = &n["params"]["update"];
+        let kind = update["sessionUpdate"].as_str().unwrap_or("?");
+        let status = update["status"].as_str().unwrap_or("none");
+        let title = update["title"].as_str().unwrap_or("");
+        let tool_call_id = update["toolCallId"].as_str().unwrap_or("");
+        let raw_output_preview = update.get("rawOutput").map(|v| {
+            let s = serde_json::to_string(v).unwrap_or_default();
+            if s.len() > 200 { format!("{}...", &s[..200]) } else { s }
+        }).unwrap_or_default();
+        eprintln!(
+            "  notif[{i}]: kind={kind} status={status} title={title} toolCallId={tool_call_id} rawOutput={raw_output_preview}"
+        );
     }
 
     assert!(
