@@ -9,6 +9,16 @@ publish.workspace = true
 sha2 = "0.10"
 glob = "0.3"
 keyring = "3"
+# In-tree path-dep on the nexus kernel rlib so `runtime::spawn_task`
+# can drive `kernel.sys_read` / `kernel.sys_write` against the per-pid
+# chat-with-me DT_STREAM directly. `default-features = false` keeps
+# the kernel runtime defaults (mimalloc allocator, reqwest connector
+# stack, py-hook adapters) off in the sudocode build — sudocode does
+# not need them and they'd bloat the standalone CLI. Path-dep ties the
+# build to local layout (sudocode + nexus-para-pc-3 side-by-side); CI
+# mirrors the layout. When sudocode lands in the nexus monorepo this
+# becomes a workspace member dep.
+kernel = { path = "../../../../nexus-para-pc-3/rust/kernel", default-features = false }
 nexus-vfs-client = { path = "../nexus-vfs-client" }
 plugins = { path = "../plugins" }
 regex = "1"

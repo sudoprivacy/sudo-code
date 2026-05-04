@@ -38,6 +38,7 @@ mod remote;
 pub mod sandbox;
 mod session;
 pub mod session_control;
+pub mod spawn_task;
 pub use session_control::SessionStore;
 mod sse;
 pub mod stale_base;
