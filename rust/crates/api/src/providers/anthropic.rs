@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use runtime::format_usd;
 use runtime::{
@@ -13,7 +12,7 @@ use serde_json::{Map, Value};
 use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, SessionTracer};
 
 use crate::error::ApiError;
-use crate::http_client::build_http_client_or_default;
+use crate::http_transport::{request_id_from_headers, HttpTransport, RetryPolicy};
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
 use super::registry::{self, model_token_limit};
@@ -22,11 +21,6 @@ use crate::sse::SseParser;
 use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
-const REQUEST_ID_HEADER: &str = "request-id";
-const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
-const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
-const DEFAULT_MAX_RETRIES: u32 = 8;
 const OAUTH_SYSTEM_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,14 +105,11 @@ impl From<OAuthTokenSet> for AuthSource {
 
 #[derive(Debug, Clone)]
 pub struct AnthropicClient {
-    http: reqwest::Client,
+    http: HttpTransport,
     auth: AuthSource,
     base_url: String,
-    max_retries: u32,
-    initial_backoff: Duration,
-    max_backoff: Duration,
+    retry_policy: RetryPolicy,
     request_profile: AnthropicRequestProfile,
-    session_tracer: Option<SessionTracer>,
     prompt_cache: Option<PromptCache>,
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
     /// When true, prepend `OAUTH_SYSTEM_PREFIX` as the first system content
@@ -131,14 +122,11 @@ impl AnthropicClient {
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            http: build_http_client_or_default(),
+            http: HttpTransport::new(),
             auth: AuthSource::ApiKey(api_key.into()),
             base_url: DEFAULT_BASE_URL.to_string(),
-            max_retries: DEFAULT_MAX_RETRIES,
-            initial_backoff: DEFAULT_INITIAL_BACKOFF,
-            max_backoff: DEFAULT_MAX_BACKOFF,
+            retry_policy: RetryPolicy::DEFAULT,
             request_profile: AnthropicRequestProfile::default(),
-            session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
             oauth_system_prefix: false,
@@ -162,14 +150,11 @@ impl AnthropicClient {
             None => is_claude_code_oauth_token(),
         };
         let mut client = Self {
-            http: build_http_client_or_default(),
+            http: HttpTransport::new(),
             auth,
             base_url: DEFAULT_BASE_URL.to_string(),
-            max_retries: DEFAULT_MAX_RETRIES,
-            initial_backoff: DEFAULT_INITIAL_BACKOFF,
-            max_backoff: DEFAULT_MAX_BACKOFF,
+            retry_policy: RetryPolicy::DEFAULT,
             request_profile: AnthropicRequestProfile::default(),
-            session_tracer: None,
             prompt_cache: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
             oauth_system_prefix: is_subscription,
@@ -234,15 +219,17 @@ impl AnthropicClient {
         initial_backoff: Duration,
         max_backoff: Duration,
     ) -> Self {
-        self.max_retries = max_retries;
-        self.initial_backoff = initial_backoff;
-        self.max_backoff = max_backoff;
+        self.retry_policy = RetryPolicy {
+            max_retries,
+            initial_backoff,
+            max_backoff,
+        };
         self
     }
 
     #[must_use]
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
-        self.session_tracer = Some(session_tracer);
+        self.http.set_session_tracer(session_tracer);
         self
     }
 
@@ -282,7 +269,7 @@ impl AnthropicClient {
 
     #[must_use]
     pub fn session_tracer(&self) -> Option<&SessionTracer> {
-        self.session_tracer.as_ref()
+        self.http.session_tracer()
     }
 
     #[must_use]
@@ -326,7 +313,7 @@ impl AnthropicClient {
 
         self.preflight_message_request(&request).await?;
 
-        let http_response = self.send_with_retry(&request).await?;
+        let http_response = self.send_request(&request).await?;
         let request_id = request_id_from_headers(http_response.headers());
         let body = http_response.text().await.map_err(ApiError::from)?;
         let mut response = serde_json::from_str::<MessageResponse>(&body).map_err(|error| {
@@ -340,28 +327,26 @@ impl AnthropicClient {
             let record = prompt_cache.record_response(&request, &response);
             self.store_last_prompt_cache_record(record);
         }
-        if let Some(session_tracer) = &self.session_tracer {
-            session_tracer.record_analytics(
-                AnalyticsEvent::new("api", "message_usage")
-                    .with_property(
-                        "request_id",
+        self.http.record_analytics(
+            AnalyticsEvent::new("api", "message_usage")
+                .with_property(
+                    "request_id",
+                    response
+                        .request_id
+                        .clone()
+                        .map_or(Value::Null, Value::String),
+                )
+                .with_property("total_tokens", Value::from(response.total_tokens()))
+                .with_property(
+                    "estimated_cost_usd",
+                    Value::String(format_usd(
                         response
-                            .request_id
-                            .clone()
-                            .map_or(Value::Null, Value::String),
-                    )
-                    .with_property("total_tokens", Value::from(response.total_tokens()))
-                    .with_property(
-                        "estimated_cost_usd",
-                        Value::String(format_usd(
-                            response
-                                .usage
-                                .estimated_cost_usd(&response.model)
-                                .total_cost_usd(),
-                        )),
-                    ),
-            );
-        }
+                            .usage
+                            .estimated_cost_usd(&response.model)
+                            .total_cost_usd(),
+                    )),
+                ),
+        );
         Ok(response)
     }
 
@@ -370,9 +355,7 @@ impl AnthropicClient {
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
         self.preflight_message_request(request).await?;
-        let response = self
-            .send_with_retry(&request.clone().with_streaming())
-            .await?;
+        let response = self.send_request(&request.clone().with_streaming()).await?;
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
@@ -384,6 +367,7 @@ impl AnthropicClient {
             latest_usage: None,
             usage_recorded: false,
             last_prompt_cache_record: Arc::clone(&self.last_prompt_cache_record),
+            session_tracer: self.session_tracer().cloned(),
         })
     }
 
@@ -394,6 +378,7 @@ impl AnthropicClient {
     ) -> Result<OAuthTokenSet, ApiError> {
         let response = self
             .http
+            .raw()
             .post(&config.token_url)
             .header("content-type", "application/x-www-form-urlencoded")
             .form(&request.form_params())
@@ -414,6 +399,7 @@ impl AnthropicClient {
     ) -> Result<OAuthTokenSet, ApiError> {
         let response = self
             .http
+            .raw()
             .post(&config.token_url)
             .header("content-type", "application/x-www-form-urlencoded")
             .form(&request.form_params())
@@ -427,93 +413,28 @@ impl AnthropicClient {
         })
     }
 
-    async fn send_with_retry(
-        &self,
-        request: &MessageRequest,
-    ) -> Result<reqwest::Response, ApiError> {
-        let mut attempts = 0;
-        let mut last_error: Option<ApiError>;
+    /// Build URL, headers, body and send through `HttpTransport` with retries.
+    async fn send_request(&self, request: &MessageRequest) -> Result<reqwest::Response, ApiError> {
+        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let mut body = self.request_profile.render_json_body(request)?;
+        strip_unsupported_beta_body_fields(&mut body);
+        apply_cache_hints(&mut body, request);
+        self.prepend_oauth_system_prefix(&mut body);
 
-        loop {
-            attempts += 1;
-            if let Some(session_tracer) = &self.session_tracer {
-                session_tracer.record_http_request_started(
-                    attempts,
-                    "POST",
-                    "/v1/messages",
-                    Map::new(),
-                );
-            }
-            match self.send_raw_request(request).await {
-                Ok(response) => match expect_success(response).await {
-                    Ok(response) => {
-                        if let Some(session_tracer) = &self.session_tracer {
-                            session_tracer.record_http_request_succeeded(
-                                attempts,
-                                "POST",
-                                "/v1/messages",
-                                response.status().as_u16(),
-                                request_id_from_headers(response.headers()),
-                                Map::new(),
-                            );
-                        }
-                        return Ok(response);
-                    }
-                    Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
-                        self.record_request_failure(attempts, &error);
-                        last_error = Some(error);
-                    }
-                    Err(error) => {
-                        let error = enrich_bearer_auth_error(error, &self.auth);
-                        self.record_request_failure(attempts, &error);
-                        return Err(error);
-                    }
-                },
-                Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
-                    self.record_request_failure(attempts, &error);
-                    last_error = Some(error);
-                }
-                Err(error) => {
-                    self.record_request_failure(attempts, &error);
-                    return Err(error);
-                }
-            }
-
-            if attempts > self.max_retries {
-                break;
-            }
-
-            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
+        let mut headers: Vec<(String, String)> =
+            vec![("content-type".to_string(), "application/json".to_string())];
+        if let Some(api_key) = self.auth.api_key() {
+            headers.push(("x-api-key".to_string(), api_key.to_string()));
         }
-
-        Err(ApiError::RetriesExhausted {
-            attempts,
-            last_error: Box::new(last_error.expect("retry loop must capture an error")),
-        })
-    }
-
-    async fn send_raw_request(
-        &self,
-        request: &MessageRequest,
-    ) -> Result<reqwest::Response, ApiError> {
-        let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let mut request_body = self.request_profile.render_json_body(request)?;
-        strip_unsupported_beta_body_fields(&mut request_body);
-        self.prepend_oauth_system_prefix(&mut request_body);
-        let request_builder = self.build_request(&request_url).json(&request_body);
-        request_builder.send().await.map_err(ApiError::from)
-    }
-
-    fn build_request(&self, request_url: &str) -> reqwest::RequestBuilder {
-        let request_builder = self
-            .http
-            .post(request_url)
-            .header("content-type", "application/json");
-        let mut request_builder = self.auth.apply(request_builder);
-        for (header_name, header_value) in self.request_profile.header_pairs() {
-            request_builder = request_builder.header(header_name, header_value);
+        if let Some(token) = self.auth.bearer_token() {
+            headers.push(("authorization".to_string(), format!("Bearer {token}")));
         }
-        request_builder
+        headers.extend(self.request_profile.header_pairs());
+
+        self.http
+            .send_json(&url, &headers, &body, &self.retry_policy, expect_success)
+            .await
+            .map_err(|e| enrich_bearer_auth_error(e, &self.auth))
     }
 
     /// When `oauth_system_prefix` is set, transform the `system` field into
@@ -528,19 +449,29 @@ impl AnthropicClient {
         let Some(obj) = body.as_object_mut() else {
             return;
         };
-        let mut blocks = vec![serde_json::json!({"type": "text", "text": prefix})];
+        let prefix_block = serde_json::json!({"type": "text", "text": prefix});
         if let Some(system_val) = obj.remove("system") {
-            if let Some(s) = system_val.as_str() {
-                if !s.is_empty() {
-                    blocks.push(serde_json::json!({"type": "text", "text": s}));
+            match system_val {
+                Value::String(s) => {
+                    let mut blocks = vec![prefix_block];
+                    if !s.is_empty() {
+                        blocks.push(serde_json::json!({"type": "text", "text": s}));
+                    }
+                    obj.insert("system".to_string(), Value::Array(blocks));
                 }
-            } else {
-                // Already an array or non-string — put it back as-is.
-                obj.insert("system".to_string(), system_val);
-                return;
+                Value::Array(mut arr) => {
+                    // Already an array (e.g. from cache blocks) — prepend the prefix.
+                    arr.insert(0, prefix_block);
+                    obj.insert("system".to_string(), Value::Array(arr));
+                }
+                other => {
+                    // Unknown format — put it back unchanged.
+                    obj.insert("system".to_string(), other);
+                }
             }
+        } else {
+            obj.insert("system".to_string(), Value::Array(vec![prefix_block]));
         }
-        obj.insert("system".to_string(), Value::Array(blocks));
     }
 
     async fn preflight_message_request(&self, request: &MessageRequest) -> Result<(), ApiError> {
@@ -588,9 +519,23 @@ impl AnthropicClient {
         );
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
+        apply_cache_hints(&mut request_body, request);
         self.prepend_oauth_system_prefix(&mut request_body);
-        let response = self
-            .build_request(&request_url)
+        let mut builder = self
+            .http
+            .raw()
+            .post(&request_url)
+            .header("content-type", "application/json");
+        if let Some(api_key) = self.auth.api_key() {
+            builder = builder.header("x-api-key", api_key);
+        }
+        if let Some(token) = self.auth.bearer_token() {
+            builder = builder.bearer_auth(token);
+        }
+        for (header_name, header_value) in self.request_profile.header_pairs() {
+            builder = builder.header(header_name, header_value);
+        }
+        let response = builder
             .json(&request_body)
             .send()
             .await
@@ -604,74 +549,12 @@ impl AnthropicClient {
         Ok(parsed.input_tokens)
     }
 
-    fn record_request_failure(&self, attempt: u32, error: &ApiError) {
-        if let Some(session_tracer) = &self.session_tracer {
-            session_tracer.record_http_request_failed(
-                attempt,
-                "POST",
-                "/v1/messages",
-                error.to_string(),
-                error.is_retryable(),
-                Map::new(),
-            );
-        }
-    }
-
     fn store_last_prompt_cache_record(&self, record: PromptCacheRecord) {
         *self
             .last_prompt_cache_record
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
     }
-
-    fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
-        let Some(multiplier) = 1_u32.checked_shl(attempt.saturating_sub(1)) else {
-            return Err(ApiError::BackoffOverflow {
-                attempt,
-                base_delay: self.initial_backoff,
-            });
-        };
-        Ok(self
-            .initial_backoff
-            .checked_mul(multiplier)
-            .map_or(self.max_backoff, |delay| delay.min(self.max_backoff)))
-    }
-
-    fn jittered_backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
-        let base = self.backoff_for_attempt(attempt)?;
-        Ok(base + jitter_for_base(base))
-    }
-}
-
-/// Process-wide counter that guarantees distinct jitter samples even when
-/// the system clock resolution is coarser than consecutive retry sleeps.
-static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Returns a random additive jitter in `[0, base]` to decorrelate retries
-/// from multiple concurrent clients. Entropy is drawn from the nanosecond
-/// wall clock mixed with a monotonic counter and run through a splitmix64
-/// finalizer; adequate for retry jitter (no cryptographic requirement).
-fn jitter_for_base(base: Duration) -> Duration {
-    let base_nanos = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
-    if base_nanos == 0 {
-        return Duration::ZERO;
-    }
-    let raw_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    let tick = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
-    // splitmix64 finalizer — mixes the low bits so large bases still see
-    // jitter across their full range instead of being clamped to subsec nanos.
-    let mut mixed = raw_nanos
-        .wrapping_add(tick)
-        .wrapping_add(0x9E37_79B9_7F4A_7C15);
-    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    mixed ^= mixed >> 31;
-    // Inclusive upper bound: jitter may equal `base`, matching "up to base".
-    let jitter_nanos = mixed % base_nanos.saturating_add(1);
-    Duration::from_nanos(jitter_nanos)
 }
 
 impl AuthSource {
@@ -862,9 +745,9 @@ fn load_saved_oauth_token() -> Result<Option<OAuthTokenSet>, ApiError> {
 }
 
 fn now_unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
@@ -911,14 +794,6 @@ pub fn base_url_for_mode(mode: super::AuthMode) -> String {
     }
 }
 
-fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    headers
-        .get(REQUEST_ID_HEADER)
-        .or_else(|| headers.get(ALT_REQUEST_ID_HEADER))
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned)
-}
-
 impl Provider for AnthropicClient {
     type Stream = MessageStream;
 
@@ -949,6 +824,7 @@ pub struct MessageStream {
     latest_usage: Option<Usage>,
     usage_recorded: bool,
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
+    session_tracer: Option<SessionTracer>,
 }
 
 impl MessageStream {
@@ -991,14 +867,22 @@ impl MessageStream {
             }
             StreamEvent::MessageStop(_) => {
                 if !self.usage_recorded {
-                    if let (Some(prompt_cache), Some(usage)) =
-                        (&self.prompt_cache, self.latest_usage.as_ref())
-                    {
-                        let record = prompt_cache.record_usage(&self.request, usage);
-                        *self
-                            .last_prompt_cache_record
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+                    if let Some(usage) = self.latest_usage.as_ref() {
+                        if let Some(prompt_cache) = &self.prompt_cache {
+                            let record = prompt_cache.record_usage(&self.request, usage);
+                            *self
+                                .last_prompt_cache_record
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+                        }
+                        if let Some(tracer) = &self.session_tracer {
+                            tracer.record_usage(
+                                usage.input_tokens,
+                                usage.output_tokens,
+                                usage.cache_creation_input_tokens,
+                                usage.cache_read_input_tokens,
+                            );
+                        }
                     }
                     self.usage_recorded = true;
                 }
@@ -1136,6 +1020,86 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
                 object.insert("stop_sequences".to_string(), stop_val);
             }
         }
+        // Strip thought_signature from tool_use content blocks. The API
+        // rejects this field when extended thinking is not enabled.
+        strip_thought_signatures(object);
+    }
+}
+
+/// Translate provider-agnostic [`CacheHints`] into Anthropic-specific
+/// `cache_control` markers on the JSON body.
+///
+/// - `system_static` → system block with `cache_control: {type: "ephemeral", scope: "global"}`
+/// - `system_dynamic` → system block with `cache_control: {type: "ephemeral"}`
+/// - `breakpoint_last_message` → `cache_control: {type: "ephemeral"}` on the last
+///   content block of the last message
+fn apply_cache_hints(body: &mut Value, request: &MessageRequest) {
+    let Some(hints) = &request.cache_hints else {
+        return;
+    };
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+
+    // --- System blocks ---
+    let mut system_blocks: Vec<Value> = Vec::new();
+    if let Some(text) = &hints.system_static {
+        if !text.is_empty() {
+            system_blocks.push(serde_json::json!({
+                "type": "text",
+                "text": text,
+                "cache_control": { "type": "ephemeral", "scope": "global" },
+            }));
+        }
+    }
+    if let Some(text) = &hints.system_dynamic {
+        if !text.is_empty() {
+            system_blocks.push(serde_json::json!({
+                "type": "text",
+                "text": text,
+                "cache_control": { "type": "ephemeral" },
+            }));
+        }
+    }
+    if !system_blocks.is_empty() {
+        obj.insert("system".to_string(), Value::Array(system_blocks));
+    }
+
+    // --- Message breakpoint ---
+    if hints.breakpoint_last_message {
+        if let Some(Value::Array(messages)) = obj.get_mut("messages") {
+            if let Some(last_msg) = messages.last_mut() {
+                if let Some(Value::Array(content)) = last_msg.get_mut("content") {
+                    if let Some(last_block) = content.last_mut() {
+                        if let Some(block_obj) = last_block.as_object_mut() {
+                            block_obj.insert(
+                                "cache_control".to_string(),
+                                serde_json::json!({ "type": "ephemeral" }),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Walk `messages[].content[]` and remove `thought_signature` from any
+/// `tool_use` content blocks. Without an explicit `thinking` configuration
+/// in the request the Anthropic API treats the field as an extra input.
+fn strip_thought_signatures(body: &mut Map<String, Value>) {
+    if let Some(Value::Array(messages)) = body.get_mut("messages") {
+        for msg in messages.iter_mut() {
+            if let Some(Value::Array(content)) = msg.get_mut("content") {
+                for block in content.iter_mut() {
+                    if let Some(obj) = block.as_object_mut() {
+                        if obj.get("type").and_then(Value::as_str) == Some("tool_use") {
+                            obj.remove("thought_signature");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1153,7 +1117,7 @@ struct AnthropicErrorBody {
 
 #[cfg(test)]
 mod tests {
-    use super::{ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER};
+    use crate::http_transport::{request_id_from_headers, RetryPolicy};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Mutex, OnceLock};
@@ -1442,75 +1406,23 @@ mod tests {
 
     #[test]
     fn backoff_doubles_until_maximum() {
+        let policy = RetryPolicy {
+            max_retries: 3,
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(25),
+        };
+        // Verify with_retry_policy wires through correctly.
         let client = AnthropicClient::new("test-key").with_retry_policy(
-            3,
-            Duration::from_millis(10),
-            Duration::from_millis(25),
+            policy.max_retries,
+            policy.initial_backoff,
+            policy.max_backoff,
         );
+        assert_eq!(client.retry_policy.max_retries, 3);
         assert_eq!(
-            client.backoff_for_attempt(1).expect("attempt 1"),
+            client.retry_policy.initial_backoff,
             Duration::from_millis(10)
         );
-        assert_eq!(
-            client.backoff_for_attempt(2).expect("attempt 2"),
-            Duration::from_millis(20)
-        );
-        assert_eq!(
-            client.backoff_for_attempt(3).expect("attempt 3"),
-            Duration::from_millis(25)
-        );
-    }
-
-    #[test]
-    fn jittered_backoff_stays_within_additive_bounds_and_varies() {
-        let client = AnthropicClient::new("test-key").with_retry_policy(
-            8,
-            Duration::from_secs(1),
-            Duration::from_secs(128),
-        );
-        let mut samples = Vec::with_capacity(64);
-        for _ in 0..64 {
-            let base = client.backoff_for_attempt(3).expect("base attempt 3");
-            let jittered = client
-                .jittered_backoff_for_attempt(3)
-                .expect("jittered attempt 3");
-            assert!(
-                jittered >= base,
-                "jittered delay {jittered:?} must be at least the base {base:?}"
-            );
-            assert!(
-                jittered <= base * 2,
-                "jittered delay {jittered:?} must not exceed base*2 {:?}",
-                base * 2
-            );
-            samples.push(jittered);
-        }
-        let distinct: std::collections::HashSet<_> = samples.iter().collect();
-        assert!(
-            distinct.len() > 1,
-            "jitter should produce varied delays across samples, got {samples:?}"
-        );
-    }
-
-    #[test]
-    fn default_retry_policy_matches_exponential_schedule() {
-        let client = AnthropicClient::new("test-key");
-        assert_eq!(
-            client.backoff_for_attempt(1).expect("attempt 1"),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            client.backoff_for_attempt(2).expect("attempt 2"),
-            Duration::from_secs(2)
-        );
-        assert_eq!(
-            client.backoff_for_attempt(3).expect("attempt 3"),
-            Duration::from_secs(4)
-        );
-        assert_eq!(
-            client.backoff_for_attempt(8).expect("attempt 8"),
-            Duration::from_secs(128)
-        );
+        assert_eq!(client.retry_policy.max_backoff, Duration::from_millis(25));
     }
 
     #[test]
@@ -1540,19 +1452,16 @@ mod tests {
     #[test]
     fn request_id_uses_primary_or_fallback_header() {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(REQUEST_ID_HEADER, "req_primary".parse().expect("header"));
+        headers.insert("request-id", "req_primary".parse().expect("header"));
         assert_eq!(
-            super::request_id_from_headers(&headers).as_deref(),
+            request_id_from_headers(&headers).as_deref(),
             Some("req_primary")
         );
 
         headers.clear();
-        headers.insert(
-            ALT_REQUEST_ID_HEADER,
-            "req_fallback".parse().expect("header"),
-        );
+        headers.insert("x-request-id", "req_fallback".parse().expect("header"));
         assert_eq!(
-            super::request_id_from_headers(&headers).as_deref(),
+            request_id_from_headers(&headers).as_deref(),
             Some("req_fallback")
         );
     }
@@ -1856,5 +1765,55 @@ mod tests {
             enriched,
             crate::error::ApiError::InvalidSseFrame(_)
         ));
+    }
+
+    #[test]
+    fn apply_cache_hints_produces_system_blocks_and_message_breakpoint() {
+        use crate::types::{CacheHints, InputMessage};
+        use telemetry::AnthropicRequestProfile;
+
+        let request = MessageRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                InputMessage::user_text("first question"),
+                InputMessage::user_text("second question"),
+            ],
+            system: Some("flat fallback".to_string()),
+            stream: true,
+            cache_hints: Some(CacheHints {
+                system_static: Some("static core instructions".to_string()),
+                system_dynamic: Some("dynamic session context".to_string()),
+                breakpoint_last_message: true,
+            }),
+            ..Default::default()
+        };
+
+        let mut body = AnthropicRequestProfile::default()
+            .render_json_body(&request)
+            .expect("render body");
+        super::apply_cache_hints(&mut body, &request);
+
+        // --- System blocks ---
+        let system = body.get("system").expect("system field should exist");
+        let sys_blocks = system.as_array().expect("system should be an array");
+        assert_eq!(sys_blocks.len(), 2);
+
+        assert_eq!(sys_blocks[0]["text"], "static core instructions");
+        assert_eq!(sys_blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(sys_blocks[0]["cache_control"]["scope"], "global");
+
+        assert_eq!(sys_blocks[1]["text"], "dynamic session context");
+        assert_eq!(sys_blocks[1]["cache_control"]["type"], "ephemeral");
+        assert!(sys_blocks[1]["cache_control"].get("scope").is_none());
+
+        // --- Message breakpoint on last message ---
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+        // First message: no cache_control.
+        assert!(messages[0]["content"][0].get("cache_control").is_none());
+        // Last message's last content block: has cache_control.
+        let last_block = &messages[1]["content"][0];
+        assert_eq!(last_block["cache_control"]["type"], "ephemeral");
     }
 }

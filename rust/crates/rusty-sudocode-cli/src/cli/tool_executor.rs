@@ -1,4 +1,5 @@
-use std::io;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use runtime::{PermissionMode, PermissionPolicy, ToolError, ToolExecutor};
@@ -40,6 +41,7 @@ pub(crate) struct CliToolExecutor {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    spinner_pause: Option<Arc<AtomicBool>>,
 }
 
 impl CliToolExecutor {
@@ -55,6 +57,28 @@ impl CliToolExecutor {
             allowed_tools,
             tool_registry,
             mcp_state,
+            spinner_pause: None,
+        }
+    }
+
+    pub(crate) fn set_spinner_pause(&mut self, flag: Arc<AtomicBool>) {
+        self.spinner_pause = Some(flag);
+    }
+
+    /// Pause the spinner and clear its line before writing content.
+    fn pause_spinner(&self) {
+        if let Some(flag) = &self.spinner_pause {
+            flag.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let _ = write!(io::stdout(), "\r\x1b[2K");
+            let _ = io::stdout().flush();
+        }
+    }
+
+    /// Resume the spinner after content has been written.
+    fn resume_spinner(&self) {
+        if let Some(flag) = &self.spinner_pause {
+            flag.store(false, Ordering::SeqCst);
         }
     }
 
@@ -144,19 +168,23 @@ impl ToolExecutor for CliToolExecutor {
         match result {
             Ok(output) => {
                 if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &output, false);
-                    self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
+                    self.pause_spinner();
+                    let formatted = format_tool_result(tool_name, &output, false);
+                    writeln!(io::stdout(), "{formatted}")
+                        .and_then(|()| io::stdout().flush())
                         .map_err(|error| ToolError::new(error.to_string()))?;
+                    self.resume_spinner();
                 }
                 Ok(output)
             }
             Err(error) => {
                 if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &error.to_string(), true);
-                    self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
-                        .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
+                    self.pause_spinner();
+                    let formatted = format_tool_result(tool_name, &error.to_string(), true);
+                    writeln!(io::stdout(), "{formatted}")
+                        .and_then(|()| io::stdout().flush())
+                        .map_err(|error| ToolError::new(error.to_string()))?;
+                    self.resume_spinner();
                 }
                 Err(error)
             }

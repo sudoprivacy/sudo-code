@@ -55,13 +55,23 @@ pub enum HookProgressEvent {
     },
 }
 
-pub trait HookProgressReporter {
+pub trait HookProgressReporter: Send {
     fn on_event(&mut self, event: &HookProgressEvent);
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HookAbortSignal {
     aborted: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Default for HookAbortSignal {
+    fn default() -> Self {
+        Self {
+            aborted: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
 }
 
 impl HookAbortSignal {
@@ -72,11 +82,26 @@ impl HookAbortSignal {
 
     pub fn abort(&self) {
         self.aborted.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    /// Clear the abort flag so a new turn can run.
+    pub fn reset(&self) {
+        self.aborted.store(false, Ordering::SeqCst);
     }
 
     #[must_use]
     pub fn is_aborted(&self) -> bool {
         self.aborted.load(Ordering::SeqCst)
+    }
+
+    /// Returns a future that resolves when the abort signal is triggered.
+    /// If already aborted, resolves immediately.
+    pub async fn cancelled(&self) {
+        if self.is_aborted() {
+            return;
+        }
+        self.notify.notified().await;
     }
 }
 

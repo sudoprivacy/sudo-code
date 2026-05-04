@@ -51,7 +51,25 @@ fn main() {
         });
     println!("cargo:rustc-env=BUILD_DATE={build_date}");
 
-    // Rerun if git state changes
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs");
+    // Resolve the real git directory, handling worktrees where .git is a file
+    // pointing to the main repo (e.g. "gitdir: /repo/.git/worktrees/my-wt").
+    let git_dir = {
+        let dot_git = std::path::Path::new(".git");
+        if dot_git.is_file() {
+            std::fs::read_to_string(dot_git)
+                .ok()
+                .and_then(|content| {
+                    content
+                        .strip_prefix("gitdir: ")
+                        .map(|s| s.trim().to_string())
+                })
+                .unwrap_or_else(|| ".git".to_string())
+        } else {
+            ".git".to_string()
+        }
+    };
+
+    // Rerun if git state changes (works for both normal repos and worktrees)
+    println!("cargo:rerun-if-changed={git_dir}/HEAD");
+    println!("cargo:rerun-if-changed={git_dir}/refs");
 }

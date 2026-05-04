@@ -31,6 +31,8 @@ pub enum ApiFormat {
     OpenAiCompletions,
     /// `OpenAI` Responses API (`/v1/responses`).
     OpenAiResponses,
+    /// Google Gemini `GenerateContent` API.
+    GeminiGenerateContent,
 }
 
 /// Resolved credential for authenticating with a provider.
@@ -167,6 +169,21 @@ const MODEL_SPECS: &[(&str, ModelTokenLimit)] = &[
         ModelTokenLimit {
             max_output_tokens: 64_000,
             context_window_tokens: 200_000,
+        },
+    ),
+    // Gemini
+    (
+        "gemini-3.1-pro-preview",
+        ModelTokenLimit {
+            max_output_tokens: 65_536,
+            context_window_tokens: 1_048_576,
+        },
+    ),
+    (
+        "gemini-3-flash-preview",
+        ModelTokenLimit {
+            max_output_tokens: 65_536,
+            context_window_tokens: 1_048_576,
         },
     ),
 ];
@@ -403,7 +420,7 @@ pub fn resolve_provider_from_config(
     let api_format = resolve_api_format(&auth_mode_str, &mapping.provider, mapping.api.as_deref())?;
 
     // 6. Resolve credential.
-    let credential = resolve_credential(&auth_mode_str, connection)?;
+    let credential = resolve_credential(&auth_mode_str, &mapping.provider, connection)?;
 
     // 7. Determine provider kind from the provider name / api format.
     let kind = infer_provider_kind(&mapping.provider, api_format);
@@ -446,6 +463,7 @@ fn resolve_api_format(
     match provider_name {
         "anthropic" | "claude" => Ok(ApiFormat::AnthropicMessages),
         "codex" => Ok(ApiFormat::OpenAiResponses),
+        "gemini" => Ok(ApiFormat::GeminiGenerateContent),
         // Known and unknown providers default to OpenAI-compatible.
         _ => Ok(ApiFormat::OpenAiCompletions),
     }
@@ -458,6 +476,7 @@ fn resolve_api_format(
 /// - `proxy` mode: inline `apiKey` → `apiKeyEnv` from env
 fn resolve_credential(
     auth_mode: &str,
+    provider_name: &str,
     connection: &ProviderConnectionConfig,
 ) -> Result<Credential, ApiError> {
     match auth_mode {
@@ -486,21 +505,22 @@ fn resolve_credential(
             )))
         }
         "subscription" => {
-            // 1. Inline token.
-            if let Some(token) = &connection.token {
-                if !token.is_empty() {
-                    return Ok(Credential::Token(token.clone()));
-                }
-            }
-            // 2. Token env var.
-            if let Some(env_name) = &connection.token_env {
-                if let Ok(val) = std::env::var(env_name) {
+            // 1. For claude/anthropic providers, CLAUDE_CODE_OAUTH_TOKEN env
+            //    var has highest priority.
+            if matches!(provider_name, "claude" | "anthropic") {
+                if let Ok(val) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
                     if !val.trim().is_empty() {
                         return Ok(Credential::Token(val));
                     }
                 }
             }
-            // 3. Auth file.
+            // 2. Inline token (skip obvious placeholders like `<YOUR_...>`).
+            if let Some(token) = &connection.token {
+                if !token.is_empty() && !token.starts_with('<') {
+                    return Ok(Credential::Token(token.clone()));
+                }
+            }
+            // 4. Auth file.
             if let Some(path) = &connection.auth_file {
                 let expanded = expand_tilde(path);
                 if expanded.exists() {
@@ -534,6 +554,7 @@ fn resolve_credential(
 fn infer_provider_kind(provider_name: &str, api_format: ApiFormat) -> ProviderKind {
     match api_format {
         ApiFormat::AnthropicMessages => ProviderKind::Anthropic,
+        ApiFormat::GeminiGenerateContent => ProviderKind::Gemini,
         ApiFormat::OpenAiCompletions | ApiFormat::OpenAiResponses => match provider_name {
             "xai" => ProviderKind::Xai,
             "codex" => ProviderKind::Codex,

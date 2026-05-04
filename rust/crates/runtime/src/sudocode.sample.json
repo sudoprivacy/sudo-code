@@ -3,12 +3,15 @@
     "subscription": {
       "claude": {
         "baseUrl": "https://api.anthropic.com",
-        "token": null,
-        "tokenEnv": "CLAUDE_CODE_OAUTH_TOKEN"
+        "token": "<YOUR_CLAUDE_TOKEN>"
       },
       "codex": {
         "baseUrl": "https://chatgpt.com/backend-api/codex",
         "authFile": "~/.codex/auth.json"
+      },
+      "gemini": {
+        "baseUrl": "https://cloudcode-pa.googleapis.com",
+        "authFile": "~/.gemini/oauth_creds.json"
       }
     },
     "proxy": {
@@ -37,8 +40,8 @@
     }
   },
   "models": {
-    "opus": {
-      "alias": "opus",
+    "claude-opus": {
+      "alias": "claude-opus",
       "name": "Claude Opus 4.6",
       "input": ["text"],
       "providers": {
@@ -47,8 +50,8 @@
         "api-key":      { "provider": "anthropic", "model": "claude-opus-4-6" }
       }
     },
-    "sonnet": {
-      "alias": "sonnet",
+    "claude-sonnet": {
+      "alias": "claude-sonnet",
       "name": "Claude Sonnet 4.6",
       "input": ["text"],
       "providers": {
@@ -57,8 +60,8 @@
         "api-key":      { "provider": "anthropic", "model": "claude-sonnet-4-6" }
       }
     },
-    "haiku": {
-      "alias": "haiku",
+    "claude-haiku": {
+      "alias": "claude-haiku",
       "name": "Claude Haiku 4.5",
       "input": ["text"],
       "providers": {
@@ -114,6 +117,7 @@
       "name": "Gemini 3.1 Pro",
       "input": ["text"],
       "providers": {
+        "subscription": { "provider": "gemini", "model": "gemini-3.1-pro-preview" },
         "proxy": { "provider": "sudorouter", "model": "gemini-3.1-pro-preview", "api": "openai-completions" }
       }
     },
@@ -122,6 +126,7 @@
       "name": "Gemini 3 Flash",
       "input": ["text"],
       "providers": {
+        "subscription": { "provider": "gemini", "model": "gemini-3-flash-preview" },
         "proxy": { "provider": "sudorouter", "model": "gemini-3-flash-preview", "api": "openai-completions" }
       }
     },

@@ -4,7 +4,9 @@
 //! MCP plumbing, tool-facing file operations, and the core conversation loop
 //! that drives interactive and one-shot turns.
 
-pub mod acp_server;
+pub mod acp_sdk_server;
+pub mod acp_stdio_server;
+pub mod acp_ws_server;
 mod bash;
 pub mod bash_validation;
 mod bootstrap;
@@ -17,6 +19,7 @@ mod file_ops;
 mod git_context;
 pub mod green_contract;
 mod hooks;
+pub mod image_registry;
 mod json;
 pub mod jsonrpc_transport;
 mod lane_events;
@@ -51,10 +54,7 @@ mod trust_resolver;
 mod usage;
 pub mod worker_boot;
 
-pub use acp_server::{
-    run_acp_server_with_io, run_acp_stdio_server, AcpAgent, AcpError, AcpServerError,
-    AcpServerOptions, AcpSessionUpdateObserver,
-};
+pub use acp_sdk_server::AcpError;
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
@@ -63,7 +63,7 @@ pub use compact::{
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,
+    default_config_home, ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig,
     ModelConfigEntry, ModelProviderMapping, OAuthConfig, ProviderConnectionConfig,
@@ -76,9 +76,9 @@ pub use config_validate::{
     DiagnosticKind, ValidationResult,
 };
 pub use conversation::{
-    auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
-    ConversationRuntime, PromptCacheEvent, RuntimeError, RuntimeObserver, StaticToolExecutor,
-    ToolError, ToolExecutor, TurnSummary,
+    auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent,
+    AssistantEventStream, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+    RuntimeObserver, StaticToolExecutor, ToolError, ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
@@ -89,6 +89,7 @@ pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
     HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
 };
+pub use image_registry::{ImageRegistry, RegisteredImage};
 pub use lane_events::{
     compute_event_fingerprint, dedupe_superseded_commit_events, dedupe_terminal_events,
     is_terminal_event, BlockedSubphase, EventProvenance, LaneCommitProvenance, LaneEvent,
@@ -140,7 +141,7 @@ pub use policy_engine::{
 };
 pub use prompt::{
     load_system_prompt, prepend_bullets, ContextFile, ProjectContext, PromptBuildError,
-    SystemPromptBuilder, FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    SystemPrompt, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use recovery_recipes::{
     attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryContext,

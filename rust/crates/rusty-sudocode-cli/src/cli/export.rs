@@ -70,7 +70,9 @@ pub(crate) fn render_session_markdown(
                         lines.push(String::new());
                     }
                 }
-                ContentBlock::ToolUse { id, name, input } => {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
                     lines.push(format!(
                         "**Tool call** `{name}` _(id `{}`)_",
                         short_tool_id(id)
@@ -96,6 +98,10 @@ pub(crate) fn render_session_markdown(
                     if !summary.is_empty() {
                         lines.push(format!("> {summary}"));
                     }
+                    lines.push(String::new());
+                }
+                ContentBlock::Image { mime_type, .. } => {
+                    lines.push(format!("_[image: {mime_type}]_"));
                     lines.push(String::new());
                 }
             }
@@ -254,7 +260,9 @@ pub(crate) fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
-                ContentBlock::ToolUse { id, name, input } => {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
                 ContentBlock::ToolResult {
@@ -266,6 +274,9 @@ pub(crate) fn render_export_text(session: &Session) -> String {
                     lines.push(format!(
                         "[tool_result id={tool_use_id} name={tool_name} error={is_error}] {output}"
                     ));
+                }
+                ContentBlock::Image { mime_type, .. } => {
+                    lines.push(format!("[image: {mime_type}]"));
                 }
             }
         }

@@ -399,18 +399,25 @@ impl ConfigLoader {
         })
     }
 
-    /// Load `sudocode.json` from the config home directory, merged on top of
-    /// the built-in config so that standard aliases always resolve.
+    /// Load `sudocode.json` from the config home directory.
+    ///
+    /// Returns an error if the file does not exist. Built-in defaults from
+    /// `SudoCodeConfig::builtin()` are intentionally **not** merged here so
+    /// that the on-disk file is the single source of truth. Callers that
+    /// can tolerate a missing file (display helpers, alias resolution) are
+    /// responsible for their own fallback.
     pub fn load_sudocode_config(&self) -> Result<SudoCodeConfig, ConfigError> {
-        let mut config = SudoCodeConfig::builtin();
         let path = self.config_home.join("sudocode.json");
-        if path.exists() {
-            let user = parse_sudocode_json(&path)?;
-            // User entries override builtins.
-            config.auth_modes.extend(user.auth_modes);
-            config.models.extend(user.models);
+        if !path.exists() {
+            return Err(ConfigError::Parse(format!(
+                "missing sudocode.json: expected at {path}\n\
+                 Create this file to configure models and providers.\n\n\
+                 To get started, copy the sample config:\n  \
+                 cp crates/runtime/src/sudocode.sample.json {path}",
+                path = path.display()
+            )));
         }
-        Ok(config)
+        parse_sudocode_json(&path)
     }
 }
 
@@ -2421,8 +2428,8 @@ mod tests {
         assert_eq!(apikey.base_url, "https://api.anthropic.com");
         assert_eq!(apikey.api_key.as_deref(), Some("sk-test-anthropic-key"));
 
-        // models — user-defined entries are merged on top of builtins.
-        assert!(config.models.len() >= 2);
+        // models — only entries from the file, no built-in merging.
+        assert_eq!(config.models.len(), 2);
         let opus = &config.models["opus"];
         assert_eq!(opus.name, "Claude Opus 4.6");
         assert_eq!(opus.providers.len(), 3);
@@ -2439,6 +2446,26 @@ mod tests {
         let deepseek = &config.models["deepseek"];
         assert_eq!(deepseek.providers.len(), 1);
         assert_eq!(deepseek.providers["proxy"].model, "deepseek-chat");
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn load_sudocode_config_errors_when_file_is_missing() {
+        let root = temp_dir();
+        let home = root.join("empty-home");
+        fs::create_dir_all(&home).expect("config dir");
+        let cwd = root.join("project");
+        fs::create_dir_all(&cwd).expect("project dir");
+
+        let loader = ConfigLoader::new(&cwd, &home);
+        let result = loader.load_sudocode_config();
+        assert!(result.is_err(), "should fail when sudocode.json is missing");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("missing sudocode.json"),
+            "error should mention missing file: {err_msg}"
+        );
 
         fs::remove_dir_all(root).expect("cleanup");
     }

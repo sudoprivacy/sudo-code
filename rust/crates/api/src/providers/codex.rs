@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
-use crate::http_client::build_http_client_or_default;
+use crate::http_transport::{HttpTransport, RetryPolicy};
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
@@ -85,10 +85,11 @@ fn read_auth_file() -> Result<(String, String), ApiError> {
 
 #[derive(Debug, Clone)]
 pub struct CodexClient {
-    http: reqwest::Client,
+    http: HttpTransport,
     base_url: String,
     access_token: String,
     account_id: String,
+    retry_policy: RetryPolicy,
 }
 
 impl CodexClient {
@@ -96,24 +97,31 @@ impl CodexClient {
     #[must_use]
     pub fn new(base_url: String, access_token: String, account_id: String) -> Self {
         Self {
-            http: build_http_client_or_default(),
+            http: HttpTransport::new(),
             base_url,
             access_token,
             account_id,
+            retry_policy: RetryPolicy::DEFAULT,
         }
+    }
+
+    #[must_use]
+    pub fn with_session_tracer(mut self, session_tracer: telemetry::SessionTracer) -> Self {
+        self.http.set_session_tracer(session_tracer);
+        self
     }
 
     /// Build from `~/.codex/auth.json`.
     pub fn from_auth_file() -> Result<Self, ApiError> {
         let (access_token, account_id) = read_auth_file()?;
-        let http = build_http_client_or_default();
         let base_url =
             std::env::var("CODEX_BASE_URL").unwrap_or_else(|_| DEFAULT_CODEX_BASE_URL.to_string());
         Ok(Self {
-            http,
+            http: HttpTransport::new(),
             base_url,
             access_token,
             account_id,
+            retry_policy: RetryPolicy::DEFAULT,
         })
     }
 
@@ -141,22 +149,26 @@ impl CodexClient {
         let payload = build_codex_request(request);
         let url = format!("{}/responses", self.base_url);
 
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "authorization".to_string(),
+                format!("Bearer {}", self.access_token),
+            ),
+            ("chatgpt-account-id".to_string(), self.account_id.clone()),
+            (
+                "openai-beta".to_string(),
+                "responses=experimental".to_string(),
+            ),
+            ("originator".to_string(), "codex_cli_rs".to_string()),
+        ];
+
         let response = self
             .http
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {}", self.access_token))
-            .header("chatgpt-account-id", &self.account_id)
-            .header("openai-beta", "responses=experimental")
-            .header("originator", "codex_cli_rs")
-            .json(&payload)
-            .send()
+            .send_json(&url, &headers, &payload, &self.retry_policy, |response| {
+                check_codex_response(response)
+            })
             .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(error_from_response(status, response).await);
-        }
 
         Ok(MessageStream {
             response,
@@ -168,7 +180,11 @@ impl CodexClient {
     }
 }
 
-async fn error_from_response(status: reqwest::StatusCode, response: reqwest::Response) -> ApiError {
+async fn check_codex_response(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
     let body = response.text().await.unwrap_or_default();
     let (error_type, message) = serde_json::from_str::<Value>(&body)
         .ok()
@@ -180,7 +196,7 @@ async fn error_from_response(status: reqwest::StatusCode, response: reqwest::Res
             ))
         })
         .unwrap_or((None, None));
-    ApiError::Api {
+    Err(ApiError::Api {
         status,
         error_type,
         message,
@@ -188,7 +204,7 @@ async fn error_from_response(status: reqwest::StatusCode, response: reqwest::Res
         body,
         retryable: matches!(status.as_u16(), 429 | 500 | 502 | 503),
         suggested_action: None,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -228,50 +244,76 @@ fn build_codex_request(request: &MessageRequest) -> Value {
 }
 
 fn translate_input_message(message: &InputMessage, input: &mut Vec<Value>) {
-    match message.role.as_str() {
-        "assistant" => {
-            let mut text_buf = String::new();
-            for block in &message.content {
-                match block {
-                    InputContentBlock::Text { text } => text_buf.push_str(text),
-                    InputContentBlock::ToolUse {
-                        id,
-                        name,
-                        input: args,
-                        ..
-                    } => {
-                        flush_text(&mut text_buf, "assistant", input);
-                        input.push(json!({
-                            "type": "function_call",
-                            "call_id": id,
-                            "name": name,
-                            "arguments": args.to_string(),
-                        }));
-                    }
-                    InputContentBlock::ToolResult { .. } => {}
+    if message.role.as_str() == "assistant" {
+        let mut text_buf = String::new();
+        for block in &message.content {
+            match block {
+                InputContentBlock::Text { text } => text_buf.push_str(text),
+                InputContentBlock::ToolUse {
+                    id,
+                    name,
+                    input: args,
+                    ..
+                } => {
+                    flush_text(&mut text_buf, "assistant", input);
+                    input.push(json!({
+                        "type": "function_call",
+                        "call_id": id,
+                        "name": name,
+                        "arguments": args.to_string(),
+                    }));
                 }
+                InputContentBlock::ToolResult { .. } | InputContentBlock::Image { .. } => {}
             }
-            flush_text(&mut text_buf, "assistant", input);
         }
-        _ => {
-            for block in &message.content {
-                match block {
-                    InputContentBlock::Text { text } => {
-                        input.push(json!({"role": "user", "content": text}));
-                    }
-                    InputContentBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                        ..
-                    } => {
-                        input.push(json!({
-                            "type": "function_call_output",
-                            "call_id": tool_use_id,
-                            "output": flatten_tool_result(content),
-                        }));
-                    }
-                    InputContentBlock::ToolUse { .. } => {}
+        flush_text(&mut text_buf, "assistant", input);
+    } else {
+        let mut user_parts: Vec<Value> = Vec::new();
+        for block in &message.content {
+            match block {
+                InputContentBlock::Text { text } => {
+                    user_parts.push(json!({ "type": "input_text", "text": text }));
                 }
+                InputContentBlock::Image { source } => {
+                    user_parts.push(json!({
+                        "type": "input_image",
+                        "image_url": format!("data:{};base64,{}", source.media_type, source.data),
+                    }));
+                }
+                InputContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    // Flush accumulated user parts before the tool result.
+                    if !user_parts.is_empty() {
+                        input.push(json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": user_parts,
+                        }));
+                        user_parts = Vec::new();
+                    }
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": tool_use_id,
+                        "output": flatten_tool_result(content),
+                    }));
+                }
+                InputContentBlock::ToolUse { .. } => {}
+            }
+        }
+        // Flush remaining user parts.
+        if !user_parts.is_empty() {
+            // Plain string for text-only messages (broad compatibility).
+            if user_parts.len() == 1 && user_parts[0]["type"] == "input_text" {
+                input.push(json!({"role": "user", "content": user_parts[0]["text"]}));
+            } else {
+                input.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": user_parts,
+                }));
             }
         }
     }
@@ -557,6 +599,7 @@ impl StreamState {
                             id: call_id,
                             name,
                             input: json!({}),
+                            thought_signature: None,
                         },
                     }));
 
@@ -814,6 +857,7 @@ mod tests {
                         id: "call_123".to_string(),
                         name: "get_weather".to_string(),
                         input: json!({"city": "SF"}),
+                        thought_signature: None,
                     }],
                 },
                 InputMessage::user_tool_result("call_123", "72F sunny", false),

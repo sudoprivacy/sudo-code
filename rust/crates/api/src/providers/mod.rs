@@ -7,6 +7,7 @@ use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
 pub mod codex;
+pub mod gemini;
 pub mod openai_compat;
 pub mod registry;
 
@@ -79,6 +80,7 @@ pub enum ProviderKind {
     Xai,
     OpenAi,
     Codex,
+    Gemini,
 }
 
 /// Env var names used by other provider backends. When Anthropic auth

@@ -30,10 +30,17 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    Image {
+        /// Base64-encoded image data.
+        data: String,
+        /// MIME type, e.g. `image/png`, `image/jpeg`.
+        mime_type: String,
+    },
     ToolUse {
         id: String,
         name: String,
         input: String,
+        thought_signature: Option<String>,
     },
     ToolResult {
         tool_use_id: String,
@@ -49,6 +56,8 @@ pub struct ConversationMessage {
     pub role: MessageRole,
     pub blocks: Vec<ContentBlock>,
     pub usage: Option<TokenUsage>,
+    /// The model that generated this message (set only for assistant messages).
+    pub model: Option<String>,
 }
 
 /// Metadata describing the latest compaction that summarized a session.
@@ -244,6 +253,16 @@ impl Session {
 
     pub fn push_user_text(&mut self, text: impl Into<String>) -> Result<(), SessionError> {
         self.push_message(ConversationMessage::user_text(text))
+    }
+
+    /// Push a user message containing multiple content blocks (e.g. text + images).
+    pub fn push_user_blocks(&mut self, blocks: Vec<ContentBlock>) -> Result<(), SessionError> {
+        self.push_message(ConversationMessage {
+            role: MessageRole::User,
+            blocks,
+            usage: None,
+            model: None,
+        })
     }
 
     pub fn record_compaction(&mut self, summary: impl Into<String>, removed_message_count: usize) {
@@ -628,6 +647,7 @@ impl ConversationMessage {
             role: MessageRole::User,
             blocks: vec![ContentBlock::Text { text: text.into() }],
             usage: None,
+            model: None,
         }
     }
 
@@ -637,6 +657,7 @@ impl ConversationMessage {
             role: MessageRole::Assistant,
             blocks,
             usage: None,
+            model: None,
         }
     }
 
@@ -646,6 +667,7 @@ impl ConversationMessage {
             role: MessageRole::Assistant,
             blocks,
             usage,
+            model: None,
         }
     }
 
@@ -665,6 +687,7 @@ impl ConversationMessage {
                 is_error,
             }],
             usage: None,
+            model: None,
         }
     }
 
@@ -689,6 +712,9 @@ impl ConversationMessage {
         );
         if let Some(usage) = self.usage {
             object.insert("usage".to_string(), usage_to_json(usage));
+        }
+        if let Some(model) = &self.model {
+            object.insert("model".to_string(), JsonValue::String(model.clone()));
         }
         JsonValue::Object(object)
     }
@@ -720,10 +746,15 @@ impl ConversationMessage {
             .map(ContentBlock::from_json)
             .collect::<Result<Vec<_>, _>>()?;
         let usage = object.get("usage").map(usage_from_json).transpose()?;
+        let model = object
+            .get("model")
+            .and_then(JsonValue::as_str)
+            .map(String::from);
         Ok(Self {
             role,
             blocks,
             usage,
+            model,
         })
     }
 }
@@ -737,7 +768,20 @@ impl ContentBlock {
                 object.insert("type".to_string(), JsonValue::String("text".to_string()));
                 object.insert("text".to_string(), JsonValue::String(text.clone()));
             }
-            Self::ToolUse { id, name, input } => {
+            Self::Image { data, mime_type } => {
+                object.insert("type".to_string(), JsonValue::String("image".to_string()));
+                object.insert("data".to_string(), JsonValue::String(data.clone()));
+                object.insert(
+                    "mime_type".to_string(),
+                    JsonValue::String(mime_type.clone()),
+                );
+            }
+            Self::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature,
+            } => {
                 object.insert(
                     "type".to_string(),
                     JsonValue::String("tool_use".to_string()),
@@ -745,6 +789,12 @@ impl ContentBlock {
                 object.insert("id".to_string(), JsonValue::String(id.clone()));
                 object.insert("name".to_string(), JsonValue::String(name.clone()));
                 object.insert("input".to_string(), JsonValue::String(input.clone()));
+                if let Some(sig) = thought_signature {
+                    object.insert(
+                        "thought_signature".to_string(),
+                        JsonValue::String(sig.clone()),
+                    );
+                }
             }
             Self::ToolResult {
                 tool_use_id,
@@ -783,10 +833,18 @@ impl ContentBlock {
             "text" => Ok(Self::Text {
                 text: required_string(object, "text")?,
             }),
+            "image" => Ok(Self::Image {
+                data: required_string(object, "data")?,
+                mime_type: required_string(object, "mime_type")?,
+            }),
             "tool_use" => Ok(Self::ToolUse {
                 id: required_string(object, "id")?,
                 name: required_string(object, "name")?,
                 input: required_string(object, "input")?,
+                thought_signature: object
+                    .get("thought_signature")
+                    .and_then(JsonValue::as_str)
+                    .map(String::from),
             }),
             "tool_result" => Ok(Self::ToolResult {
                 tool_use_id: required_string(object, "tool_use_id")?,
@@ -1178,6 +1236,7 @@ mod tests {
                         id: "tool-1".to_string(),
                         name: "bash".to_string(),
                         input: "echo hi".to_string(),
+                        thought_signature: None,
                     },
                 ],
                 Some(TokenUsage {
@@ -1448,6 +1507,39 @@ mod tests {
         // then
         assert_eq!(restored.workspace_root(), Some(workspace_root.as_path()));
         assert_eq!(forked.workspace_root(), Some(workspace_root.as_path()));
+    }
+
+    #[test]
+    fn per_message_model_round_trips_through_jsonl() {
+        // given
+        let path = temp_session_path("per-message-model");
+        let mut session = Session::new();
+        let mut assistant_msg = ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: "response".to_string(),
+        }]);
+        assistant_msg.model = Some("claude-sonnet-4-6".to_string());
+        session
+            .push_user_text("hello")
+            .expect("user message should append");
+        session
+            .push_message(assistant_msg)
+            .expect("assistant message should append");
+
+        // when
+        session.save_to_path(&path).expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        // then
+        assert_eq!(
+            restored.messages[1].model.as_deref(),
+            Some("claude-sonnet-4-6"),
+            "assistant message model should survive JSONL round-trip"
+        );
+        assert_eq!(
+            restored.messages[0].model, None,
+            "user message model should be None"
+        );
     }
 
     fn temp_session_path(label: &str) -> PathBuf {

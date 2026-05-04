@@ -17,7 +17,7 @@ mod init;
 mod input;
 mod render;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -44,9 +44,9 @@ use cli::api_client::{
 use cli::args::{
     config_model_for_current_dir, default_permission_mode, format_unknown_slash_command,
     load_sudocode_config_for_current_dir, load_sudocode_config_for_cwd, parse_args,
-    permission_mode_from_label, resolve_model_alias, resolve_model_alias_with_config,
-    resolve_repl_model, try_resolve_bare_skill_prompt, AllowedToolSet, CliAction, CliOutputFormat,
-    LocalHelpTopic,
+    permission_mode_from_label, require_sudocode_config_for_cwd, resolve_model_alias,
+    resolve_model_alias_with_config, resolve_repl_model, try_resolve_bare_skill_prompt,
+    AllowedToolSet, CliAction, CliOutputFormat, LocalHelpTopic,
 };
 use cli::export::{
     collect_session_prompt_history, parse_history_count, render_export_text,
@@ -59,8 +59,8 @@ use cli::format::{
     format_commit_skipped_report, format_compact_report, format_cost_report,
     format_internal_prompt_progress_line, format_issue_report, format_model_report,
     format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-    format_pr_report, format_resume_report, format_sandbox_report, format_ultraplan_report,
-    render_resume_usage, render_version_report, truncate_for_summary,
+    format_pr_report, format_resume_report, format_sandbox_report, format_turn_status_line,
+    format_ultraplan_report, render_resume_usage, render_version_report, truncate_for_summary,
 };
 use cli::git::{
     enforce_broad_cwd_policy, git_output, parse_git_status_branch, parse_git_status_metadata,
@@ -92,17 +92,18 @@ use commands::{
     slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
+use dialoguer::{FuzzySelect, Select};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
     load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status, AcpError,
-    AcpSessionUpdateObserver, ApiClient, ApiRequest, AssistantEvent, CompactionConfig,
-    ConfigLoader, ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
-    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
-    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
-    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
+    ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
+    McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode, PermissionPolicy,
+    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, SystemPrompt,
+    TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -215,9 +216,9 @@ const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
-pub(crate) const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/sudo-code";
-pub(crate) const OFFICIAL_REPO_SLUG: &str = "ultraworkers/sudo-code";
-pub(crate) const DEPRECATED_INSTALL_COMMAND: &str = "cargo install sudo-code";
+pub(crate) const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/sudocode";
+pub(crate) const OFFICIAL_REPO_SLUG: &str = "ultraworkers/sudocode";
+pub(crate) const DEPRECATED_INSTALL_COMMAND: &str = "cargo install sudocode";
 type RuntimePluginStateBuildOutput = (
     Option<Arc<Mutex<RuntimeMcpState>>>,
     Vec<RuntimeToolDefinition>,
@@ -236,9 +237,11 @@ fn main() {
         if json_output {
             // #77: classify error by prefix so downstream consumers can route without
             // regex-scraping the prose. Split short-reason from hint-runbook.
+            // #64: emit to stdout (not stderr) so JSON-mode consumers capturing only
+            // stdout receive errors with the same envelope as success responses.
             let kind = classify_error_kind(&message);
             let (short_reason, hint) = split_error_hint(&message);
-            eprintln!(
+            println!(
                 "{}",
                 serde_json::json!({
                     "type": "error",
@@ -276,7 +279,9 @@ Run `scode --help` for usage."
 /// matching against the error messages produced throughout the CLI surface.
 fn classify_error_kind(message: &str) -> &'static str {
     // Check specific patterns first (more specific before generic)
-    if message.contains("missing Anthropic credentials") {
+    if message.contains("missing sudocode.json") {
+        "missing_config"
+    } else if message.contains("missing Anthropic credentials") {
         "missing_credentials"
     } else if message.contains("Manifest source files are missing") {
         "missing_manifests"
@@ -359,7 +364,12 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    match parse_args(&args)? {
+    let action = parse_args(&args)?;
+    // Informational commands (help, version, config, login, logout) are
+    // dispatched immediately and must never block on a credential check.
+    // If an ensure_authenticated() call is ever added below this point it
+    // MUST be guarded by `if !action.is_informational()`.
+    match action {
         CliAction::DumpManifests {
             output_format,
             manifests_dir,
@@ -442,14 +452,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode_override,
             reasoning_effort,
             auth_mode,
-        } => run_acp_server(
-            model,
-            model_flag_raw,
-            allowed_tools,
-            permission_mode_override,
-            reasoning_effort,
-            auth_mode,
-        )?,
+            ws_port,
+        } => {
+            run_acp_server(
+                model,
+                model_flag_raw,
+                allowed_tools,
+                permission_mode_override,
+                reasoning_effort,
+                auth_mode,
+                ws_port,
+            )?;
+        }
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         // #146: dispatch pure-local introspection. Text mode uses existing
@@ -717,22 +731,22 @@ fn print_system_prompt(
     date: String,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sections = load_system_prompt(cwd, date, env::consts::OS, "unknown")?;
-    let message = sections.join(
-        "
-
-",
-    );
+    let prompt = load_system_prompt(cwd, date, env::consts::OS, "unknown")?;
+    let message = prompt.render();
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
-        CliOutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "system-prompt",
-                "message": message,
-                "sections": sections,
-            }))?
-        ),
+        CliOutputFormat::Json => {
+            let mut all_sections = prompt.static_sections.clone();
+            all_sections.extend(prompt.dynamic_sections.iter().cloned());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "system-prompt",
+                    "message": message,
+                    "sections": all_sections,
+                }))?
+            );
+        }
     }
     Ok(())
 }
@@ -1252,7 +1266,7 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
@@ -1274,17 +1288,39 @@ fn run_repl(
     )?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
-        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
+        input::LineEditor::new("❯ ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
+        let term_width = crossterm::terminal::size()
+            .map(|(cols, _)| cols as usize)
+            .unwrap_or(80);
+        let separator = format!("\x1b[2m{}\x1b[0m", "─".repeat(term_width));
+        let footer = "  \x1b[2m/help · /status · Tab for /commands\x1b[0m";
+        // Print the entire input chrome block: top sep, prompt placeholder,
+        // bottom sep, footer.  Then move the cursor back to the prompt line
+        // so read_line() renders there — the user sees all four elements at once.
+        println!("{separator}");
+        println!();
+        println!("{separator}");
+        print!("{footer}");
+        print!("\x1b[2F\x1b[2K"); // cursor up 2 lines, clear prompt placeholder
+        std::io::Write::flush(&mut std::io::stdout())?;
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
+                // Clear pre-printed bottom sep + footer
+                print!("\x1b[J");
+                // Replace prompt line with gray-background echo of user input
                 let trimmed = input.trim().to_string();
-                if trimmed.is_empty() {
-                    continue;
-                }
+                let echo_display = format!(" › {}", trimmed.replace('\n', " "));
+                let pad = term_width.saturating_sub(echo_display.chars().count());
+                print!(
+                    "\x1b[1F\x1b[2K\x1b[48;5;236m{echo_display}{}\x1b[0m",
+                    " ".repeat(pad)
+                );
+                println!();
+                println!("{separator}");
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
                     cli.persist_session()?;
                     break;
@@ -1317,14 +1353,17 @@ fn run_repl(
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
                     editor.push_history(input);
                     cli.record_prompt_history(&trimmed);
-                    cli.run_turn(&prompt)?;
+                    if let Err(e) = cli.run_turn(&prompt) {
+                        eprintln!("\x1b[31m{e}\x1b[0m");
+                    }
                     continue;
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
+                if let Err(e) = cli.run_turn(&trimmed) {
+                    eprintln!("\x1b[31m{e}\x1b[0m");
+                }
             }
-            input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
                 cli.persist_session()?;
                 break;
@@ -1340,6 +1379,8 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    /// Shared tokio runtime used to drive async `run_turn` calls.
+    tokio_runtime: tokio::runtime::Runtime,
 }
 
 pub(crate) struct RuntimePluginState {
@@ -1355,7 +1396,7 @@ pub(crate) struct RuntimePluginState {
 #[derive(Clone)]
 struct RuntimeConfig {
     model: String,
-    system_prompt: Vec<String>,
+    system_prompt: SystemPrompt,
     enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
@@ -1448,6 +1489,7 @@ struct AcpCliSession {
     cwd: PathBuf,
     handle: SessionHandle,
     runtime: BuiltRuntime,
+    abort_signal: runtime::HookAbortSignal,
 }
 
 struct AcpCliAgent {
@@ -1458,6 +1500,7 @@ struct AcpCliAgent {
     reasoning_effort: Option<String>,
     auth_mode: Option<AuthMode>,
     sessions: HashMap<String, AcpCliSession>,
+    tokio_runtime: tokio::runtime::Runtime,
 }
 
 impl AcpCliAgent {
@@ -1477,6 +1520,8 @@ impl AcpCliAgent {
             reasoning_effort,
             auth_mode,
             sessions: HashMap::new(),
+            tokio_runtime: tokio::runtime::Runtime::new()
+                .expect("failed to create tokio runtime for ACP agent"),
         }
     }
 
@@ -1497,7 +1542,8 @@ impl AcpCliAgent {
             session_state.with_persistence_path(handle.path.clone()),
             &handle.id,
             {
-                let sudocode_config = load_sudocode_config_for_cwd(&cwd);
+                let sudocode_config =
+                    require_sudocode_config_for_cwd(&cwd).map_err(AcpError::internal)?;
                 let auth_mode = resolve_auth_mode(&model, self.auth_mode, &sudocode_config)
                     .map_err(|e| AcpError::internal(format!("failed to resolve auth mode: {e}")))?;
                 RuntimeConfig {
@@ -1514,9 +1560,10 @@ impl AcpCliAgent {
             },
         )
         .map_err(|error| AcpError::internal(format!("failed to build runtime: {error}")))?;
-        if let Some(runtime) = runtime.runtime.as_mut() {
-            runtime
-                .api_client_mut()
+        let abort_signal = runtime::HookAbortSignal::new();
+        runtime = runtime.with_hook_abort_signal(abort_signal.clone());
+        if let Some(rt) = runtime.runtime.as_mut() {
+            rt.api_client_mut()
                 .set_reasoning_effort(self.reasoning_effort.clone());
         }
         runtime
@@ -1528,6 +1575,7 @@ impl AcpCliAgent {
             cwd,
             handle,
             runtime,
+            abort_signal,
         })
     }
 
@@ -1550,39 +1598,75 @@ impl AcpCliAgent {
     }
 }
 
-impl runtime::AcpAgent for AcpCliAgent {
-    fn new_session(&mut self, cwd: Option<PathBuf>) -> Result<String, AcpError> {
-        let cwd = cwd
-            .map_or_else(env::current_dir, Ok)
-            .map_err(|error| AcpError::internal(format!("failed to resolve cwd: {error}")))?;
-        let session = self.build_session(&cwd)?;
-        let session_id = session.handle.id.clone();
-        self.sessions.insert(session_id.clone(), session);
-        Ok(session_id)
-    }
-
-    fn run_prompt(
+impl AcpCliAgent {
+    fn handle_acp_model_switch(
         &mut self,
         session_id: &str,
-        prompt: String,
-        observer: &mut AcpSessionUpdateObserver<'_>,
-    ) -> Result<(), AcpError> {
+        model: Option<String>,
+    ) -> Result<String, AcpError> {
         let session = self
             .sessions
-            .get_mut(session_id)
+            .get(session_id)
             .ok_or_else(|| AcpError::invalid_params(format!("unknown sessionId: {session_id}")))?;
-        let _guard = ScopedCurrentDir::change_to(&session.cwd)
-            .map_err(|error| AcpError::internal(format!("failed to enter session cwd: {error}")))?;
-        session
-            .runtime
-            .run_turn(prompt, None, Some(observer))
-            .map_err(|error| AcpError::internal(error.to_string()))?;
-        session
-            .runtime
-            .session()
-            .save_to_path(&session.handle.path)
-            .map_err(|error| AcpError::internal(format!("failed to persist session: {error}")))?;
-        Ok(())
+
+        let Some(new_model) = model else {
+            return Ok(format_model_report(
+                &self.model,
+                session.runtime.session().messages.len(),
+                UsageTracker::from_session(session.runtime.session()).turns(),
+            ));
+        };
+
+        let resolved = resolve_model_alias_with_config(&new_model);
+        if resolved == self.model {
+            let session = self.sessions.get(session_id).unwrap();
+            return Ok(format_model_report(
+                &self.model,
+                session.runtime.session().messages.len(),
+                UsageTracker::from_session(session.runtime.session()).turns(),
+            ));
+        }
+
+        let previous = self.model.clone();
+        let session = self.sessions.get(session_id).unwrap();
+        let message_count = session.runtime.session().messages.len();
+        let cloned_session = session.runtime.session().clone();
+        let cwd = session.cwd.clone();
+        let handle_id = session.handle.id.clone();
+
+        let sudocode_config = load_sudocode_config_for_cwd(&cwd);
+        let permission_mode = self.resolve_permission_mode_for_cwd(&cwd)?;
+        let auth_mode = resolve_auth_mode(&resolved, self.auth_mode, &sudocode_config)
+            .map_err(|e| AcpError::internal(format!("failed to resolve auth mode: {e}")))?;
+        let system_prompt = build_system_prompt_for(&cwd)
+            .map_err(|e| AcpError::internal(format!("failed to build system prompt: {e}")))?;
+        let runtime = build_runtime_for_cwd(
+            &cwd,
+            cloned_session,
+            &handle_id,
+            RuntimeConfig {
+                model: resolved.clone(),
+                system_prompt,
+                enable_tools: true,
+                emit_output: false,
+                allowed_tools: self.allowed_tools.clone(),
+                permission_mode,
+                progress_reporter: None,
+                auth_mode,
+                sudocode_config,
+            },
+        )
+        .map_err(|e| AcpError::internal(e.to_string()))?;
+
+        let session = self.sessions.get_mut(session_id).unwrap();
+        session.runtime = runtime;
+        self.model.clone_from(&resolved);
+
+        Ok(format_model_switch_report(
+            &previous,
+            &resolved,
+            message_count,
+        ))
     }
 }
 
@@ -1621,17 +1705,386 @@ fn run_acp_server(
     permission_mode_override: Option<PermissionMode>,
     reasoning_effort: Option<String>,
     auth_mode: Option<AuthMode>,
+    ws_port: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let agent = AcpCliAgent::new(
+    let config = runtime::acp_sdk_server::SdkAcpConfig {
+        agent_version: VERSION.to_string(),
+        model: model.clone(),
+        model_flag_raw: model_flag_raw.clone(),
+        permission_mode_override,
+        reasoning_effort: reasoning_effort.clone(),
+    };
+    let delegate = Box::new(AcpSdkDelegate::new(
         model,
         model_flag_raw,
         allowed_tools,
         permission_mode_override,
         reasoning_effort,
         auth_mode,
-    );
-    runtime::run_acp_stdio_server(agent, &runtime::AcpServerOptions::new(VERSION))?;
-    Ok(())
+    ));
+    let rt = tokio::runtime::Runtime::new()?;
+    if let Some(port) = ws_port {
+        rt.block_on(runtime::acp_ws_server::run_acp_ws_server(
+            config, delegate, port,
+        ))
+    } else {
+        rt.block_on(runtime::acp_stdio_server::run_acp_stdio_server(
+            config, delegate,
+        ))
+    }
+}
+
+/// Delegate implementation that bridges the SDK ACP server to the existing
+/// CLI session/runtime machinery.
+struct AcpSdkDelegate {
+    inner: AcpCliAgent,
+}
+
+impl AcpSdkDelegate {
+    fn new(
+        model: String,
+        model_flag_raw: Option<String>,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode_override: Option<PermissionMode>,
+        reasoning_effort: Option<String>,
+        auth_mode: Option<AuthMode>,
+    ) -> Self {
+        Self {
+            inner: AcpCliAgent::new(
+                model,
+                model_flag_raw,
+                allowed_tools,
+                permission_mode_override,
+                reasoning_effort,
+                auth_mode,
+            ),
+        }
+    }
+}
+
+impl runtime::acp_sdk_server::SdkAcpDelegate for AcpSdkDelegate {
+    fn new_session(
+        &mut self,
+        cwd: PathBuf,
+    ) -> Result<(String, PathBuf, runtime::HookAbortSignal), runtime::AcpError> {
+        let session = self.inner.build_session(&cwd)?;
+        let session_id = session.handle.id.clone();
+        let session_cwd = session.cwd.clone();
+        let abort_signal = session.abort_signal.clone();
+        self.inner.sessions.insert(session_id.clone(), session);
+        Ok((session_id, session_cwd, abort_signal))
+    }
+
+    fn run_prompt(
+        &mut self,
+        session_id: &str,
+        prompt: String,
+        observer: &mut runtime::acp_sdk_server::SdkSessionObserver,
+    ) -> Result<
+        (
+            runtime::acp_sdk_server::AcpStopReason,
+            Option<runtime::acp_sdk_server::PromptUsage>,
+        ),
+        runtime::AcpError,
+    > {
+        self.run_prompt_impl(session_id, prompt, observer, None)
+    }
+
+    fn run_prompt_with_prompter(
+        &mut self,
+        session_id: &str,
+        prompt: String,
+        observer: &mut runtime::acp_sdk_server::SdkSessionObserver,
+        prompter: &mut dyn runtime::PermissionPrompter,
+    ) -> Result<
+        (
+            runtime::acp_sdk_server::AcpStopReason,
+            Option<runtime::acp_sdk_server::PromptUsage>,
+        ),
+        runtime::AcpError,
+    > {
+        self.run_prompt_impl(session_id, prompt, observer, Some(prompter))
+    }
+
+    fn handle_slash_command(
+        &mut self,
+        session_id: &str,
+        input: &str,
+        observer: &mut runtime::acp_sdk_server::SdkSessionObserver,
+    ) -> Result<(), runtime::AcpError> {
+        use runtime::RuntimeObserver as _;
+        let Ok(Some(command)) = SlashCommand::parse(input) else {
+            observer.on_text_delta(&format!(
+                "Unknown slash command: `{input}`. Type `/help` for available commands."
+            ));
+            return Ok(());
+        };
+
+        let response = match &command {
+            SlashCommand::Model { model } => {
+                self.inner.handle_acp_model_switch(session_id, model.clone())?
+            }
+            SlashCommand::Help => render_repl_help(),
+            SlashCommand::Status => {
+                let session = self.inner.sessions.get(session_id).ok_or_else(|| {
+                    runtime::AcpError::invalid_params(format!(
+                        "unknown sessionId: {session_id}"
+                    ))
+                })?;
+                let _guard = ScopedCurrentDir::change_to(&session.cwd)
+                    .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
+                let tracker = UsageTracker::from_session(session.runtime.session());
+                format_status_report(
+                    &self.inner.model,
+                    StatusUsage {
+                        message_count: session.runtime.session().messages.len(),
+                        turns: tracker.turns(),
+                        latest: tracker.current_turn_usage(),
+                        cumulative: tracker.cumulative_usage(),
+                        estimated_tokens: 0,
+                    },
+                    default_permission_mode().as_str(),
+                    &status_context(Some(&session.handle.path))
+                        .map_err(|e| runtime::AcpError::internal(e.to_string()))?,
+                    None,
+                )
+            }
+            SlashCommand::Cost => {
+                let session = self.inner.sessions.get(session_id).ok_or_else(|| {
+                    runtime::AcpError::invalid_params(format!(
+                        "unknown sessionId: {session_id}"
+                    ))
+                })?;
+                let usage = UsageTracker::from_session(session.runtime.session())
+                    .cumulative_usage();
+                format!(
+                    "Token usage: {} input, {} output, {} cache-create, {} cache-read",
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_creation_input_tokens,
+                    usage.cache_read_input_tokens,
+                )
+            }
+            SlashCommand::Config { section } => render_config_report(section.as_deref())
+                .map_err(|e| runtime::AcpError::internal(e.to_string()))?,
+            SlashCommand::Diff => {
+                let output = std::process::Command::new("git")
+                    .args(["diff", "--cached", "--no-color"])
+                    .output()
+                    .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
+                let cached = String::from_utf8_lossy(&output.stdout);
+                let output2 = std::process::Command::new("git")
+                    .args(["diff", "--no-color"])
+                    .output()
+                    .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
+                let unstaged = String::from_utf8_lossy(&output2.stdout);
+                if cached.is_empty() && unstaged.is_empty() {
+                    "No changes detected.".to_string()
+                } else {
+                    format!(
+                        "{}{}",
+                        if cached.is_empty() {
+                            String::new()
+                        } else {
+                            format!("**Staged:**\n```diff\n{cached}```\n\n")
+                        },
+                        if unstaged.is_empty() {
+                            String::new()
+                        } else {
+                            format!("**Unstaged:**\n```diff\n{unstaged}```")
+                        }
+                    )
+                }
+            }
+            SlashCommand::Doctor => render_doctor_report()
+                .map(|report| report.render())
+                .map_err(|e| runtime::AcpError::internal(e.to_string()))?,
+            _ => format!(
+                "`{}` is not supported in ACP mode. Available: /model, /status, /cost, /config, /diff, /doctor, /help",
+                input.split_whitespace().next().unwrap_or(input)
+            ),
+        };
+
+        observer.on_text_delta(&response);
+        Ok(())
+    }
+
+    fn list_sessions(&self) -> Vec<(String, PathBuf)> {
+        self.inner
+            .sessions
+            .iter()
+            .map(|(id, s)| (id.clone(), s.cwd.clone()))
+            .collect()
+    }
+
+    fn close_session(&mut self, session_id: &str) -> bool {
+        self.inner.sessions.remove(session_id).is_some()
+    }
+
+    fn set_model(&mut self, session_id: &str, model_id: &str) -> Result<String, runtime::AcpError> {
+        self.inner
+            .handle_acp_model_switch(session_id, Some(model_id.to_string()))
+    }
+
+    fn get_model_info(&self) -> (String, Vec<String>) {
+        let config = load_sudocode_config_for_current_dir();
+        let mut models: Vec<String> = config.models.keys().cloned().collect();
+        // Ensure the current model is always present.
+        if !models.contains(&self.inner.model) {
+            models.insert(0, self.inner.model.clone());
+        }
+        (self.inner.model.clone(), models)
+    }
+
+    fn set_permission_mode(
+        &mut self,
+        session_id: &str,
+        mode: PermissionMode,
+    ) -> Result<(), runtime::AcpError> {
+        let session = self.inner.sessions.get_mut(session_id).ok_or_else(|| {
+            runtime::AcpError::invalid_params(format!("unknown sessionId: {session_id}"))
+        })?;
+        if let Some(rt) = session.runtime.runtime.as_mut() {
+            rt.permission_policy_mut().set_active_mode(mode);
+        }
+        Ok(())
+    }
+
+    fn push_images(
+        &mut self,
+        session_id: &str,
+        images: &[(String, String)],
+    ) -> Result<(), runtime::AcpError> {
+        let session = self.inner.sessions.get_mut(session_id).ok_or_else(|| {
+            runtime::AcpError::invalid_params(format!("unknown sessionId: {session_id}"))
+        })?;
+        for (data, mime_type) in images {
+            let msg = runtime::ConversationMessage {
+                role: runtime::MessageRole::User,
+                blocks: vec![runtime::ContentBlock::Image {
+                    data: data.clone(),
+                    mime_type: mime_type.clone(),
+                }],
+                usage: None,
+                model: None,
+            };
+            session
+                .runtime
+                .session_mut()
+                .push_message(msg)
+                .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn load_session(
+        &mut self,
+        session_id: &str,
+        cwd: PathBuf,
+    ) -> Result<(String, PathBuf, runtime::HookAbortSignal), runtime::AcpError> {
+        let cwd = canonical_session_cwd(&cwd)?;
+        let _guard = ScopedCurrentDir::change_to(&cwd)
+            .map_err(|e| runtime::AcpError::internal(format!("failed to enter cwd: {e}")))?;
+
+        let (handle, session) = load_session_reference(session_id)
+            .map_err(|e| runtime::AcpError::internal(format!("failed to load session: {e}")))?;
+
+        let model = self.inner.resolve_model_for_cwd(&cwd)?;
+        let permission_mode = self.inner.resolve_permission_mode_for_cwd(&cwd)?;
+        let system_prompt = build_system_prompt_for(&cwd).map_err(|e| {
+            runtime::AcpError::internal(format!("failed to build system prompt: {e}"))
+        })?;
+        let sudocode_config =
+            require_sudocode_config_for_cwd(&cwd).map_err(runtime::AcpError::internal)?;
+        let auth_mode =
+            resolve_auth_mode(&model, self.inner.auth_mode, &sudocode_config).map_err(|e| {
+                runtime::AcpError::internal(format!("failed to resolve auth mode: {e}"))
+            })?;
+
+        let mut runtime = build_runtime_for_cwd(
+            &cwd,
+            session,
+            &handle.id,
+            RuntimeConfig {
+                model,
+                system_prompt,
+                enable_tools: true,
+                emit_output: false,
+                allowed_tools: self.inner.allowed_tools.clone(),
+                permission_mode,
+                progress_reporter: None,
+                auth_mode,
+                sudocode_config,
+            },
+        )
+        .map_err(|e| runtime::AcpError::internal(format!("failed to build runtime: {e}")))?;
+
+        let abort_signal = runtime::HookAbortSignal::new();
+        runtime = runtime.with_hook_abort_signal(abort_signal.clone());
+        if let Some(rt) = runtime.runtime.as_mut() {
+            rt.api_client_mut()
+                .set_reasoning_effort(self.inner.reasoning_effort.clone());
+        }
+
+        let loaded_session_id = handle.id.clone();
+        let signal = abort_signal.clone();
+        self.inner.sessions.insert(
+            loaded_session_id.clone(),
+            AcpCliSession {
+                cwd: cwd.clone(),
+                handle,
+                runtime,
+                abort_signal,
+            },
+        );
+        Ok((loaded_session_id, cwd, signal))
+    }
+}
+
+impl AcpSdkDelegate {
+    fn run_prompt_impl(
+        &mut self,
+        session_id: &str,
+        prompt: String,
+        observer: &mut runtime::acp_sdk_server::SdkSessionObserver,
+        prompter: Option<&mut dyn runtime::PermissionPrompter>,
+    ) -> Result<
+        (
+            runtime::acp_sdk_server::AcpStopReason,
+            Option<runtime::acp_sdk_server::PromptUsage>,
+        ),
+        runtime::AcpError,
+    > {
+        let session = self.inner.sessions.get_mut(session_id).ok_or_else(|| {
+            runtime::AcpError::invalid_params(format!("unknown sessionId: {session_id}"))
+        })?;
+        // Reset abort signal for this new turn.
+        session.abort_signal.reset();
+        let _guard = ScopedCurrentDir::change_to(&session.cwd).map_err(|e| {
+            runtime::AcpError::internal(format!("failed to enter session cwd: {e}"))
+        })?;
+        self.inner
+            .tokio_runtime
+            .block_on(session.runtime.run_turn(prompt, prompter, Some(observer)))
+            .map_err(|e| runtime::AcpError::internal(e.to_string()))?;
+        let usage = UsageTracker::from_session(session.runtime.session()).cumulative_usage();
+        let prompt_usage = runtime::acp_sdk_server::PromptUsage {
+            input_tokens: u64::from(usage.input_tokens),
+            output_tokens: u64::from(usage.output_tokens),
+            total_tokens: u64::from(usage.total_tokens()),
+            cache_read_tokens: Some(u64::from(usage.cache_read_input_tokens)),
+            cache_write_tokens: Some(u64::from(usage.cache_creation_input_tokens)),
+        };
+        session
+            .runtime
+            .session()
+            .save_to_path(&session.handle.path)
+            .map_err(|e| runtime::AcpError::internal(format!("failed to persist session: {e}")))?;
+        Ok((
+            runtime::acp_sdk_server::AcpStopReason::EndTurn,
+            Some(prompt_usage),
+        ))
+    }
 }
 
 struct HookAbortMonitor {
@@ -1689,6 +2142,24 @@ impl HookAbortMonitor {
     }
 }
 
+/// Measure visible string width by stripping ANSI escape sequences.
+fn strip_ansi_width(s: &str) -> usize {
+    let mut width = 0;
+    let mut in_escape = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+        } else if in_escape {
+            if c == 'm' {
+                in_escape = false;
+            }
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
 impl LiveCli {
     fn new(
         model: String,
@@ -1700,8 +2171,11 @@ impl LiveCli {
         let system_prompt = build_system_prompt()?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
-        let sudocode_config = load_sudocode_config_for_current_dir();
+        let cwd = env::current_dir()?;
+        let sudocode_config = require_sudocode_config_for_cwd(&cwd)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         let auth_mode = resolve_auth_mode(&model, auth_mode, &sudocode_config)?;
+        tools::set_global_auth_mode(auth_mode);
         let config = RuntimeConfig {
             model,
             system_prompt,
@@ -1723,6 +2197,7 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            tokio_runtime: tokio::runtime::Runtime::new()?,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -1767,37 +2242,66 @@ impl LiveCli {
         .map(|r| r.base_url)
         .unwrap_or_default();
 
-        format!(
-            "\x1b[38;5;117m\
+        let logo = "\x1b[38;5;117m\
 ███████╗██╗   ██╗██████╗  ██████╗ \n\
 ██╔════╝██║   ██║██╔══██╗██╔═══██╗\n\
 ███████╗██║   ██║██║  ██║██║   ██║\n\
 ╚════██║██║   ██║██║  ██║██║   ██║\n\
 ███████║╚██████╔╝██████╔╝╚██████╔╝\n\
-╚══════╝ ╚═════╝ ╚═════╝  ╚═════╝\x1b[0m \x1b[38;5;208mCode\x1b[0m\n\n\
-  \x1b[2mModel\x1b[0m            {}\n\
-  \x1b[2mAuth mode\x1b[0m        {}\n\
-  \x1b[2mEndpoint\x1b[0m         {}\n\
-  \x1b[2mPermissions\x1b[0m      {}\n\
-  \x1b[2mBranch\x1b[0m           {}\n\
-  \x1b[2mWorkspace\x1b[0m        {}\n\
-  \x1b[2mDirectory\x1b[0m        {}\n\
-  \x1b[2mSession\x1b[0m          {}\n\
-  \x1b[2mAuto-save\x1b[0m        {}\n\n\
-  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
-            self.config.model,
-            auth_mode_str,
-            endpoint,
-            self.config.permission_mode.as_str(),
-            git_branch,
-            workspace,
-            cwd,
-            self.session.id,
-            session_path,
+╚══════╝ ╚═════╝ ╚═════╝  ╚═════╝\x1b[0m \x1b[38;5;208mCode\x1b[0m";
+
+        let lines = [
+            format!("  \x1b[2mModel\x1b[0m            {}", self.config.model),
+            format!("  \x1b[2mAuth mode\x1b[0m        {}", auth_mode_str),
+            format!("  \x1b[2mEndpoint\x1b[0m         {}", endpoint),
+            format!(
+                "  \x1b[2mPermissions\x1b[0m      {}",
+                self.config.permission_mode.as_str()
+            ),
+            format!("  \x1b[2mBranch\x1b[0m           {}", git_branch),
+            format!("  \x1b[2mWorkspace\x1b[0m        {}", workspace),
+            format!("  \x1b[2mDirectory\x1b[0m        {}", cwd),
+            format!("  \x1b[2mSession\x1b[0m          {}", self.session.id),
+            format!("  \x1b[2mAuto-save\x1b[0m        {}", session_path),
+        ];
+
+        let max_width = lines.iter().map(|l| strip_ansi_width(l)).max().unwrap_or(0);
+        let box_width = max_width + 2; // 1 space padding on each side
+
+        let grey = "\x1b[38;5;245m";
+        let reset = "\x1b[0m";
+
+        let top = format!("{grey}╭{}╮{reset}", "─".repeat(box_width));
+        let bottom = format!("{grey}╰{}╯{reset}", "─".repeat(box_width));
+
+        let boxed_lines: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                let visible_width = strip_ansi_width(line);
+                let padding = max_width - visible_width;
+                format!(
+                    "{grey}│{reset} {}{} {grey}│{reset}",
+                    line,
+                    " ".repeat(padding)
+                )
+            })
+            .collect();
+
+        let hint = "  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for /command completions";
+
+        format!(
+            "{}\n\n{}\n{}\n{}\n\n{}",
+            logo,
+            top,
+            boxed_lines.join("\n"),
+            bottom,
+            hint,
         )
     }
 
-    fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    fn repl_completion_candidates(
+        &self,
+    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
         Ok(slash_command_completion_candidates_with_sessions(
             &self.config.model,
             Some(&self.session.id),
@@ -1834,30 +2338,50 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let turn_start = Instant::now();
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
-        spinner.tick(
+        spinner.start(
             "🦀 Thinking...",
+            Some(self.config.model.as_str()),
             TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
+        );
+        let pause_flag = spinner.pause_flag();
+        runtime
+            .api_client_mut()
+            .set_spinner_pause(pause_flag.clone());
+        runtime.tool_executor_mut().set_spinner_pause(pause_flag);
         let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
+        let result = self.tokio_runtime.block_on(runtime.run_turn(
+            input,
+            Some(&mut permission_prompter),
+            None,
+        ));
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                println!();
-                if let Some(event) = summary.auto_compaction {
+                if summary.cancelled {
+                    spinner.fail(
+                        "⏹ Cancelled",
+                        TerminalRenderer::new().color_theme(),
+                        &mut stdout,
+                    )?;
+                } else {
+                    spinner.clear(&mut stdout)?;
+                    if let Some(event) = summary.auto_compaction {
+                        println!(
+                            "{}",
+                            format_auto_compaction_notice(event.removed_message_count)
+                        );
+                    }
+                    let elapsed = turn_start.elapsed();
+                    let usage = self.runtime.usage().current_turn_usage();
+                    let turns = self.runtime.usage().turns();
                     println!(
                         "{}",
-                        format_auto_compaction_notice(event.removed_message_count)
+                        format_turn_status_line(&self.config.model, turns, &usage, elapsed)
                     );
                 }
                 self.persist_session()?;
@@ -1892,7 +2416,11 @@ impl LiveCli {
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
+        let result = self.tokio_runtime.block_on(runtime.run_turn(
+            input,
+            Some(&mut permission_prompter),
+            None,
+        ));
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -1905,7 +2433,11 @@ impl LiveCli {
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
+        let result = self.tokio_runtime.block_on(runtime.run_turn(
+            input,
+            Some(&mut permission_prompter),
+            None,
+        ));
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -1930,7 +2462,11 @@ impl LiveCli {
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter), None);
+        let result = self.tokio_runtime.block_on(runtime.run_turn(
+            input,
+            Some(&mut permission_prompter),
+            None,
+        ));
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -2229,15 +2765,21 @@ impl LiveCli {
 
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(model) = model else {
-            println!(
-                "{}",
-                format_model_report(
-                    &self.config.model,
-                    self.runtime.session().messages.len(),
-                    self.runtime.usage().turns(),
-                )
-            );
-            return Ok(false);
+            let sudocode_config = load_sudocode_config_for_current_dir();
+            let models: Vec<String> = sudocode_config.models.keys().cloned().collect();
+            if models.is_empty() {
+                println!("No models configured in sudocode.json");
+                return Ok(false);
+            }
+            let selection = FuzzySelect::new()
+                .with_prompt("Select model")
+                .items(&models)
+                .default(0)
+                .interact_opt()?;
+            return match selection {
+                Some(idx) => self.set_model(Some(models[idx].clone())),
+                None => Ok(false),
+            };
         };
 
         let model = resolve_model_alias_with_config(&model);
@@ -2372,8 +2914,24 @@ impl LiveCli {
         session_path: Option<String>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(session_ref) = session_path else {
-            println!("{}", render_resume_usage());
-            return Ok(false);
+            let sessions = list_managed_sessions()?;
+            if sessions.is_empty() {
+                println!("No sessions found.");
+                return Ok(false);
+            }
+            let labels: Vec<String> = sessions
+                .iter()
+                .map(|s| format!("{} ({} msgs)", s.id, s.message_count))
+                .collect();
+            let selection = Select::new()
+                .with_prompt("Select session to resume")
+                .items(&labels)
+                .default(0)
+                .interact_opt()?;
+            return match selection {
+                Some(idx) => self.resume_session(Some(sessions[idx].id.clone())),
+                None => Ok(false),
+            };
         };
 
         let (handle, session) = load_session_reference(&session_ref)?;
@@ -2679,7 +3237,11 @@ impl LiveCli {
             },
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.config.permission_mode);
-        let summary = runtime.run_turn(prompt, Some(&mut permission_prompter), None)?;
+        let summary = self.tokio_runtime.block_on(runtime.run_turn(
+            prompt,
+            Some(&mut permission_prompter),
+            None,
+        ))?;
         let text = final_assistant_text(&summary).trim().to_string();
         runtime.shutdown_plugins()?;
         Ok(text)
@@ -2784,11 +3346,11 @@ fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_jso
     })
 }
 
-fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+fn build_system_prompt() -> Result<SystemPrompt, Box<dyn std::error::Error>> {
     build_system_prompt_for(&env::current_dir()?)
 }
 
-fn build_system_prompt_for(cwd: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+fn build_system_prompt_for(cwd: &Path) -> Result<SystemPrompt, Box<dyn std::error::Error>> {
     Ok(load_system_prompt(
         cwd.to_path_buf(),
         DEFAULT_DATE,
@@ -3206,31 +3768,51 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     ) -> runtime::PermissionPromptDecision {
         println!();
         println!("Permission approval required");
-        println!("  Tool             {}", request.tool_name);
-        println!("  Current mode     {}", self.current_mode.as_str());
-        println!("  Required mode    {}", request.required_mode.as_str());
+        println!("  Tool             \x1b[36m{}\x1b[0m", request.tool_name);
         if let Some(reason) = &request.reason {
-            println!("  Reason           {reason}");
+            println!("  Reason           \x1b[2m{reason}\x1b[0m");
         }
-        println!("  Input            {}", request.input);
-        print!("Approve this tool call? [y/N]: ");
-        let _ = io::stdout().flush();
 
-        let mut response = String::new();
-        match io::stdin().read_line(&mut response) {
-            Ok(_) => {
-                let normalized = response.trim().to_ascii_lowercase();
-                if matches!(normalized.as_str(), "y" | "yes") {
-                    runtime::PermissionPromptDecision::Allow
-                } else {
-                    runtime::PermissionPromptDecision::Deny {
-                        reason: format!(
-                            "tool '{}' denied by user approval prompt",
-                            request.tool_name
-                        ),
+        if !io::stdin().is_terminal() {
+            // Non-interactive fallback: read a line from stdin.
+            print!("Approve this tool call? [y/N]: ");
+            let _ = io::stdout().flush();
+            let mut response = String::new();
+            return match io::stdin().read_line(&mut response) {
+                Ok(_) => {
+                    let normalized = response.trim().to_ascii_lowercase();
+                    if matches!(normalized.as_str(), "y" | "yes") {
+                        runtime::PermissionPromptDecision::Allow
+                    } else {
+                        runtime::PermissionPromptDecision::Deny {
+                            reason: format!(
+                                "tool '{}' denied by user approval prompt",
+                                request.tool_name
+                            ),
+                        }
                     }
                 }
-            }
+                Err(error) => runtime::PermissionPromptDecision::Deny {
+                    reason: format!("permission approval failed: {error}"),
+                },
+            };
+        }
+
+        let items = &["Allow once", "Deny"];
+        let selection = Select::new()
+            .with_prompt("Approve this tool call?")
+            .items(items)
+            .default(0)
+            .interact_opt();
+
+        match selection {
+            Ok(Some(0)) => runtime::PermissionPromptDecision::Allow,
+            Ok(Some(_) | None) => runtime::PermissionPromptDecision::Deny {
+                reason: format!(
+                    "tool '{}' denied by user approval prompt",
+                    request.tool_name
+                ),
+            },
             Err(error) => runtime::PermissionPromptDecision::Deny {
                 reason: format!("permission approval failed: {error}"),
             },
@@ -3358,17 +3940,17 @@ fn slash_command_completion_candidates_with_sessions(
     model: &str,
     active_session_id: Option<&str>,
     recent_session_ids: Vec<String>,
-) -> Vec<String> {
-    let mut completions = BTreeSet::new();
+) -> Vec<(String, String)> {
+    let mut completions = BTreeMap::new();
 
     for spec in slash_command_specs() {
         if STUB_COMMANDS.contains(&spec.name) {
             continue;
         }
-        completions.insert(format!("/{}", spec.name));
+        completions.insert(format!("/{}", spec.name), spec.summary.to_string());
         for alias in spec.aliases {
             if !STUB_COMMANDS.contains(alias) {
-                completions.insert(format!("/{alias}"));
+                completions.insert(format!("/{alias}"), spec.summary.to_string());
             }
         }
     }
@@ -3416,23 +3998,35 @@ fn slash_command_completion_candidates_with_sessions(
         "/mcp help",
         "/skills help",
     ] {
-        completions.insert(candidate.to_string());
+        completions
+            .entry(candidate.to_string())
+            .or_insert_with(String::new);
     }
 
     // Add config-driven model aliases to /model completions.
     let sudocode_config = load_sudocode_config_for_current_dir();
     for alias in sudocode_config.models.keys() {
-        completions.insert(format!("/model {alias}"));
+        completions
+            .entry(format!("/model {alias}"))
+            .or_insert_with(String::new);
     }
 
     if !model.trim().is_empty() {
-        completions.insert(format!("/model {}", resolve_model_alias_with_config(model)));
-        completions.insert(format!("/model {model}"));
+        completions
+            .entry(format!("/model {}", resolve_model_alias_with_config(model)))
+            .or_insert_with(String::new);
+        completions
+            .entry(format!("/model {model}"))
+            .or_insert_with(String::new);
     }
 
     if let Some(active_session_id) = active_session_id.filter(|value| !value.trim().is_empty()) {
-        completions.insert(format!("/resume {active_session_id}"));
-        completions.insert(format!("/session switch {active_session_id}"));
+        completions
+            .entry(format!("/resume {active_session_id}"))
+            .or_insert_with(String::new);
+        completions
+            .entry(format!("/session switch {active_session_id}"))
+            .or_insert_with(String::new);
     }
 
     for session_id in recent_session_ids
@@ -3440,8 +4034,12 @@ fn slash_command_completion_candidates_with_sessions(
         .filter(|value| !value.trim().is_empty())
         .take(10)
     {
-        completions.insert(format!("/resume {session_id}"));
-        completions.insert(format!("/session switch {session_id}"));
+        completions
+            .entry(format!("/resume {session_id}"))
+            .or_insert_with(String::new);
+        completions
+            .entry(format!("/session switch {session_id}"))
+            .or_insert_with(String::new);
     }
 
     completions.into_iter().collect()

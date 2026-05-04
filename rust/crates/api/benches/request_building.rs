@@ -38,6 +38,7 @@ fn create_sample_request(message_count: usize) -> MessageRequest {
                         id: format!("call_{}", i),
                         name: "read_file".to_string(),
                         input: json!({"path": format!("/tmp/file{}", i)}),
+                        thought_signature: None,
                     },
                 ],
             }),
@@ -57,6 +58,7 @@ fn create_sample_request(message_count: usize) -> MessageRequest {
                     id: format!("call_{}", i),
                     name: "write_file".to_string(),
                     input: json!({"path": format!("/tmp/out{}", i), "content": "data"}),
+                    thought_signature: None,
                 }],
             }),
         }
@@ -76,6 +78,7 @@ fn create_sample_request(message_count: usize) -> MessageRequest {
         presence_penalty: None,
         stop: None,
         reasoning_effort: None,
+        cache_hints: None,
     }
 }
 
@@ -104,11 +107,13 @@ fn bench_translate_message(c: &mut Criterion) {
                 id: "call_1".to_string(),
                 name: "read_file".to_string(),
                 input: json!({"path": "/tmp/test"}),
+                thought_signature: None,
             },
             InputContentBlock::ToolUse {
                 id: "call_2".to_string(),
                 name: "write_file".to_string(),
                 input: json!({"path": "/tmp/out", "content": "data"}),
+                thought_signature: None,
             },
         ],
     };

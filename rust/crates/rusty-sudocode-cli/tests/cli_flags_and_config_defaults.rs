@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use runtime::Session;
+use serde_json;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -123,7 +124,7 @@ fn omc_namespaced_slash_commands_surface_a_targeted_compatibility_hint() {
     );
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
     assert!(stderr.contains("unknown slash command outside the REPL: /oh-my-claudecode:hud"));
-    assert!(stderr.contains("Claude Code/OMC plugin command"));
+    assert!(stderr.contains("Sudo Code/OMC plugin command"));
     assert!(stderr.contains("does not yet load plugin slash commands"));
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
@@ -243,22 +244,80 @@ fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
         .output()
         .expect("status help should launch");
 
+    // clap handles --help: it prints to stdout and exits 0.
     assert_success(&doctor_help);
     let doctor_stdout = String::from_utf8(doctor_help.stdout).expect("stdout should be utf8");
-    assert!(doctor_stdout.contains("Usage            scode doctor"));
-    assert!(doctor_stdout.contains("local-only health report"));
+    assert!(
+        doctor_stdout.contains("local-only health report"),
+        "doctor --help should contain subcommand description: {doctor_stdout}"
+    );
     assert!(!doctor_stdout.contains("Thinking"));
 
     assert_success(&status_help);
     let status_stdout = String::from_utf8(status_help.stdout).expect("stdout should be utf8");
-    assert!(status_stdout.contains("Usage            scode status"));
-    assert!(status_stdout.contains("local workspace snapshot"));
+    assert!(
+        status_stdout.contains("workspace status snapshot"),
+        "status --help should contain subcommand description: {status_stdout}"
+    );
     assert!(!status_stdout.contains("Thinking"));
 
     let doctor_stderr = String::from_utf8(doctor_help.stderr).expect("stderr should be utf8");
     let status_stderr = String::from_utf8(status_help.stderr).expect("stderr should be utf8");
     assert!(!doctor_stderr.contains("auth_unavailable"));
     assert!(!status_stderr.contains("auth_unavailable"));
+
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
+/// Verify that informational commands (help, version, config) succeed without
+/// any credentials present. This guards against regressions where an
+/// `ensure_authenticated()` call is accidentally placed before the informational
+/// dispatch in `run()`.
+#[test]
+fn informational_commands_bypass_credential_check() {
+    let temp_dir = unique_temp_dir("informational-no-creds");
+    let config_home = temp_dir.join("home").join(".nexus").join("sudocode");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+
+    // A helper that strips credentials from the environment and points the
+    // network at a port that refuses connections (127.0.0.1:9), so any
+    // accidental auth attempt either errors immediately or hangs (which the
+    // test process timeout would surface).
+    let no_creds = |args: &[&str]| {
+        command_in(&temp_dir)
+            .env("SUDO_CODE_CONFIG_HOME", &config_home)
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .env_remove("PROXY_AUTH_TOKEN")
+            .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
+            .args(args)
+            .output()
+            .expect("scode should launch")
+    };
+
+    // scode help --output-format json
+    let help_json = no_creds(&["help", "--output-format", "json"]);
+    assert_success(&help_json);
+    let help_stdout = String::from_utf8(help_json.stdout).expect("utf8");
+    let parsed: serde_json::Value = serde_json::from_str(&help_stdout)
+        .expect("help --output-format json should emit valid JSON");
+    assert_eq!(parsed["kind"], "help");
+
+    // scode version --output-format json
+    let version_json = no_creds(&["version", "--output-format", "json"]);
+    assert_success(&version_json);
+    let version_stdout = String::from_utf8(version_json.stdout).expect("utf8");
+    let parsed: serde_json::Value = serde_json::from_str(&version_stdout)
+        .expect("version --output-format json should emit valid JSON");
+    assert_eq!(parsed["kind"], "version");
+
+    // scode config --output-format json
+    let config_json = no_creds(&["config", "--output-format", "json"]);
+    assert_success(&config_json);
+    let config_stdout = String::from_utf8(config_json.stdout).expect("utf8");
+    let _parsed: serde_json::Value = serde_json::from_str(&config_stdout)
+        .expect("config --output-format json should emit valid JSON");
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }

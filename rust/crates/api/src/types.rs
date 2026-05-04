@@ -31,6 +31,31 @@ pub struct MessageRequest {
     /// Silently ignored by backends that do not support it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+
+    /// Provider-agnostic cache hints. Providers that support caching will
+    /// translate these into their specific wire format. Providers that
+    /// don't support caching ignore them.
+    #[serde(skip)]
+    pub cache_hints: Option<CacheHints>,
+}
+
+/// Provider-agnostic description of what to cache in a request.
+///
+/// Each provider translates these hints into its own caching mechanism:
+/// - Anthropic: `cache_control` markers on system blocks and messages
+/// - OpenAI-compatible: ignored (automatic prefix caching)
+/// - Others: ignored or provider-specific
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheHints {
+    /// Static system prompt text — identical across all sessions.
+    /// Providers may cache this globally (e.g. Anthropic `scope: "global"`).
+    pub system_static: Option<String>,
+    /// Dynamic system prompt text — stable within a session but varies
+    /// across sessions. Providers may cache this per-session.
+    pub system_dynamic: Option<String>,
+    /// When true, place a cache breakpoint on the last message so the
+    /// conversation prefix is cached between turns.
+    pub breakpoint_last_message: bool,
 }
 
 impl MessageRequest {
@@ -81,10 +106,15 @@ pub enum InputContentBlock {
     Text {
         text: String,
     },
+    Image {
+        source: ImageSource,
+    },
     ToolUse {
         id: String,
         name: String,
         input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     ToolResult {
         tool_use_id: String,
@@ -92,6 +122,15 @@ pub enum InputContentBlock {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
+}
+
+/// Source data for an inline image content block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageSource {
+    #[serde(rename = "type")]
+    pub source_type: String,
+    pub media_type: String,
+    pub data: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -152,6 +191,8 @@ pub enum OutputContentBlock {
         id: String,
         name: String,
         input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     Thinking {
         #[serde(default)]

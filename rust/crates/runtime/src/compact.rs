@@ -167,6 +167,7 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         role: MessageRole::System,
         blocks: vec![ContentBlock::Text { text: continuation }],
         usage: None,
+        model: None,
     }];
     compacted_messages.extend(preserved);
 
@@ -212,7 +213,7 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
         .filter_map(|block| match block {
             ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
             ContentBlock::ToolResult { tool_name, .. } => Some(tool_name.as_str()),
-            ContentBlock::Text { .. } => None,
+            ContentBlock::Text { .. } | ContentBlock::Image { .. } => None,
         })
         .collect::<Vec<_>>();
     tool_names.sort_unstable();
@@ -317,6 +318,7 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
 fn summarize_block(block: &ContentBlock) -> String {
     let raw = match block {
         ContentBlock::Text { text } => text.clone(),
+        ContentBlock::Image { mime_type, .. } => format!("[image: {mime_type}]"),
         ContentBlock::ToolUse { name, input, .. } => format!("tool_use {name}({input})"),
         ContentBlock::ToolResult {
             tool_name,
@@ -374,10 +376,11 @@ fn collect_key_files(messages: &[ConversationMessage]) -> Vec<String> {
     let mut files = messages
         .iter()
         .flat_map(|message| message.blocks.iter())
-        .map(|block| match block {
-            ContentBlock::Text { text } => text.as_str(),
-            ContentBlock::ToolUse { input, .. } => input.as_str(),
-            ContentBlock::ToolResult { output, .. } => output.as_str(),
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::ToolUse { input, .. } => Some(input.as_str()),
+            ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
+            ContentBlock::Image { .. } => None,
         })
         .flat_map(extract_file_candidates)
         .collect::<Vec<_>>();
@@ -400,7 +403,8 @@ fn first_text_block(message: &ConversationMessage) -> Option<&str> {
         ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
         ContentBlock::ToolUse { .. }
         | ContentBlock::ToolResult { .. }
-        | ContentBlock::Text { .. } => None,
+        | ContentBlock::Text { .. }
+        | ContentBlock::Image { .. } => None,
     })
 }
 
@@ -446,6 +450,7 @@ fn estimate_message_tokens(message: &ConversationMessage) -> usize {
         .iter()
         .map(|block| match block {
             ContentBlock::Text { text } => text.len() / 4 + 1,
+            ContentBlock::Image { data, .. } => data.len() / 4 + 1,
             ContentBlock::ToolUse { name, input, .. } => (name.len() + input.len()) / 4 + 1,
             ContentBlock::ToolResult {
                 tool_name, output, ..
@@ -592,6 +597,7 @@ mod tests {
                     text: "recent".to_string(),
                 }],
                 usage: None,
+                model: None,
             },
         ];
 
@@ -704,6 +710,7 @@ mod tests {
                     text: get_compact_continuation_message(summary, true, true),
                 }],
                 usage: None,
+                model: None,
             },
             ConversationMessage::user_text("tiny"),
             ConversationMessage::assistant(vec![ContentBlock::Text {
@@ -732,10 +739,10 @@ mod tests {
     #[test]
     fn extracts_key_files_from_message_content() {
         let files = collect_key_files(&[ConversationMessage::user_text(
-            "Update rust/crates/runtime/src/compact.rs and rust/crates/rusty-claude-cli/src/main.rs next.",
+            "Update rust/crates/runtime/src/compact.rs and rust/crates/rusty-sudocode-cli/src/main.rs next.",
         )]);
         assert!(files.contains(&"rust/crates/runtime/src/compact.rs".to_string()));
-        assert!(files.contains(&"rust/crates/rusty-claude-cli/src/main.rs".to_string()));
+        assert!(files.contains(&"rust/crates/rusty-sudocode-cli/src/main.rs".to_string()));
     }
 
     /// Regression: compaction must not split an assistant(ToolUse) /
@@ -759,6 +766,7 @@ mod tests {
                     id: tool_id.to_string(),
                     name: "search".to_string(),
                     input: "{\"q\":\"*.rs\"}".to_string(),
+                    thought_signature: None,
                 },
             ]))
             .unwrap();

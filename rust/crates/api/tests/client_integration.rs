@@ -82,7 +82,7 @@ async fn send_message_posts_json_and_parses_response() {
     );
     assert_eq!(
         request.headers.get("user-agent").map(String::as_str),
-        Some("claude-code/0.1.0")
+        Some(concat!("claude-code/", env!("CARGO_PKG_VERSION")))
     );
     assert_eq!(
         request.headers.get("anthropic-beta").map(String::as_str),
@@ -169,7 +169,7 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
         .with_base_url(server.base_url())
         .with_client_identity(ClientIdentity::new("claude-code", "9.9.9").with_runtime("rust-cli"))
         .with_beta("tools-2026-04-01")
-        .with_extra_body_param("metadata", json!({"source": "sudo-code"}))
+        .with_extra_body_param("metadata", json!({"source": "sudocode"}))
         .with_session_tracer(SessionTracer::new("session-telemetry", sink.clone()));
 
     let response = client
@@ -191,14 +191,14 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
     );
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be json");
-    assert_eq!(body["metadata"]["source"], json!("sudo-code"));
+    assert_eq!(body["metadata"]["source"], json!("sudocode"));
     assert!(
         body.get("betas").is_none(),
         "betas must travel via the anthropic-beta header, not the request body"
     );
 
     let events = sink.events();
-    assert_eq!(events.len(), 6);
+    assert_eq!(events.len(), 7);
     assert!(matches!(
         &events[0],
         TelemetryEvent::HttpRequestStarted {
@@ -215,6 +215,14 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
     ));
     assert!(matches!(
         &events[2],
+        TelemetryEvent::HttpRequestDebug {
+            method,
+            url,
+            ..
+        } if method == "POST" && url.contains("/v1/messages")
+    ));
+    assert!(matches!(
+        &events[3],
         TelemetryEvent::HttpRequestSucceeded {
             request_id,
             status: 200,
@@ -222,11 +230,11 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
         } if request_id.as_deref() == Some("req_profile_123")
     ));
     assert!(matches!(
-        &events[3],
+        &events[4],
         TelemetryEvent::SessionTrace(trace) if trace.name == "http_request_succeeded"
     ));
     assert!(matches!(
-        &events[4],
+        &events[5],
         TelemetryEvent::Analytics(event)
             if event.namespace == "api"
                 && event.action == "message_usage"
@@ -235,7 +243,7 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
                 && event.properties.get("estimated_cost_usd") == Some(&json!("$0.0001"))
     ));
     assert!(matches!(
-        &events[5],
+        &events[6],
         TelemetryEvent::SessionTrace(trace) if trace.name == "analytics"
     ));
 }
