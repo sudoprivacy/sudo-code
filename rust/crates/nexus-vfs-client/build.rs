@@ -3,9 +3,6 @@ fn main() {
     std::env::set_var("PROTOC", &protoc);
     tonic_build::configure()
         .build_server(false)
-        .compile_protos(
-            &["proto/nexus/grpc/vfs/vfs.proto"],
-            &["proto"],
-        )
+        .compile_protos(&["proto/nexus/grpc/vfs/vfs.proto"], &["proto"])
         .unwrap();
 }

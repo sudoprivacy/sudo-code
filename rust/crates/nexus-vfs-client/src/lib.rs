@@ -59,7 +59,11 @@ impl NexusVfsClient {
                     let mut client = NexusVfsServiceClient::new(ch);
                     while let Some(op) = rx.recv().await {
                         match op {
-                            VfsOp::Read { path, auth_token, resp } => {
+                            VfsOp::Read {
+                                path,
+                                auth_token,
+                                resp,
+                            } => {
                                 let r = client
                                     .read(ReadRequest {
                                         path,
@@ -75,7 +79,12 @@ impl NexusVfsClient {
                                     }
                                 }));
                             }
-                            VfsOp::Write { path, content, auth_token, resp } => {
+                            VfsOp::Write {
+                                path,
+                                content,
+                                auth_token,
+                                resp,
+                            } => {
                                 let r = client
                                     .write(WriteRequest {
                                         path,
@@ -92,7 +101,11 @@ impl NexusVfsClient {
                                     }
                                 }));
                             }
-                            VfsOp::Delete { path, auth_token, resp } => {
+                            VfsOp::Delete {
+                                path,
+                                auth_token,
+                                resp,
+                            } => {
                                 let r = client
                                     .delete(DeleteRequest {
                                         path,
